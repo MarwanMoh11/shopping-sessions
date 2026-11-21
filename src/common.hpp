@@ -20,6 +20,10 @@
 #define SS_ENGINE_NS ss_default
 #endif
 
+#define SS_ALWAYS_INLINE __attribute__((always_inline)) inline
+#define SS_LAMBDA_INLINE __attribute__((always_inline))
+#define SS_COLD_NOINLINE __attribute__((noinline, cold))
+
 namespace SS_ENGINE_NS {
 
 static constexpr int64_t SECOND_MS       = 1000LL;
@@ -31,14 +35,21 @@ static constexpr int64_t CLICK_WINDOW_MS = 7LL * DAY_MS;
 
 static constexpr uint64_t FALLBACK_BIT = 1ULL << 63;
 
-// Clean zero-THP-stall anonymous mmap (eliminates Linux THP compaction stalls on fresh containers!)
-static inline void* alloc_mmap(size_t bytes) {
+// Anonymous mmap with optional MADV_HUGEPAGE (ONLY on actively-used >= 2 MB slabs/tables!)
+static inline void* alloc_mmap(size_t bytes, bool hugepage = false) {
     if (bytes == 0) bytes = 4096;
     void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) {
         std::fprintf(stderr, "mmap failed for %zu bytes\n", bytes);
         std::abort();
     }
+#ifdef MADV_HUGEPAGE
+    if (hugepage && bytes >= (2ULL << 20)) {
+        ::madvise(p, bytes, MADV_HUGEPAGE);
+    }
+#else
+    (void)hugepage;
+#endif
     return p;
 }
 
@@ -50,12 +61,12 @@ struct StringArenaPool {
 
     void init(int nthreads) {
         for (int t = 0; t < nthreads; ++t) {
-            base[t] = static_cast<char*>(alloc_mmap(RESERVATION));
+            base[t] = static_cast<char*>(alloc_mmap(RESERVATION, false));
             pos[t] = 0;
         }
     }
 
-    inline uint64_t store_fallback(int tid, const char* s, size_t len) {
+    SS_COLD_NOINLINE uint64_t store_fallback(int tid, const char* s, size_t len) {
         size_t off = pos[tid];
         if (__builtin_expect(len > 0x1FFFFFFULL || off + len > RESERVATION, 0)) {
             std::fprintf(stderr, "StringArena overflow on thread %d (off=%zu len=%zu)\n", tid, off, len);
@@ -66,7 +77,7 @@ struct StringArenaPool {
         return FALLBACK_BIT | (uint64_t(tid) << 57) | (uint64_t(off) << 25) | uint64_t(len);
     }
 
-    inline std::string_view get_fallback(uint64_t k) const {
+    SS_ALWAYS_INLINE std::string_view get_fallback(uint64_t k) const {
         uint32_t tid = uint32_t((k >> 57) & 0x3F);
         uint32_t off = uint32_t((k >> 25) & 0xFFFFFFFFULL);
         uint32_t len = uint32_t(k & 0x1FFFFFFULL);
@@ -75,9 +86,9 @@ struct StringArenaPool {
 };
 
 // ============================================================================
-// 9-Byte 7-Bit ASCII Order-Preserving Key64 via BMI2 PEXT/PDEP (SWAR fallback)
+// BMI2 PEXT/PDEP 56-bit (7-bit ASCII) & 48-bit (6-bit Base36) Order-Preserving Codecs
 // ============================================================================
-static inline uint64_t pext56(uint64_t be) {
+static SS_ALWAYS_INLINE uint64_t pext56(uint64_t be) {
 #if defined(__BMI2__)
     return _pext_u64(be, 0x7F7F7F7F7F7F7F7FULL);
 #else
@@ -87,7 +98,7 @@ static inline uint64_t pext56(uint64_t be) {
 #endif
 }
 
-static inline uint64_t pdep56(uint64_t k) {
+static SS_ALWAYS_INLINE uint64_t pdep56(uint64_t k) {
 #if defined(__BMI2__)
     return _pdep_u64(k, 0x7F7F7F7F7F7F7F7FULL);
 #else
@@ -97,32 +108,91 @@ static inline uint64_t pdep56(uint64_t k) {
 #endif
 }
 
-static inline uint64_t encode_key64(const char* s, size_t len, StringArenaPool& arenas, int tid) {
-    if (__builtin_expect(len == 9, 1)) {
-        uint8_t b0 = uint8_t(s[0]);
+static SS_ALWAYS_INLINE uint64_t pext48(uint64_t v) {
+#if defined(__BMI2__)
+    return _pext_u64(v, 0x3F3F3F3F3F3F3F3FULL);
+#else
+    uint64_t t = ((v & 0x3F003F003F003F00ULL) >> 2) | (v & 0x003F003F003F003FULL);
+    t = ((t & 0x0FFF00000FFF0000ULL) >> 4) | (t & 0x00000FFF00000FFFULL);
+    return ((t & 0x00FFFFFF00000000ULL) >> 8) | (t & 0x0000000000FFFFFFULL);
+#endif
+}
+
+static SS_ALWAYS_INLINE uint64_t pdep48(uint64_t k) {
+#if defined(__BMI2__)
+    return _pdep_u64(k, 0x3F3F3F3F3F3F3F3FULL);
+#else
+    uint64_t t = ((k & 0x0000FFFFFF000000ULL) << 8) | (k & 0x0000000000FFFFFFULL);
+    t = ((t & 0x00FFF00000FFF000ULL) << 4) | (t & 0x00000FFF00000FFFULL);
+    return ((t & 0x0FC00FC00FC00FC0ULL) << 2) | (t & 0x003F003F003F003FULL);
+#endif
+}
+
+// Exact 48-bit bijection (odd multipliers mod 2^48 + xor-shifts): mix48(a)==mix48(b) <=> a==b!
+static constexpr uint64_t MASK48 = (1ULL << 48) - 1ULL;
+static SS_ALWAYS_INLINE uint64_t mix48(uint64_t x) {
+    x ^= x >> 24;
+    x = (x * 0xbf58476d1ce5ULL) & MASK48;
+    x ^= x >> 23;
+    x = (x * 0x94d049bb1331ULL) & MASK48;
+    x ^= x >> 24;
+    return x;
+}
+
+// 100% lossless, branchless 6-bit codec for s[0]==prefix, 2<=len<=9, padded >=8B after s+1.
+// Bijectively maps S = {0x00..0x0F} U {0x30..0x3F} U {0x60..0x7F} -> [0..63] preserving order!
+// Any byte outside S (e.g. uppercase 'A'-'Z', UTF-8) or active 0x00 fails rt==raw8 -> SideEvent!
+static SS_ALWAYS_INLINE bool encode_eid48_padded(const char* s, size_t len, uint64_t& out_eid48) {
+    if (__builtin_expect((len - 2) <= 7 && s[0] == 'e', 1)) {
         uint64_t raw8;
         std::memcpy(&raw8, s + 1, 8);
-        uint64_t bad = (raw8 & 0x8080808080808080ULL) |
-                       ((raw8 - 0x0101010101010101ULL) & ~raw8 & 0x8080808080808080ULL);
-        if (__builtin_expect(bad == 0 && uint8_t(b0 - 1) < 127, 1)) {
-            return (uint64_t(b0) << 56) | pext56(__builtin_bswap64(raw8));
+        uint64_t mask = (~0ULL) >> ((9 - len) << 3);
+        raw8 &= mask;
+        uint64_t x = ((raw8 & 0x4040404040404040ULL) >> 1) | (raw8 & 0x1F1F1F1F1F1F1F1FULL);
+        uint64_t b5 = x & 0x2020202020202020ULL;
+        uint64_t rt = x | (b5 << 1) | ((~b5) & ((x & 0x1010101010101010ULL) << 1));
+        uint64_t check = raw8 | (~mask & 0x0101010101010101ULL);
+        uint64_t has_zero = (check - 0x0101010101010101ULL) & ~check & 0x8080808080808080ULL;
+        if (__builtin_expect((rt == raw8) & (has_zero == 0), 1)) {
+            out_eid48 = pext48(x);
+            return true;
         }
-        return arenas.store_fallback(tid, s, len);
     }
-    if (__builtin_expect(len == 8, 1)) {
+    return false;
+}
+
+static SS_ALWAYS_INLINE bool encode_uid48_padded(const char* s, size_t len, uint64_t& out_uid48) {
+    if (__builtin_expect((len - 2) <= 7 && s[0] == 'u', 1)) {
+        uint64_t raw8;
+        std::memcpy(&raw8, s + 1, 8);
+        uint64_t mask = (~0ULL) >> ((9 - len) << 3);
+        raw8 &= mask;
+        uint64_t x = ((raw8 & 0x4040404040404040ULL) >> 1) | (raw8 & 0x1F1F1F1F1F1F1F1FULL);
+        uint64_t b5 = x & 0x2020202020202020ULL;
+        uint64_t rt = x | (b5 << 1) | ((~b5) & ((x & 0x1010101010101010ULL) << 1));
+        uint64_t check = raw8 | (~mask & 0x0101010101010101ULL);
+        uint64_t has_zero = (check - 0x0101010101010101ULL) & ~check & 0x8080808080808080ULL;
+        if (__builtin_expect((rt == raw8) & (has_zero == 0), 1)) {
+            out_uid48 = pext48(__builtin_bswap64(x));
+            return true;
+        }
+    }
+    return false;
+}
+
+static SS_ALWAYS_INLINE uint64_t decode_uid48_to_key64(uint64_t uid48) {
+    uint64_t u = pdep48(uid48);
+    uint64_t b5 = u & 0x2020202020202020ULL;
+    uint64_t ascii_be = u | (b5 << 1) | ((~b5) & ((u & 0x1010101010101010ULL) << 1));
+    return (uint64_t('u') << 56) | pext56(ascii_be);
+}
+
+static SS_COLD_NOINLINE uint64_t encode_key64_slow(const char* s, size_t len, StringArenaPool& arenas, int tid) {
+    if (len == 0) return 0;
+    if (len == 1) {
         uint8_t b0 = uint8_t(s[0]);
-        uint64_t raw8 = 0;
-        std::memcpy(&raw8, s + 1, 7);
-        uint64_t check = raw8 | 0x0100000000000000ULL;
-        uint64_t bad = (check & 0x8080808080808080ULL) |
-                       ((check - 0x0101010101010101ULL) & ~check & 0x8080808080808080ULL);
-        if (__builtin_expect(bad == 0 && uint8_t(b0 - 1) < 127, 1)) {
-            return (uint64_t(b0) << 56) | pext56(__builtin_bswap64(raw8));
-        }
-        return arenas.store_fallback(tid, s, len);
-    }
-    if (__builtin_expect(len == 0, 0)) return 0;
-    if (__builtin_expect(len <= 9, 1)) {
+        if (uint8_t(b0 - 1) < 127) return uint64_t(b0) << 56;
+    } else if (len <= 9) {
         uint8_t b0 = uint8_t(s[0]);
         if (uint8_t(b0 - 1) < 127) {
             uint8_t tmp[8]{};
@@ -142,29 +212,40 @@ static inline uint64_t encode_key64(const char* s, size_t len, StringArenaPool& 
     return arenas.store_fallback(tid, s, len);
 }
 
-// Equality-only ultra-fast event_id encoder (ZERO pext56, ZERO bswap64, 100% lossless!):
-// - bit 63 == 0, bit 55 == 0: len == 9 && s[0] == 'e' && s[1..8] all 7-bit ASCII (raw8 != 0)
-// - bit 63 == 0, bit 55 == 1: len == 8 && s[0] == 'e' && s[1..7] all 7-bit ASCII
-// - bit 63 == 1: fallback arena
-static inline uint64_t encode_event_id(const char* s, size_t len, StringArenaPool& arenas, int tid) {
-    if (__builtin_expect(len == 9 && s[0] == 'e', 1)) {
+// Branchless 2..9 byte order-preserving Key64 encoder (requires >= 8 readable pad bytes after s+1!).
+static SS_ALWAYS_INLINE uint64_t encode_key64_padded(const char* s, size_t len, StringArenaPool& arenas, int tid) {
+    if (__builtin_expect((len - 2) <= 7, 1)) {
+        uint8_t b0 = uint8_t(s[0]);
         uint64_t raw8;
         std::memcpy(&raw8, s + 1, 8);
-        if (__builtin_expect((raw8 & 0x8080808080808080ULL) == 0 && raw8 != 0, 1)) {
-            return raw8;
-        }
-    } else if (__builtin_expect(len == 8 && s[0] == 'e', 1)) {
-        uint64_t raw7 = 0;
-        std::memcpy(&raw7, s + 1, 7);
-        if (__builtin_expect((raw7 & 0x8080808080808080ULL) == 0, 1)) {
-            return raw7 | (1ULL << 55);
+        uint64_t mask = (~0ULL) >> ((9 - len) << 3);
+        raw8 &= mask;
+        uint64_t check = raw8 | (~mask & 0x0101010101010101ULL);
+        uint64_t bad = (check & 0x8080808080808080ULL) |
+                       ((check - 0x0101010101010101ULL) & ~check & 0x8080808080808080ULL);
+        if (__builtin_expect((bad == 0) & (uint8_t(b0 - 1) < 127), 1)) {
+            return (uint64_t(b0) << 56) | pext56(__builtin_bswap64(raw8));
         }
     }
-    return arenas.store_fallback(tid, s, len);
+    return encode_key64_slow(s, len, arenas, tid);
+}
+
+static SS_ALWAYS_INLINE uint64_t encode_key64(const char* s, size_t len, StringArenaPool& arenas, int tid) {
+    if (__builtin_expect(len == 9, 1)) {
+        uint8_t b0 = uint8_t(s[0]);
+        uint64_t raw8;
+        std::memcpy(&raw8, s + 1, 8);
+        uint64_t bad = (raw8 & 0x8080808080808080ULL) |
+                       ((raw8 - 0x0101010101010101ULL) & ~raw8 & 0x8080808080808080ULL);
+        if (__builtin_expect((bad == 0) & (uint8_t(b0 - 1) < 127), 1)) {
+            return (uint64_t(b0) << 56) | pext56(__builtin_bswap64(raw8));
+        }
+    }
+    return encode_key64_slow(s, len, arenas, tid);
 }
 
 // Decode inline Key64 (writes 9 bytes into `out`, returns exact length in 1..9).
-static inline size_t decode_inline(uint64_t k, char* out) {
+static SS_ALWAYS_INLINE size_t decode_inline(uint64_t k, char* out) {
     out[0] = char(k >> 56);
     uint64_t be = pdep56(k);
     uint64_t le = __builtin_bswap64(be);
@@ -172,7 +253,7 @@ static inline size_t decode_inline(uint64_t k, char* out) {
     return be ? (9U - (uint32_t(__builtin_ctzll(be)) >> 3)) : 1U;
 }
 
-static inline std::string_view key_to_sv(uint64_t k, char tmp[10], const StringArenaPool& arenas) {
+static SS_ALWAYS_INLINE std::string_view key_to_sv(uint64_t k, char tmp[10], const StringArenaPool& arenas) {
     if (__builtin_expect((k & FALLBACK_BIT) == 0, 1)) {
         size_t n = decode_inline(k, tmp);
         return {tmp, n};
@@ -180,7 +261,7 @@ static inline std::string_view key_to_sv(uint64_t k, char tmp[10], const StringA
     return arenas.get_fallback(k);
 }
 
-static inline uint64_t mix64(uint64_t x) {
+static SS_ALWAYS_INLINE uint64_t mix64(uint64_t x) {
     x ^= x >> 30;
     x *= 0xbf58476d1ce4e5b9ULL;
     x ^= x >> 27;
@@ -189,7 +270,7 @@ static inline uint64_t mix64(uint64_t x) {
     return x;
 }
 
-static inline uint64_t hash_bytes(const char* s, size_t len) {
+static SS_COLD_NOINLINE uint64_t hash_bytes(const char* s, size_t len) {
     uint64_t h = 0x9e3779b97f4a7c15ULL ^ (len * 0x517cc1b727220a95ULL);
     size_t i = 0;
     while (i + 8 <= len) {
@@ -203,7 +284,7 @@ static inline uint64_t hash_bytes(const char* s, size_t len) {
     return mix64(h ^ tail);
 }
 
-static inline uint64_t hash_key64(uint64_t k, const StringArenaPool& arenas) {
+static SS_ALWAYS_INLINE uint64_t hash_key64(uint64_t k, const StringArenaPool& arenas) {
     if (__builtin_expect((k & FALLBACK_BIT) == 0, 1)) {
         return mix64(k);
     }
@@ -211,20 +292,21 @@ static inline uint64_t hash_key64(uint64_t k, const StringArenaPool& arenas) {
     return hash_bytes(sv.data(), sv.size());
 }
 
-static inline bool key_eq(uint64_t a, uint64_t b, const StringArenaPool& arenas) {
-    if (__builtin_expect(((a | b) & FALLBACK_BIT) == 0, 1)) {
-        return a == b;
-    }
+static SS_COLD_NOINLINE bool key_eq_fallback(uint64_t a, uint64_t b, const StringArenaPool& arenas) {
     if (((a ^ b) & FALLBACK_BIT) != 0) return false;
     auto sa = arenas.get_fallback(a);
     auto sb = arenas.get_fallback(b);
     return sa.size() == sb.size() && std::memcmp(sa.data(), sb.data(), sa.size()) == 0;
 }
 
-static inline bool key_less(uint64_t a, uint64_t b, const StringArenaPool& arenas) {
+static SS_ALWAYS_INLINE bool key_eq(uint64_t a, uint64_t b, const StringArenaPool& arenas) {
     if (__builtin_expect(((a | b) & FALLBACK_BIT) == 0, 1)) {
-        return a < b;
+        return a == b;
     }
+    return key_eq_fallback(a, b, arenas);
+}
+
+static SS_COLD_NOINLINE bool key_less_fallback(uint64_t a, uint64_t b, const StringArenaPool& arenas) {
     char ba[10], bb[10];
     auto sa = key_to_sv(a, ba, arenas);
     auto sb = key_to_sv(b, bb, arenas);
@@ -234,8 +316,15 @@ static inline bool key_less(uint64_t a, uint64_t b, const StringArenaPool& arena
     return sa.size() < sb.size();
 }
 
+static SS_ALWAYS_INLINE bool key_less(uint64_t a, uint64_t b, const StringArenaPool& arenas) {
+    if (__builtin_expect(((a | b) & FALLBACK_BIT) == 0, 1)) {
+        return a < b;
+    }
+    return key_less_fallback(a, b, arenas);
+}
+
 // ============================================================================
-// Calendar & Branchless FastMonth + SWAR Timestamp Parsing (Strict F1, F2, F3)
+// Calendar + 4 KB L1D FastDay[256] LUT + 64-bit SWAR Timestamp Parsers (F1, F2, F3)
 // ============================================================================
 static inline bool is_leap_year(int64_t y) {
     return (y % 4 == 0) && ((y % 100 != 0) || (y % 400 == 0));
@@ -265,24 +354,47 @@ static inline void civil_from_days(int64_t z, int& y, int& m, int& d) {
 
 static constexpr uint8_t DAYS_IN_MONTH[13] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
 
-struct FastMonth {
-    uint64_t prefix_u64;
-    int64_t day0_sec;
-    uint8_t max_day;
+static SS_ALWAYS_INLINE bool parse_2d(const char* p, int& out) {
+    unsigned d0 = uint8_t(p[0]) - uint8_t('0');
+    unsigned d1 = uint8_t(p[1]) - uint8_t('0');
+    if (__builtin_expect((d0 > 9) | (d1 > 9), 0)) return false;
+    out = int(d0 * 10 + d1);
+    return true;
+}
+
+static SS_ALWAYS_INLINE bool parse_4d(const char* p, int& out) {
+    unsigned d0 = uint8_t(p[0]) - uint8_t('0');
+    unsigned d1 = uint8_t(p[1]) - uint8_t('0');
+    unsigned d2 = uint8_t(p[2]) - uint8_t('0');
+    unsigned d3 = uint8_t(p[3]) - uint8_t('0');
+    if (__builtin_expect((d0 > 9) | (d1 > 9) | (d2 > 9) | (d3 > 9), 0)) return false;
+    out = int(d0 * 1000 + d1 * 100 + d2 * 10 + d3);
+    return true;
+}
+
+// 16-byte L1D-hot calendar entry: maps unique (month%4, D0, D1) -> exact day_rel_sec!
+// Covers up to 4 consecutive months (~120 days) with ZERO month-boundary branch mispredicts!
+struct FastDay {
+    uint64_t ym;       // "YYYY-MM-" (0 = empty, ~0ULL = collided -> fallback)
+    uint16_t dd16;     // "DD"
+    uint16_t _pad;
+    int32_t  rel_sec;  // day_sec - win_start_sec
 };
 
 struct DateLut {
     static constexpr int NUM_YEARS = 8;
     static constexpr int32_t INVALID = INT32_MIN;
+    FastDay days[256]{};
+    int64_t win_start_sec = 0;
     int base_year = -1000000;
     int32_t table[NUM_YEARS * 16 * 32]{};
-    FastMonth fm[4]{};
-    int num_fm = 0;
 
-    void init(int64_t click_start_ms, int64_t win_end_ms) {
-        int y1, m1, d1, y2, m2, d2;
-        civil_from_days((click_start_ms / DAY_MS) - 2, y1, m1, d1);
-        civil_from_days((win_end_ms / DAY_MS) + 10, y2, m2, d2);
+    void init(int64_t click_start_ms, int64_t win_start_ms, int64_t win_end_ms) {
+        win_start_sec = win_start_ms / 1000LL;
+        int64_t d_start = (click_start_ms / DAY_MS) - 2;
+        int64_t d_end = (win_end_ms / DAY_MS) + 10;
+        int y1, m1, dy1;
+        civil_from_days(d_start, y1, m1, dy1);
         base_year = y1 - 1;
         for (int i = 0; i < NUM_YEARS * 16 * 32; ++i) table[i] = INVALID;
         for (int yo = 0; yo < NUM_YEARS; ++yo) {
@@ -295,44 +407,44 @@ struct DateLut {
                 }
             }
         }
-        num_fm = 0;
-        int wy, wm, wd;
-        civil_from_days((win_end_ms / DAY_MS) - 1, wy, wm, wd);
-        auto add_ym = [&](int y, int m) {
-            if (num_fm >= 4) return;
-            char buf[8];
-            buf[0] = char('0' + (y / 1000) % 10);
-            buf[1] = char('0' + (y / 100) % 10);
-            buf[2] = char('0' + (y / 10) % 10);
-            buf[3] = char('0' + y % 10);
-            buf[4] = '-';
-            buf[5] = char('0' + m / 10);
-            buf[6] = char('0' + m % 10);
-            buf[7] = '-';
-            uint64_t u;
-            std::memcpy(&u, buf, 8);
-            for (int i = 0; i < num_fm; ++i) if (fm[i].prefix_u64 == u) return;
-            uint8_t md = (m == 2 && is_leap_year(y)) ? 29 : DAYS_IN_MONTH[m];
-            int64_t day0_s = (days_from_civil(y, m, 1) - 1) * 86400LL;
-            fm[num_fm++] = {u, day0_s, md};
-        };
-        add_ym(wy, wm);
-        int cy = y1, cm = m1;
-        for (int step = 0; step < 4; ++step) {
-            add_ym(cy, cm);
-            if (cy == y2 && cm == m2) break;
-            if (++cm > 12) { cm = 1; ++cy; }
+        for (auto& e : days) { e.ym = 0; e.dd16 = 0; e._pad = 0; e.rel_sec = INT32_MIN; }
+        // Only populate fast_days if the span fits inside int32_t relative seconds (<= 110 days)
+        if (d_end - d_start <= 110) {
+            for (int64_t d = d_start; d <= d_end; ++d) {
+                int y, m, dy;
+                civil_from_days(d, y, m, dy);
+                if (y < 0 || y > 9999) continue;
+                char b[10];
+                b[0] = char('0' + (y / 1000) % 10);
+                b[1] = char('0' + (y / 100) % 10);
+                b[2] = char('0' + (y / 10) % 10);
+                b[3] = char('0' + y % 10);
+                b[4] = '-';
+                b[5] = char('0' + m / 10);
+                b[6] = char('0' + m % 10);
+                b[7] = '-';
+                b[8] = char('0' + dy / 10);
+                b[9] = char('0' + dy % 10);
+                uint32_t idx = ((uint8_t(b[6]) & 3U) << 6) | ((uint8_t(b[8]) & 3U) << 4) | (uint8_t(b[9]) & 15U);
+                uint64_t ym; uint16_t dd16;
+                std::memcpy(&ym, b, 8);
+                std::memcpy(&dd16, b + 8, 2);
+                int64_t rel = d * 86400LL - win_start_sec;
+                if (rel < INT32_MIN + 1 || rel > INT32_MAX) continue;
+                if (days[idx].ym == 0) {
+                    days[idx] = {ym, dd16, 0, int32_t(rel)};
+                } else {
+                    days[idx].ym = ~0ULL; // mark collision -> always fall back safely!
+                }
+            }
         }
     }
 
-    inline bool lookup(int y, int m, int d, int64_t& out_days) const {
+    SS_COLD_NOINLINE bool lookup_days_slow(int y, int m, int d, int64_t& out_days) const {
         unsigned yo = unsigned(y - base_year);
         if (__builtin_expect(yo < NUM_YEARS && unsigned(m) < 16 && unsigned(d) < 32, 1)) {
             int32_t v = table[(yo << 9) | (m << 5) | d];
-            if (__builtin_expect(v != INVALID, 1)) {
-                out_days = v;
-                return true;
-            }
+            if (__builtin_expect(v != INVALID, 1)) { out_days = v; return true; }
             return false;
         }
         if (m < 1 || m > 12) return false;
@@ -342,35 +454,68 @@ struct DateLut {
         return true;
     }
 
-    inline bool lookup_fast_ym(uint64_t prefix_u64, int& out_idx) const {
-        if (__builtin_expect(num_fm > 0 && fm[0].prefix_u64 == prefix_u64, 1)) { out_idx = 0; return true; }
-        if (__builtin_expect(num_fm > 1 && fm[1].prefix_u64 == prefix_u64, 1)) { out_idx = 1; return true; }
-        if (num_fm > 2 && fm[2].prefix_u64 == prefix_u64) { out_idx = 2; return true; }
-        if (num_fm > 3 && fm[3].prefix_u64 == prefix_u64) { out_idx = 3; return true; }
-        return false;
+    SS_COLD_NOINLINE bool parse_date_rel_slow(const char* s, int64_t& out_day_rel_sec) const {
+        if (s[4] != '-' || s[7] != '-') return false;
+        int y, mo, dd;
+        if (!parse_4d(s, y) || !parse_2d(s + 5, mo) || !parse_2d(s + 8, dd)) return false;
+        int64_t d;
+        if (!lookup_days_slow(y, mo, dd, d)) return false;
+        out_day_rel_sec = d * 86400LL - win_start_sec;
+        return true;
+    }
+
+    // 100% strictly validated 64-bit SWAR THH:MM:SS parser (ZERO SIMD cross-domain penalty!)
+    static SS_ALWAYS_INLINE bool parse_hms_swar(const char* s, uint32_t& out_hms) {
+        if (__builtin_expect(s[10] != 'T', 0)) return false;
+        uint64_t w;
+        std::memcpy(&w, s + 11, 8);
+        uint64_t hi = w & 0x8080808080808080ULL;
+        uint64_t t = (w | 0x8080808080808080ULL) - 0x30303A30303A3030ULL;
+        uint64_t d = t & 0x7F7F7F7F7F7F7F7FULL;
+        uint64_t u = d + 0x767A7F767A7F767DULL;
+        uint64_t bad = hi | ((~t | u) & 0x8080808080808080ULL);
+        uint64_t p = d * 10ULL + (d >> 8);
+        uint32_t hh = uint32_t(p & 0xFFU);
+        if (__builtin_expect((bad != 0) | (hh > 23U), 0)) return false;
+        uint32_t mm = uint32_t((p >> 24) & 0xFFU);
+        uint32_t ss = uint32_t((p >> 48) & 0xFFU);
+        out_hms = hh * 3600U + mm * 60U + ss;
+        return true;
+    }
+
+    SS_ALWAYS_INLINE bool parse_iso19_rel_sec(const char* s, int64_t& out_rel_sec) const {
+        uint32_t hms;
+        if (__builtin_expect(!parse_hms_swar(s, hms), 0)) return false;
+        uint64_t ym; uint16_t dd16;
+        std::memcpy(&ym, s, 8);
+        std::memcpy(&dd16, s + 8, 2);
+        uint32_t idx = (((uint32_t(ym >> 48)) & 3U) << 6) | ((uint32_t(dd16) & 3U) << 4) | ((uint32_t(dd16 >> 8)) & 15U);
+        const FastDay& fd = days[idx];
+        if (__builtin_expect((fd.ym == ym) & (fd.dd16 == dd16), 1)) {
+            out_rel_sec = int64_t(fd.rel_sec) + int64_t(hms);
+            return true;
+        }
+        int64_t day_rel;
+        if (!parse_date_rel_slow(s, day_rel)) return false;
+        out_rel_sec = day_rel + int64_t(hms);
+        return true;
+    }
+
+    // Parse 25-byte F2 ("YYYY-MM-DDTHH:MM:SS±HH:MM") relative to win_start_sec
+    SS_ALWAYS_INLINE bool parse_f2_rel_sec(const char* s, int64_t& out_rel_sec) const {
+        if (__builtin_expect(((s[19] != '+') & (s[19] != '-')) | (s[22] != ':'), 0)) return false;
+        int64_t rel_s;
+        int oh, om;
+        if (__builtin_expect(!parse_iso19_rel_sec(s, rel_s) || !parse_2d(s + 20, oh) || !parse_2d(s + 23, om), 0)) return false;
+        if (__builtin_expect((oh > 23) | (om > 59), 0)) return false;
+        int64_t off_s = int64_t(oh) * 3600LL + int64_t(om) * 60LL;
+        out_rel_sec = rel_s + ((s[19] == '+') ? -off_s : off_s);
+        return true;
     }
 };
 
-static inline bool parse_2d(const char* p, int& out) {
-    unsigned d0 = uint8_t(p[0]) - uint8_t('0');
-    unsigned d1 = uint8_t(p[1]) - uint8_t('0');
-    if (__builtin_expect((d0 > 9) | (d1 > 9), 0)) return false;
-    out = int(d0 * 10 + d1);
-    return true;
-}
-
-static inline bool parse_4d(const char* p, int& out) {
-    unsigned d0 = uint8_t(p[0]) - uint8_t('0');
-    unsigned d1 = uint8_t(p[1]) - uint8_t('0');
-    unsigned d2 = uint8_t(p[2]) - uint8_t('0');
-    unsigned d3 = uint8_t(p[3]) - uint8_t('0');
-    if (__builtin_expect((d0 > 9) | (d1 > 9) | (d2 > 9) | (d3 > 9), 0)) return false;
-    out = int(d0 * 1000 + d1 * 100 + d2 * 10 + d3);
-    return true;
-}
-
-// Branchless 13-digit SWAR parser (ZERO division, 2 unaligned 64-bit loads inside 13B field!)
-static inline bool parse_13d_swar(const char* s, int64_t& out_ms) {
+// Branchless 13-digit SWAR parser (2 unaligned 64-bit loads strictly inside 13B!)
+static SS_ALWAYS_INLINE bool parse_13d_swar(const char* s, int64_t& out_ms) {
     uint64_t v0, w;
     std::memcpy(&v0, s, 8);
     std::memcpy(&w, s + 5, 8);
@@ -392,144 +537,24 @@ static inline bool parse_13d_swar(const char* s, int64_t& out_ms) {
     return true;
 }
 
-// Branchless single-check ISO-19 parser returning both `out_sec` and `out_day_sec` (for same-day reuse!)
-// Uses 128-bit SSSE3/AVX2 SIMD on x86-64-v3/v4 (11 instructions, 1 branch for all 8 digits + 3 seps + ranges!)
-static inline bool parse_iso19_sec_day(const char* s, int64_t& out_sec, int64_t& out_day_sec, const DateLut& lut) {
-#if defined(__SSSE3__)
-    // Bytes s[4..19] are always strictly inside a 20+ byte ISO-19 timestamp (0 overread!).
-    __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s + 4));
-    // Lanes 0..7: D0,D1,H0,H1,m0,m1,S0,S1; Lanes 8..10: s[10]='T', s[13]=':', s[16]=':'; Lanes 11..15: 0
-    const __m128i shuf = _mm_setr_epi8(4, 5, 7, 8, 10, 11, 13, 14, 6, 9, 12, -1, -1, -1, -1, -1);
-    __m128i d = _mm_shuffle_epi8(raw, shuf);
-    const __m128i bias = _mm_setr_epi8(
-        char('0' - 128), char('0' - 128), char('0' - 128), char('0' - 128),
-        char('0' - 128), char('0' - 128), char('0' - 128), char('0' - 128),
-        char('T' - 128), char(':' - 128), char(':' - 128), -128, -128, -128, -128, -128);
-    const __m128i maxv = _mm_setr_epi8(
-        -119, -119, -119, -119, -119, -119, -119, -119,
-        -128, -128, -128, -128, -128, -128, -128, -128);
-    int bad_ds = _mm_movemask_epi8(_mm_cmpgt_epi8(_mm_sub_epi8(d, bias), maxv));
-    __m128i dig = _mm_sub_epi8(d, _mm_set1_epi8('0'));
-    __m128i pairs = _mm_maddubs_epi16(dig, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0));
-    int bad_rng = _mm_movemask_epi8(_mm_cmpgt_epi16(pairs, _mm_setr_epi16(99, 23, 59, 59, 0, 0, 0, 0)));
-    if (__builtin_expect((bad_ds | bad_rng) != 0, 0)) return false;
-    __m128i sec_v = _mm_madd_epi16(pairs, _mm_setr_epi16(0, 3600, 60, 1, 0, 0, 0, 0));
-    uint64_t sp = uint64_t(_mm_cvtsi128_si64(sec_v));
-    int64_t hms_sec = int64_t(uint32_t(sp)) + int64_t(uint32_t(sp >> 32));
-    unsigned dd = uint16_t(_mm_extract_epi16(pairs, 0));
-#else
-    uint32_t sep = (uint8_t(s[10]) ^ 'T') | (uint8_t(s[13]) ^ ':') | (uint8_t(s[16]) ^ ':');
-    unsigned d0 = uint8_t(s[8]) - '0',  d1 = uint8_t(s[9]) - '0';
-    unsigned h0 = uint8_t(s[11]) - '0', h1 = uint8_t(s[12]) - '0';
-    unsigned m0 = uint8_t(s[14]) - '0', m1 = uint8_t(s[15]) - '0';
-    unsigned s0 = uint8_t(s[17]) - '0', s1 = uint8_t(s[18]) - '0';
-    unsigned dd = d0 * 10 + d1;
-    unsigned hh = h0 * 10 + h1;
-    unsigned mm = m0 * 10 + m1;
-    unsigned sc = s0 * 10 + s1;
-    uint32_t bad = sep | (d0 > 9) | (d1 > 9) | (h0 > 9) | (h1 > 9) |
-                   (m0 > 9) | (m1 > 9) | (s0 > 9) | (s1 > 9) |
-                   (hh > 23) | (mm > 59) | (sc > 59);
-    if (__builtin_expect(bad != 0, 0)) return false;
-    int64_t hms_sec = int64_t(hh * 3600U + mm * 60U + sc);
-#endif
-
-    uint64_t ym_u64;
-    std::memcpy(&ym_u64, s, 8);
-    int fi;
-    if (__builtin_expect(lut.lookup_fast_ym(ym_u64, fi), 1)) {
-        const FastMonth& m = lut.fm[fi];
-        if (__builtin_expect(unsigned(dd - 1) >= unsigned(m.max_day), 0)) return false;
-        out_day_sec = m.day0_sec + int64_t(dd) * 86400LL;
-        out_sec = out_day_sec + hms_sec;
+static SS_COLD_NOINLINE bool parse_ts_slow(const char* s, size_t len, int64_t& out_ms, const DateLut& lut) {
+    if (len == 20 && s[19] == 'Z') {
+        int64_t rel_s;
+        if (!lut.parse_iso19_rel_sec(s, rel_s)) return false;
+        out_ms = (lut.win_start_sec + rel_s) * 1000LL;
         return true;
     }
-
-    if (s[4] != '-' || s[7] != '-') return false;
-    int y, mo;
-    if (!parse_4d(s, y) || !parse_2d(s + 5, mo)) return false;
-    int64_t days;
-    if (!lut.lookup(y, mo, int(dd), days)) return false;
-    out_day_sec = days * 86400LL;
-    out_sec = out_day_sec + hms_sec;
-    return true;
-}
-
-static inline bool parse_iso19_sec(const char* s, int64_t& out_sec, const DateLut& lut) {
-    int64_t dummy;
-    return parse_iso19_sec_day(s, out_sec, dummy, lut);
-}
-
-// Ultra-fast HH:MM:SS parse when 10-byte YYYY-MM-DD already matched another validated ISO-19 date!
-static inline bool parse_hms_only(const char* s, int64_t day_sec, int64_t& out_sec) {
-#if defined(__SSSE3__)
-    __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s + 4));
-    const __m128i shuf = _mm_setr_epi8(-1, -1, 7, 8, 10, 11, 13, 14, 6, 9, 12, -1, -1, -1, -1, -1);
-    __m128i d = _mm_shuffle_epi8(raw, shuf);
-    const __m128i bias = _mm_setr_epi8(
-        -128, -128, char('0' - 128), char('0' - 128),
-        char('0' - 128), char('0' - 128), char('0' - 128), char('0' - 128),
-        char('T' - 128), char(':' - 128), char(':' - 128), -128, -128, -128, -128, -128);
-    const __m128i maxv = _mm_setr_epi8(
-        -128, -128, -119, -119, -119, -119, -119, -119,
-        -128, -128, -128, -128, -128, -128, -128, -128);
-    int bad_ds = _mm_movemask_epi8(_mm_cmpgt_epi8(_mm_sub_epi8(d, bias), maxv));
-    __m128i dig = _mm_sub_epi8(d, _mm_set1_epi8('0'));
-    __m128i pairs = _mm_maddubs_epi16(dig, _mm_setr_epi8(0, 0, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0));
-    int bad_rng = _mm_movemask_epi8(_mm_cmpgt_epi16(pairs, _mm_setr_epi16(0, 23, 59, 59, 0, 0, 0, 0)));
-    if (__builtin_expect((bad_ds | bad_rng) != 0, 0)) return false;
-    __m128i sec_v = _mm_madd_epi16(pairs, _mm_setr_epi16(0, 3600, 60, 1, 0, 0, 0, 0));
-    uint64_t sp = uint64_t(_mm_cvtsi128_si64(sec_v));
-    out_sec = day_sec + int64_t(uint32_t(sp)) + int64_t(uint32_t(sp >> 32));
-    return true;
-#else
-    uint32_t sep = (uint8_t(s[10]) ^ 'T') | (uint8_t(s[13]) ^ ':') | (uint8_t(s[16]) ^ ':');
-    unsigned h0 = uint8_t(s[11]) - '0', h1 = uint8_t(s[12]) - '0';
-    unsigned m0 = uint8_t(s[14]) - '0', m1 = uint8_t(s[15]) - '0';
-    unsigned s0 = uint8_t(s[17]) - '0', s1 = uint8_t(s[18]) - '0';
-    unsigned hh = h0 * 10 + h1;
-    unsigned mm = m0 * 10 + m1;
-    unsigned sc = s0 * 10 + s1;
-    uint32_t bad = sep | (h0 > 9) | (h1 > 9) | (m0 > 9) | (m1 > 9) | (s0 > 9) | (s1 > 9) |
-                   (hh > 23) | (mm > 59) | (sc > 59);
-    if (__builtin_expect(bad != 0, 0)) return false;
-    out_sec = day_sec + int64_t(hh * 3600U + mm * 60U + sc);
-    return true;
-#endif
-}
-
-static inline bool parse_ts(const char* s, size_t len, int64_t& out_ms, const DateLut& lut) {
-    if (__builtin_expect(len == 20 && s[19] == 'Z', 1)) {
-        int64_t sec;
-        if (__builtin_expect(!parse_iso19_sec(s, sec, lut), 0)) return false;
-        out_ms = sec * 1000LL;
+    if (len == 25) {
+        int64_t rel_s;
+        if (!lut.parse_f2_rel_sec(s, rel_s)) return false;
+        out_ms = (lut.win_start_sec + rel_s) * 1000LL;
         return true;
     }
-
-    if (__builtin_expect(len == 13, 1)) {
-        return parse_13d_swar(s, out_ms);
-    }
-
-    if (len == 25 && (s[19] == '+' || s[19] == '-') && s[22] == ':') {
-        int64_t sec;
-        int oh, om;
-        if (!parse_iso19_sec(s, sec, lut) || !parse_2d(s + 20, oh) || !parse_2d(s + 23, om)) return false;
-        if (oh > 23 || om > 59) return false;
-        int64_t off_sec = oh * 3600LL + om * 60LL;
-        sec += (s[19] == '+') ? -off_sec : off_sec;
-        out_ms = sec * 1000LL;
-        return true;
-    }
-
-    if (__builtin_expect(len == 0, 0)) return false;
+    if (len == 0) return false;
     size_t i = 0;
     while (i < len && s[i] == '0') ++i;
-    if (i == len) {
-        out_ms = 0;
-        return true;
-    }
-    size_t digits = len - i;
-    if (digits > 19) return false;
+    if (i == len) { out_ms = 0; return true; }
+    if (len - i > 19) return false;
     uint64_t v = 0;
     for (; i < len; ++i) {
         unsigned d = uint8_t(s[i]) - uint8_t('0');
@@ -541,7 +566,26 @@ static inline bool parse_ts(const char* s, size_t len, int64_t& out_ms, const Da
     return true;
 }
 
-static inline bool parse_price_cents(const char* s, size_t len, uint32_t& out_price) {
+static SS_ALWAYS_INLINE bool parse_ts(const char* s, size_t len, int64_t& out_ms, const DateLut& lut) {
+    if (__builtin_expect(len == 20 && s[19] == 'Z', 1)) {
+        int64_t rel_s;
+        if (__builtin_expect(!lut.parse_iso19_rel_sec(s, rel_s), 0)) return false;
+        out_ms = (lut.win_start_sec + rel_s) * 1000LL;
+        return true;
+    }
+    if (__builtin_expect(len == 13, 1)) {
+        return parse_13d_swar(s, out_ms);
+    }
+    if (__builtin_expect(len == 25, 1)) {
+        int64_t rel_s;
+        if (__builtin_expect(!lut.parse_f2_rel_sec(s, rel_s), 0)) return false;
+        out_ms = (lut.win_start_sec + rel_s) * 1000LL;
+        return true;
+    }
+    return parse_ts_slow(s, len, out_ms, lut);
+}
+
+static SS_ALWAYS_INLINE bool parse_price_cents(const char* s, size_t len, uint32_t& out_price) {
     if (__builtin_expect(len == 0, 0)) return false;
     uint32_t v = 0;
     for (size_t i = 0; i < len; ++i) {
@@ -556,7 +600,7 @@ static inline bool parse_price_cents(const char* s, size_t len, uint32_t& out_pr
 }
 
 // ============================================================================
-// Multi-ISA 64-Byte SIMD Primitives + Branchless Quote-Strip Field Extractor
+// Multi-ISA 64-Byte SIMD Primitives + Shifted-Remainder 6-tzcnt CSV Extractors
 // ============================================================================
 struct Slice {
     const char* ptr;
@@ -564,7 +608,7 @@ struct Slice {
 };
 
 template <int N>
-static inline bool parse_csv_line_scalar(const char* line, const char* end, Slice out[N]) {
+static SS_COLD_NOINLINE bool parse_csv_line_scalar(const char* line, const char* end, Slice out[N]) {
     if (__builtin_expect(line == end, 0)) return false;
     const char* p = line;
     for (int f = 0; f < N; ++f) {
@@ -603,29 +647,24 @@ static inline bool parse_csv_line_scalar(const char* line, const char* end, Slic
     return true;
 }
 
-template <int N>
-static inline bool parse_csv_line(const char* line, const char* end, Slice out[N]) {
-    return parse_csv_line_scalar<N>(line, end, out);
-}
-
 #if defined(__AVX512BW__)
 struct Vec64 {
     __m512i v;
-    static inline Vec64 load(const char* p) { return {_mm512_loadu_si512(p)}; }
-    inline uint64_t eq(char ch) const {
+    static SS_ALWAYS_INLINE Vec64 load(const char* p) { return {_mm512_loadu_si512(p)}; }
+    SS_ALWAYS_INLINE uint64_t eq(char ch) const {
         return uint64_t(_mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(ch)));
     }
 };
 #elif defined(__AVX2__)
 struct Vec64 {
     __m256i v0, v1;
-    static inline Vec64 load(const char* p) {
+    static SS_ALWAYS_INLINE Vec64 load(const char* p) {
         return {
             _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)),
             _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32))
         };
     }
-    inline uint64_t eq(char ch) const {
+    SS_ALWAYS_INLINE uint64_t eq(char ch) const {
         __m256i vc = _mm256_set1_epi8(ch);
         uint64_t m0 = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, vc)));
         uint64_t m1 = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, vc)));
@@ -635,11 +674,11 @@ struct Vec64 {
 #elif defined(__aarch64__)
 struct Vec64 {
     uint8x16_t v0, v1, v2, v3;
-    static inline Vec64 load(const char* p) {
+    static SS_ALWAYS_INLINE Vec64 load(const char* p) {
         const uint8_t* u = reinterpret_cast<const uint8_t*>(p);
         return {vld1q_u8(u), vld1q_u8(u + 16), vld1q_u8(u + 32), vld1q_u8(u + 48)};
     }
-    inline uint64_t eq(char ch) const {
+    SS_ALWAYS_INLINE uint64_t eq(char ch) const {
         const uint8x16_t vc = vdupq_n_u8(uint8_t(ch));
         const uint8x16_t bm = {0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,
                                0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80};
@@ -657,7 +696,7 @@ struct Vec64 {
 #elif defined(__SSE2__)
 struct Vec64 {
     __m128i v0, v1, v2, v3;
-    static inline Vec64 load(const char* p) {
+    static SS_ALWAYS_INLINE Vec64 load(const char* p) {
         return {
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(p)),
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 16)),
@@ -665,7 +704,7 @@ struct Vec64 {
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 48))
         };
     }
-    inline uint64_t eq(char ch) const {
+    SS_ALWAYS_INLINE uint64_t eq(char ch) const {
         __m128i vc = _mm_set1_epi8(ch);
         uint64_t m0 = uint32_t(_mm_movemask_epi8(_mm_cmpeq_epi8(v0, vc)));
         uint64_t m1 = uint32_t(_mm_movemask_epi8(_mm_cmpeq_epi8(v1, vc)));
@@ -676,64 +715,114 @@ struct Vec64 {
 };
 #endif
 
-// Zero-branch 2-chain parallel comma & quote extractor for L in [1, 127].
-// Breaks the serial cm0/cm1 dependency chain into 2 independent ALU chains (0 cmovs, 0 branches!).
-template <int N>
-static inline bool extract_fields_branchless(
-    const char* line,
-    size_t L,
+// Ultra-fast 6-tzcnt shifted-remainder extractor for 7-field events with L in [64, 127].
+// Zero 12-iter loop, zero ends[] array, zero s<64/e<64 ternaries, zero lm128!
+static SS_ALWAYS_INLINE bool extract7_hi64(
+    const char* line, uint32_t L,
     uint64_t cm0, uint64_t cm1,
     uint64_t qm0, uint64_t qm1,
-    Slice out[N]
+    Slice out[7]
 ) {
+    uint64_t m1 = (1ULL << (L - 64U)) - 1ULL;
+    cm1 &= m1;
+    qm1 &= m1;
     uint32_t k0 = uint32_t(__builtin_popcountll(cm0));
     uint32_t k1 = uint32_t(__builtin_popcountll(cm1));
-    if (__builtin_expect(k0 + k1 != uint32_t(N - 1), 0)) {
-        return false;
-    }
+    if (__builtin_expect(k0 + k1 != 6U, 0)) return false;
+
     uint64_t st0 = 1ULL | (cm0 << 1);
     uint64_t st1 = (cm0 >> 63) | (cm1 << 1);
-    uint64_t en0 = (cm0 >> 1) | (cm1 << 63) | (L <= 64 ? (1ULL << (L - 1)) : 0ULL);
-    uint64_t en1 = (cm1 >> 1) | (L > 64 ? (1ULL << (L - 65)) : 0ULL);
+    uint64_t en0 = (cm0 >> 1) | (cm1 << 63);
+    uint64_t en1 = (cm1 >> 1) | (1ULL << (L - 65U));
     uint64_t qbad = (qm0 & ~(st0 | en0)) | (qm1 & ~(st1 | en1)) |
                     (qm0 & st0 & en0) | (qm1 & st1 & en1);
-    if (__builtin_expect(qbad != 0, 0)) {
-        return false;
-    }
+    if (__builtin_expect(qbad != 0, 0)) return false;
 
-    uint32_t ends[2 * N];
+    if (__builtin_expect(k0 < 3U, 0)) return parse_csv_line_scalar<7>(line, line + L, out);
+
     uint64_t a = cm0;
-    #pragma GCC unroll 8
-    for (int i = 0; i < N - 1; ++i) {
-        ends[i] = a ? uint32_t(__builtin_ctzll(a)) : 0U;
-        a &= a - 1;
+    uint32_t e0 = uint32_t(__builtin_ctzll(a)); a &= a - 1;
+    uint32_t e1 = uint32_t(__builtin_ctzll(a)); a &= a - 1;
+    uint32_t e2 = uint32_t(__builtin_ctzll(a)); a &= a - 1;
+    uint32_t s3 = e2 + 1U;
+    if (__builtin_expect((s3 >= 64U) | (L - s3 >= 64U), 0)) {
+        return parse_csv_line_scalar<7>(line, line + L, out);
     }
-    uint64_t b = cm1;
-    uint32_t* p1 = ends + k0;
-    #pragma GCC unroll 8
-    for (int i = 0; i < N - 1; ++i) {
-        p1[i] = 64U + (b ? uint32_t(__builtin_ctzll(b)) : 0U);
-        b &= b - 1;
-    }
-    ends[N - 1] = uint32_t(L);
+    // Single 64-bit register holds ALL remaining 3 commas (e3, e4, e5)!
+    uint64_t crem = (a >> s3) | (cm1 << (64U - s3));
+    uint32_t e3 = s3 + uint32_t(__builtin_ctzll(crem)); crem &= crem - 1;
+    uint32_t e4 = s3 + uint32_t(__builtin_ctzll(crem)); crem &= crem - 1;
+    uint32_t e5 = s3 + uint32_t(__builtin_ctzll(crem));
 
-    uint64_t qe0 = qm0 << 1;
-    uint64_t qe1 = (qm0 >> 63) | (qm1 << 1);
-    uint32_t s = 0;
-    uint32_t mismatch = 0;
-    #pragma GCC unroll 8
-    for (int f = 0; f < N; ++f) {
-        uint32_t e = ends[f];
-        uint32_t qs = uint32_t(((s < 64 ? qm0 : qm1) >> (s & 63)) & 1ULL);
-        uint32_t qe = uint32_t(((e < 64 ? qe0 : qe1) >> (e & 63)) & 1ULL);
-        mismatch |= (qs ^ qe);
-        out[f] = {line + s + qs, size_t((e - s) - (qs << 1))};
-        s = e + 1U;
-    }
-    return __builtin_expect(mismatch == 0, 1);
+    if (__builtin_expect(e0 == 0, 0)) return false; // empty event_id -> dropped!
+    uint32_t qs0 = (line[0] == '"'),       qe0 = (line[e0 - 1] == '"');
+    uint32_t qs1 = (line[e0 + 1] == '"'),  qe1 = (line[e1 - 1] == '"');
+    uint32_t qs2 = (line[e1 + 1] == '"'),  qe2 = (line[e2 - 1] == '"');
+    uint32_t qs3 = (line[s3] == '"'),      qe3 = (line[e3 - 1] == '"');
+    uint32_t qs4 = (line[e3 + 1] == '"'),  qe4 = (line[e4 - 1] == '"');
+    uint32_t qs5 = (line[e4 + 1] == '"'),  qe5 = (line[e5 - 1] == '"');
+    uint32_t qs6 = (line[e5 + 1] == '"'),  qe6 = (line[L - 1] == '"');
+    uint32_t mis = (qs0 ^ qe0) | (qs1 ^ qe1) | (qs2 ^ qe2) | (qs3 ^ qe3) |
+                   (qs4 ^ qe4) | (qs5 ^ qe5) | (qs6 ^ qe6);
+    if (__builtin_expect(mis != 0, 0)) return false;
+
+    out[0] = {line + qs0,          size_t(e0 - (qs0 << 1))};
+    out[1] = {line + e0 + 1 + qs1, size_t((e1 - e0 - 1) - (qs1 << 1))};
+    out[2] = {line + e1 + 1 + qs2, size_t((e2 - e1 - 1) - (qs2 << 1))};
+    out[3] = {line + s3 + qs3,     size_t((e3 - s3) - (qs3 << 1))};
+    out[4] = {line + e3 + 1 + qs4, size_t((e4 - e3 - 1) - (qs4 << 1))};
+    out[5] = {line + e4 + 1 + qs5, size_t((e5 - e4 - 1) - (qs5 << 1))};
+    out[6] = {line + e5 + 1 + qs6, size_t((L - e5 - 1) - (qs6 << 1))};
+    return true;
 }
 
-static inline const char* find_nl_simd(const char* p, const char* end) {
+// Single-word 64-bit extractor for clicks (N=4) and links (N=2) when L in [1, 63]!
+template <int N>
+static SS_ALWAYS_INLINE bool extract_short64(
+    const char* line, uint32_t L,
+    uint64_t cm0, uint64_t qm0,
+    Slice out[N]
+) {
+    uint64_t lm = (1ULL << L) - 1ULL;
+    cm0 &= lm;
+    qm0 &= lm;
+    if (__builtin_expect(uint32_t(__builtin_popcountll(cm0)) != uint32_t(N - 1), 0)) return false;
+    uint64_t st0 = 1ULL | (cm0 << 1);
+    uint64_t en0 = (cm0 >> 1) | (1ULL << (L - 1U));
+    if (__builtin_expect(((qm0 & ~(st0 | en0)) | (qm0 & st0 & en0)) != 0, 0)) return false;
+
+    if constexpr (N == 2) {
+        uint32_t e0 = uint32_t(__builtin_ctzll(cm0));
+        if (__builtin_expect(e0 == 0 || e0 + 1 == L, 0)) return false;
+        uint32_t qs0 = (line[0] == '"'),      qe0 = (line[e0 - 1] == '"');
+        uint32_t qs1 = (line[e0 + 1] == '"'), qe1 = (line[L - 1] == '"');
+        if (__builtin_expect(((qs0 ^ qe0) | (qs1 ^ qe1)) != 0, 0)) return false;
+        out[0] = {line + qs0,          size_t(e0 - (qs0 << 1))};
+        out[1] = {line + e0 + 1 + qs1, size_t((L - e0 - 1) - (qs1 << 1))};
+        return true;
+    } else if constexpr (N == 4) {
+        uint64_t a = cm0;
+        uint32_t e0 = uint32_t(__builtin_ctzll(a)); a &= a - 1;
+        uint32_t e1 = uint32_t(__builtin_ctzll(a)); a &= a - 1;
+        uint32_t e2 = uint32_t(__builtin_ctzll(a));
+        if (__builtin_expect(e0 == 0, 0)) return false;
+        uint32_t qs0 = (line[0] == '"'),      qe0 = (line[e0 - 1] == '"');
+        uint32_t qs1 = (line[e0 + 1] == '"'), qe1 = (line[e1 - 1] == '"');
+        uint32_t qs2 = (line[e1 + 1] == '"'), qe2 = (line[e2 - 1] == '"');
+        uint32_t qs3 = (line[e2 + 1] == '"'), qe3 = (line[L - 1] == '"');
+        uint32_t mis = (qs0 ^ qe0) | (qs1 ^ qe1) | (qs2 ^ qe2) | (qs3 ^ qe3);
+        if (__builtin_expect(mis != 0, 0)) return false;
+        out[0] = {line + qs0,          size_t(e0 - (qs0 << 1))};
+        out[1] = {line + e0 + 1 + qs1, size_t((e1 - e0 - 1) - (qs1 << 1))};
+        out[2] = {line + e1 + 1 + qs2, size_t((e2 - e1 - 1) - (qs2 << 1))};
+        out[3] = {line + e2 + 1 + qs3, size_t((L - e2 - 1) - (qs3 << 1))};
+        return true;
+    } else {
+        return parse_csv_line_scalar<N>(line, line + L, out);
+    }
+}
+
+static SS_ALWAYS_INLINE const char* find_nl_simd(const char* p, const char* end) {
     while (p + 64 <= end) {
         uint64_t m = Vec64::load(p).eq('\n');
         if (m) return p + __builtin_ctzll(m);
@@ -746,23 +835,16 @@ static inline const char* find_nl_simd(const char* p, const char* end) {
     return nullptr;
 }
 
-static inline int32_t ms_to_day(int64_t ms) {
+static SS_ALWAYS_INLINE int32_t ms_to_day(int64_t ms) {
     int64_t q = ms / DAY_MS;
     int64_t r = ms % DAY_MS;
     if (r < 0) --q;
     return int32_t(q);
 }
 
-// 64-byte non-temporal cache-bypassing copy on x86-64 (eliminates RFO DRAM reads on slab flushes!)
-static inline void stream_copy_64b_aligned(void* dst, const void* src, size_t bytes) {
-#if defined(__AVX512F__)
-    const char* s = static_cast<const char*>(src);
-    char* d = static_cast<char*>(dst);
-    for (size_t off = 0; off < bytes; off += 64) {
-        __m512i v = _mm512_loadu_si512(s + off);
-        _mm512_stream_si512(reinterpret_cast<__m512i*>(d + off), v);
-    }
-#elif defined(__AVX2__)
+// Fast 64-byte AVX2 non-temporal copy (no ZMM turbo throttle!)
+static SS_ALWAYS_INLINE void stream_copy_64b_aligned(void* dst, const void* src, size_t bytes) {
+#if defined(__AVX2__)
     const char* s = static_cast<const char*>(src);
     char* d = static_cast<char*>(dst);
     for (size_t off = 0; off < bytes; off += 32) {
@@ -774,8 +856,8 @@ static inline void stream_copy_64b_aligned(void* dst, const void* src, size_t by
 #endif
 }
 
-static inline void stream_fence() {
-#if defined(__AVX2__) || defined(__AVX512F__)
+static SS_ALWAYS_INLINE void stream_fence() {
+#if defined(__AVX2__)
     _mm_sfence();
 #endif
 }

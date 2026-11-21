@@ -31,23 +31,27 @@
 namespace SS_ENGINE_NS {
 
 // ============================================================================
-// Cgroup + Affinity-Aware CPU Detection (Never Oversubscribes Pinned vCPUs!)
+// Cgroup + Affinity-Aware CPU Detection & Thread Pinning
 // ============================================================================
-static int detect_ncpu() {
-    if (const char* e = std::getenv("NCPU")) {
-        int v = std::atoi(e);
-        if (v > 0) return v > 64 ? 64 : v;
-    }
+struct CpuTopology {
+    int ncpu = 1;
+    std::vector<int> cpus;
+};
+
+static CpuTopology detect_topology() {
+    CpuTopology topo;
     int n = int(std::thread::hardware_concurrency());
     if (n < 1) n = 1;
 #if defined(__linux__)
     cpu_set_t set;
     CPU_ZERO(&set);
     if (::sched_getaffinity(0, sizeof(set), &set) == 0) {
-        int aff = CPU_COUNT(&set);
+        for (int c = 0; c < CPU_SETSIZE; ++c) {
+            if (CPU_ISSET(c, &set)) topo.cpus.push_back(c);
+        }
+        int aff = int(topo.cpus.size());
         if (aff > 0 && aff < n) n = aff;
     }
-    // Check cgroup v2 cpu.max ("<quota> <period>" or "max <period>")
     if (FILE* f = std::fopen("/sys/fs/cgroup/cpu.max", "r")) {
         char qbuf[64]{};
         long long period = 0;
@@ -75,22 +79,45 @@ static int detect_ncpu() {
         std::fclose(fq);
     }
 #endif
+    if (const char* e = std::getenv("NCPU")) {
+        int v = std::atoi(e);
+        if (v > 0) n = v;
+    }
     if (n < 1) n = 1;
     if (n > 64) n = 64;
-    return n;
+    topo.ncpu = n;
+    return topo;
+}
+
+static void pin_current_thread(int tid, const std::vector<int>& cpus) {
+#if defined(__linux__)
+    if (!cpus.empty()) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(cpus[size_t(tid) % cpus.size()], &set);
+        ::sched_setaffinity(0, sizeof(set), &set);
+    }
+#else
+    (void)tid; (void)cpus;
+#endif
 }
 
 // ============================================================================
-// Persistent Low-Latency Thread Pool (Lock-Free Fast Wakeup when Spinning!)
+// Persistent Low-Latency Pinned Thread Pool
 // ============================================================================
 class ThreadPool {
 public:
     int nthreads = 1;
 
-    explicit ThreadPool(int n) : nthreads(n < 1 ? 1 : (n > 64 ? 64 : n)) {
+    explicit ThreadPool(const CpuTopology& topo)
+        : nthreads(topo.ncpu < 1 ? 1 : (topo.ncpu > 64 ? 64 : topo.ncpu)), allowed_cpus(topo.cpus) {
+        pin_current_thread(0, allowed_cpus);
         workers.reserve(static_cast<size_t>(nthreads - 1));
         for (int t = 1; t < nthreads; ++t) {
-            workers.emplace_back([this, t]() { worker_loop(t); });
+            workers.emplace_back([this, t]() {
+                pin_current_thread(t, allowed_cpus);
+                worker_loop(t);
+            });
         }
     }
 
@@ -121,6 +148,7 @@ public:
     }
 
 private:
+    std::vector<int> allowed_cpus;
     std::vector<std::thread> workers;
     std::mutex mu;
     std::condition_variable cv;
@@ -135,7 +163,7 @@ private:
             uint32_t target = my_gen + 1;
             int spins = 0;
             while (gen.load(std::memory_order_acquire) < target) {
-                if (++spins > 60000) {
+                if (++spins > 80000) {
                     sleeping.fetch_add(1, std::memory_order_seq_cst);
                     std::unique_lock<std::mutex> lk(mu);
                     cv.wait(lk, [&]() { return gen.load(std::memory_order_acquire) >= target; });
@@ -156,7 +184,7 @@ private:
 };
 
 // ============================================================================
-// L1 Write-Combining Slab-Backed Partitioned Store (64B Aligned + NT Stores!)
+// Huge-Page Slab-Backed L1 Write-Combining Partitioned Store (Zero WC-Thrash!)
 // ============================================================================
 template <typename T, uint32_t CAP, int NUM_B, uint32_t WC_CAP, bool UseNT = false>
 struct PartitionedStore {
@@ -165,7 +193,7 @@ struct PartitionedStore {
         uint32_t count;
         alignas(64) T items[CAP];
     };
-    static constexpr size_t SLAB_BYTES = 16ULL << 20; // 16 MB slabs
+    static constexpr size_t SLAB_BYTES = 16ULL << 20; // 16 MB huge-page slabs
 
     struct alignas(64) ThreadState {
         alignas(64) T wc_buf[NUM_B][WC_CAP];
@@ -175,13 +203,15 @@ struct PartitionedStore {
         std::vector<void*> slabs;
         char* slab = nullptr;
         size_t slab_pos = SLAB_BYTES;
+        size_t slab_cap = SLAB_BYTES;
 
-        inline Block* alloc_block() {
+        SS_COLD_NOINLINE Block* alloc_block() {
             constexpr size_t bsz = (sizeof(Block) + 63) & ~size_t(63);
-            if (__builtin_expect(slab_pos + bsz > SLAB_BYTES, 0)) {
-                slab = static_cast<char*>(alloc_mmap(SLAB_BYTES));
+            if (__builtin_expect(slab_pos + bsz > slab_cap, 0)) {
+                slab = static_cast<char*>(alloc_mmap(SLAB_BYTES, true));
                 slabs.push_back(slab);
                 slab_pos = 0;
+                slab_cap = SLAB_BYTES;
             }
             auto* b = reinterpret_cast<Block*>(slab + slab_pos);
             slab_pos += bsz;
@@ -190,7 +220,15 @@ struct PartitionedStore {
             return b;
         }
 
-        inline void flush_bucket_full(uint32_t b) {
+        void donate_slab(void* mem, size_t bytes) {
+            if (!mem || bytes < sizeof(Block) * 4) return;
+            slab = static_cast<char*>(mem);
+            slab_pos = 0;
+            slab_cap = bytes;
+            if (bytes >= SLAB_BYTES) slabs.push_back(mem);
+        }
+
+        SS_ALWAYS_INLINE void flush_bucket_full(uint32_t b) {
             Block* h = heads[b];
             if (__builtin_expect(h == nullptr || h->count + WC_CAP > CAP, 0)) {
                 Block* nb = alloc_block();
@@ -208,7 +246,7 @@ struct PartitionedStore {
             wc_cnt[b] = 0;
         }
 
-        inline void flush_bucket_partial(uint32_t b) {
+        SS_COLD_NOINLINE void flush_bucket_partial(uint32_t b) {
             uint32_t n = wc_cnt[b];
             if (n == 0) return;
             Block* h = heads[b];
@@ -224,7 +262,7 @@ struct PartitionedStore {
             wc_cnt[b] = 0;
         }
 
-        inline void push(uint32_t bucket, const T& val) {
+        SS_ALWAYS_INLINE void push(uint32_t bucket, const T& val) {
             uint8_t c = wc_cnt[bucket];
             wc_buf[bucket][c++] = val;
             if (__builtin_expect(c == WC_CAP, 0)) {
@@ -249,7 +287,7 @@ struct PartitionedStore {
         nthreads = nt;
         ts.resize(static_cast<size_t>(nt));
         for (int t = 0; t < nt; ++t) {
-            void* mem = alloc_mmap((sizeof(ThreadState) + 4095) & ~size_t(4095));
+            void* mem = alloc_mmap((sizeof(ThreadState) + 4095) & ~size_t(4095), false);
             ts[size_t(t)] = new (mem) ThreadState();
         }
     }
@@ -262,19 +300,17 @@ struct PartitionedStore {
 };
 
 // ============================================================================
-// Zero-Copy MMAP Parallel File Opener & Non-Overlapping 64B Block CSV Scanner
+// Zero-Fault L2-Warm PREAD(256KB) Chunked File Scanner + 64B Pad
 // ============================================================================
-struct MmapCsvFile {
-    const char* ptr = nullptr;
+struct CsvFile {
+    std::string path;
+    int fd = -1;
     size_t file_size = 0;
-    size_t data_start = 0;
     uint8_t kind = 0; // 0 = click, 1 = event, 2 = link
 };
 
-struct MmapTask {
-    const char* base;
-    size_t file_size;
-    size_t data_start;
+struct CsvTask {
+    const CsvFile* file;
     size_t start;
     size_t end;
     uint8_t kind;
@@ -305,157 +341,257 @@ static void list_csv_paths(const std::string& dir, uint8_t kind, std::vector<std
               [](const auto& a, const auto& b) { return a.first < b.first; });
 }
 
-static MmapCsvFile open_and_mmap_csv(const std::string& path, uint8_t kind) {
-    int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) return {};
-    struct stat st{};
-    if (::fstat(fd, &st) != 0 || st.st_size <= 0) {
-        ::close(fd);
-        return {};
+static ssize_t pread_full(int fd, char* dst, size_t len, size_t off) {
+    size_t got = 0;
+    while (got < len) {
+        ssize_t n = ::pread(fd, dst + got, len - got, off_t(off + got));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return got > 0 ? ssize_t(got) : -1;
+        }
+        if (n == 0) break;
+        got += size_t(n);
     }
-    size_t fsz = size_t(st.st_size);
-    void* m = ::mmap(nullptr, fsz, PROT_READ, MAP_SHARED, fd, 0);
-    ::close(fd); // POSIX keeps mmap valid after close -> zero EMFILE risk!
-    if (m == MAP_FAILED) return {};
-    const char* cp = static_cast<const char*>(m);
-    const char* nl = find_nl_simd(cp, cp + fsz);
-    size_t ds = nl ? (size_t(nl - cp) + 1) : fsz;
-    if (ds >= fsz) {
-        ::munmap(m, fsz);
-        return {};
-    }
-    return {cp, fsz, ds, kind};
+    return ssize_t(got);
 }
 
-static void build_mmap_tasks(
-    const std::vector<MmapCsvFile>& files,
-    uint8_t kind_mask, // bitmask: (1<<kind)
+static void build_csv_tasks(
+    const std::vector<CsvFile>& files,
+    uint8_t kind_mask,
     int nthreads,
-    std::vector<MmapTask>& tasks
+    std::vector<CsvTask>& tasks
 ) {
     size_t total_bytes = 0;
     for (const auto& f : files) {
-        if (f.ptr && ((kind_mask >> f.kind) & 1U)) total_bytes += (f.file_size - f.data_start);
+        if (f.file_size > 0 && ((kind_mask >> f.kind) & 1U)) total_bytes += f.file_size;
     }
     if (total_bytes == 0) return;
-    size_t chunk_sz = std::max<size_t>(131072, std::min<size_t>(4ULL << 20, total_bytes / size_t(nthreads * 8) + 1));
+    size_t chunk_sz = std::max<size_t>(262144, std::min<size_t>(4ULL << 20, total_bytes / size_t(nthreads * 8) + 1));
     for (const auto& f : files) {
-        if (!f.ptr || !((kind_mask >> f.kind) & 1U)) continue;
-        size_t pos = f.data_start;
+        if (f.file_size == 0 || !((kind_mask >> f.kind) & 1U)) continue;
+        size_t pos = 0;
         while (pos < f.file_size) {
             size_t end = std::min<size_t>(f.file_size, pos + chunk_sz);
-            tasks.push_back({f.ptr, f.file_size, f.data_start, pos, end, f.kind});
+            tasks.push_back({&f, pos, end, f.kind});
             pos = end;
         }
     }
 }
 
-// Non-overlapping 64-byte SIMD block-bitmask CSV scanner directly on mmap!
-// Computes (nl, comma, quote) ONCE per 64 bytes (ZERO redundant loads, ZERO pread copy!).
-// 100% exact across all line lengths (1..127 fast path, >=128 scalar, EOF without '\n').
-template <int N, typename OnFields>
-static inline void scan_mmap_csv_simd(const MmapTask& task, OnFields&& on_fields) {
-    const char* base = task.base;
-    const size_t n = task.file_size;
-    const size_t limit = task.end;
-    size_t cur = task.start;
+// Reusable per-thread L2-warm pread buffer (256 KB + carry + 64B zero-pad).
+struct ReadBuf {
+    static constexpr size_t READ_CHUNK = 262144; // 256 KB L2-warm!
+    char* data = nullptr;
+    size_t cap = 0;
 
-    if (cur > task.data_start && base[cur - 1] != '\n') {
-        const char* nl = find_nl_simd(base + cur, base + n);
-        if (!nl) return;
-        cur = size_t(nl - base) + 1;
-        if (cur >= limit) return;
+    void init(size_t initial = READ_CHUNK + 65536) {
+        cap = initial;
+        data = static_cast<char*>(alloc_mmap((cap + 4095) & ~size_t(4095), false));
     }
+
+    SS_COLD_NOINLINE void ensure(size_t need) {
+        if (need <= cap) return;
+        size_t nc = std::max(cap * 2, need + 65536);
+        char* nd = static_cast<char*>(alloc_mmap((nc + 4095) & ~size_t(4095), false));
+        std::memcpy(nd, data, cap);
+        ::munmap(data, (cap + 4095) & ~size_t(4095));
+        data = nd;
+        cap = nc;
+    }
+};
+
+// Zero-fault pread + non-overlapping 64B block-SIMD CSV scanner!
+// Handles: header skip (start==0), mid-file chunk alignment (zero wasted read!),
+// arbitrary line lengths (including >= 4 KB), EOF without '\n', and 64B safe zero-padding!
+template <int N, typename OnFields>
+static SS_ALWAYS_INLINE void scan_pread_csv(const CsvTask& task, ReadBuf& rbuf, OnFields&& on_fields) {
+    const CsvFile& file = *task.file;
+    int fd = file.fd;
+    bool close_after = false;
+    if (__builtin_expect(fd < 0, 0)) {
+        fd = ::open(file.path.c_str(), O_RDONLY);
+        if (fd < 0) return;
+        close_after = true;
+    }
+
+    const size_t fsz = file.file_size;
+    const size_t limit = task.end;
+    // If start > 0, start reading at start - 1 to check if previous byte was '\n' with ZERO extra syscall!
+    size_t file_pos = (task.start > 0) ? (task.start - 1) : 0;
+    size_t carry = 0;
+    bool skip_first_line = true; // start==0 skips header; start>0 skips partial line if buf[0]!='\n'
+    bool first_read = true;
+    bool hit_limit = false;
 
     Slice f[N];
     uint64_t nls[64], cms[66], qms[66];
 
-    while (cur < limit) {
-        size_t avail = n - cur;
-        size_t nblks = std::min<size_t>(64, avail >> 6);
-        if (__builtin_expect(nblks == 0, 0)) break;
-
-        const char* bptr = base + cur;
-        for (size_t bi = 0; bi < nblks; ++bi) {
-            Vec64 v = Vec64::load(bptr + (bi << 6));
-            nls[bi] = v.eq('\n');
-            cms[bi] = v.eq(',');
-            qms[bi] = v.eq('"');
+    while (true) {
+        if (file_pos >= fsz) break;
+        // Read up to READ_CHUNK (or just enough to finish straddling line after limit)
+        size_t to_read = hit_limit ? std::min<size_t>(4096, fsz - file_pos)
+                                   : std::min<size_t>(ReadBuf::READ_CHUNK, fsz - file_pos);
+        if (__builtin_expect(carry + to_read + 128 > rbuf.cap, 0)) {
+            rbuf.ensure(carry + to_read + 128);
         }
-        cms[nblks] = cms[nblks + 1] = 0;
-        qms[nblks] = qms[nblks + 1] = 0;
+        ssize_t got = pread_full(fd, rbuf.data + carry, to_read, file_pos);
+        if (got <= 0) break;
+        size_t buf_file_off = file_pos - carry;
+        file_pos += size_t(got);
+        size_t total = carry + size_t(got);
+        // 64B zero-pad guarantees Vec64::load & 8B padded encoders NEVER overread!
+        std::memset(rbuf.data + total, 0, 64);
 
-        size_t ls = 0;
-        const size_t limit_rel = limit - cur;
-        for (size_t bi = 0; bi < nblks; ++bi) {
-            uint64_t nm = nls[bi];
-            while (nm) {
-                size_t nl_rel = (bi << 6) + size_t(__builtin_ctzll(nm));
-                nm &= nm - 1;
-                size_t L = nl_rel - ls;
-                if (__builtin_expect(L > 0 && L < 128, 1)) {
-                    size_t sbi = ls >> 6;
-                    unsigned sh = unsigned(ls & 63);
-                    uint64_t c0, c1, q0, q1;
-                    if (__builtin_expect(sh != 0, 1)) {
-                        unsigned rsh = 64U - sh;
-                        uint64_t nc = cms[sbi + 1], nnc = cms[sbi + 2];
-                        c0 = (cms[sbi] >> sh) | (nc << rsh);
-                        c1 = (nc >> sh) | (nnc << rsh);
-                        uint64_t nq = qms[sbi + 1], nnq = qms[sbi + 2];
-                        q0 = (qms[sbi] >> sh) | (nq << rsh);
-                        q1 = (nq >> sh) | (nnq << rsh);
+        size_t cur = 0;
+        if (__builtin_expect(first_read, 0)) {
+            first_read = false;
+            if (task.start > 0) {
+                if (rbuf.data[0] == '\n') {
+                    cur = 1; // task.start begins right after '\n'
+                    skip_first_line = false;
+                } else {
+                    cur = 1; // skip remainder of line belonging to previous chunk
+                    skip_first_line = true;
+                }
+            }
+        }
+
+        if (__builtin_expect(skip_first_line, 0)) {
+            const char* nl = find_nl_simd(rbuf.data + cur, rbuf.data + total);
+            if (!nl) {
+                if (file_pos >= limit) break;
+                carry = 0;
+                continue;
+            }
+            cur = size_t(nl - rbuf.data) + 1;
+            skip_first_line = false;
+            if (buf_file_off + cur >= limit) break;
+        }
+
+        // Process all complete lines starting strictly before `limit` inside `rbuf.data[cur..total]`!
+        const size_t limit_in_buf = (limit > buf_file_off) ? std::min<size_t>(limit - buf_file_off, total) : 0;
+        bool done = false;
+
+        while (cur < limit_in_buf) {
+            size_t avail = total - cur;
+            size_t nblks = std::min<size_t>(64, avail >> 6);
+            if (__builtin_expect(nblks == 0, 0)) break;
+
+            const char* bptr = rbuf.data + cur;
+            for (size_t bi = 0; bi < nblks; ++bi) {
+                Vec64 v = Vec64::load(bptr + (bi << 6));
+                nls[bi] = v.eq('\n');
+                cms[bi] = v.eq(',');
+                qms[bi] = v.eq('"');
+            }
+            cms[nblks] = cms[nblks + 1] = 0;
+            qms[nblks] = qms[nblks + 1] = 0;
+
+            size_t ls = 0;
+            const size_t lrel = limit_in_buf - cur;
+            for (size_t bi = 0; bi < nblks; ++bi) {
+                uint64_t nm = nls[bi];
+                while (nm) {
+                    size_t nl_rel = (bi << 6) + size_t(__builtin_ctzll(nm));
+                    nm &= nm - 1;
+                    uint32_t L = uint32_t(nl_rel - ls);
+                    if constexpr (N == 7) {
+                        if (__builtin_expect(L >= 64U && L < 128U, 1)) {
+                            size_t sbi = ls >> 6;
+                            unsigned sh = unsigned(ls & 63);
+                            uint64_t c0, c1, q0, q1;
+                            if (__builtin_expect(sh != 0, 1)) {
+                                unsigned rsh = 64U - sh;
+                                uint64_t nc = cms[sbi + 1], nnc = cms[sbi + 2];
+                                c0 = (cms[sbi] >> sh) | (nc << rsh);
+                                c1 = (nc >> sh) | (nnc << rsh);
+                                uint64_t nq = qms[sbi + 1], nnq = qms[sbi + 2];
+                                q0 = (qms[sbi] >> sh) | (nq << rsh);
+                                q1 = (nq >> sh) | (nnq << rsh);
+                            } else {
+                                c0 = cms[sbi]; c1 = cms[sbi + 1];
+                                q0 = qms[sbi]; q1 = qms[sbi + 1];
+                            }
+                            if (__builtin_expect(extract7_hi64(bptr + ls, L, c0, c1, q0, q1, f), 1)) {
+                                on_fields(f);
+                            }
+                        } else if (L > 0) {
+                            if (parse_csv_line_scalar<7>(bptr + ls, bptr + nl_rel, f)) on_fields(f);
+                        }
                     } else {
-                        c0 = cms[sbi]; c1 = cms[sbi + 1];
-                        q0 = qms[sbi]; q1 = qms[sbi + 1];
+                        if (__builtin_expect(L > 0 && L < 64U, 1)) {
+                            size_t sbi = ls >> 6;
+                            unsigned sh = unsigned(ls & 63);
+                            uint64_t c0, q0;
+                            if (__builtin_expect(sh != 0, 1)) {
+                                unsigned rsh = 64U - sh;
+                                c0 = (cms[sbi] >> sh) | (cms[sbi + 1] << rsh);
+                                q0 = (qms[sbi] >> sh) | (qms[sbi + 1] << rsh);
+                            } else {
+                                c0 = cms[sbi];
+                                q0 = qms[sbi];
+                            }
+                            if (__builtin_expect(extract_short64<N>(bptr + ls, L, c0, q0, f), 1)) {
+                                on_fields(f);
+                            }
+                        } else if (L >= 64U) {
+                            if (parse_csv_line_scalar<N>(bptr + ls, bptr + nl_rel, f)) on_fields(f);
+                        }
                     }
-                    unsigned __int128 lm128 = (static_cast<unsigned __int128>(1) << L) - 1;
-                    c0 &= uint64_t(lm128);
-                    c1 &= uint64_t(lm128 >> 64);
-                    q0 &= uint64_t(lm128);
-                    q1 &= uint64_t(lm128 >> 64);
-                    if (__builtin_expect(extract_fields_branchless<N>(bptr + ls, L, c0, c1, q0, q1, f), 1)) {
-                        on_fields(f);
-                    }
-                } else if (L >= 128) {
-                    if (parse_csv_line_scalar<N>(bptr + ls, bptr + nl_rel, f)) {
-                        on_fields(f);
+                    ls = nl_rel + 1;
+                    if (ls >= lrel) {
+                        cur += ls;
+                        done = true;
+                        break;
                     }
                 }
-                ls = nl_rel + 1;
-                if (ls >= limit_rel) return;
+                if (done) break;
+            }
+            if (done) break;
+            if (__builtin_expect(ls == 0, 0)) {
+                // Rare line >= 4 KB inside buffer
+                const char* nl = find_nl_simd(bptr + (nblks << 6), rbuf.data + total);
+                if (!nl) break; // need more bytes!
+                if (parse_csv_line_scalar<N>(bptr, nl, f)) on_fields(f);
+                cur = size_t(nl - rbuf.data) + 1;
+                if (cur >= limit_in_buf) { done = true; break; }
+            } else {
+                cur += ls;
             }
         }
 
-        if (__builtin_expect(ls == 0, 0)) {
-            // Rare line >= 4 KB (no '\n' in all nblks)
-            const char* nl = find_nl_simd(bptr + (nblks << 6), base + n);
-            const char* le = nl ? nl : (base + n);
-            if (parse_csv_line_scalar<N>(bptr, le, f)) {
-                on_fields(f);
-            }
-            if (!nl) return;
-            cur = size_t(nl - base) + 1;
-        } else {
-            cur += ls;
+        if (done && buf_file_off + cur >= limit) break;
+
+        // Finish any remaining complete lines in tail (< 64B) before carrying over partial line
+        while (cur < limit_in_buf) {
+            const char* line = rbuf.data + cur;
+            const char* nl = find_nl_simd(line, rbuf.data + total);
+            if (!nl) break;
+            if (parse_csv_line_scalar<N>(line, nl, f)) on_fields(f);
+            cur = size_t(nl - rbuf.data) + 1;
         }
+
+        if (buf_file_off + cur >= limit) break;
+
+        // Handle EOF without trailing '\n'
+        if (file_pos >= fsz) {
+            if (cur < total && buf_file_off + cur < limit) {
+                if (parse_csv_line_scalar<N>(rbuf.data + cur, rbuf.data + total, f)) on_fields(f);
+            }
+            break;
+        }
+
+        // Carry partial line to next read; if we already reached `limit`, read small tail to finish it!
+        carry = total - cur;
+        if (carry > 0) std::memmove(rbuf.data, rbuf.data + cur, carry);
+        if (file_pos >= limit) hit_limit = true;
     }
 
-    // Scalar tail for final < 64 bytes of file (including EOF without '\n')
-    while (cur < limit) {
-        const char* line = base + cur;
-        const char* nl = find_nl_simd(line, base + n);
-        const char* le = nl ? nl : (base + n);
-        if (parse_csv_line_scalar<N>(line, le, f)) {
-            on_fields(f);
-        }
-        if (!nl) break;
-        cur = size_t(nl - base) + 1;
-    }
+    if (close_after) ::close(fd);
 }
 
 // ============================================================================
-// Small File Helper (EINTR-safe pread) + Products / Campaigns Lookups
+// Small File Helper + L1D/L2-Hot Branchless Campaigns & Products Lookups
 // ============================================================================
 static std::string read_small_file(const std::string& path) {
     int fd = ::open(path.c_str(), O_RDONLY);
@@ -466,14 +602,9 @@ static std::string read_small_file(const std::string& path) {
         return {};
     }
     std::string s(size_t(st.st_size), '\0');
-    size_t off = 0;
-    while (off < s.size()) {
-        ssize_t n = ::pread(fd, s.data() + off, s.size() - off, off_t(off));
-        if (n < 0) { if (errno == EINTR) continue; break; }
-        if (n == 0) break;
-        off += size_t(n);
-    }
+    ssize_t n = pread_full(fd, s.data(), s.size(), 0);
     ::close(fd);
+    if (n >= 0) s.resize(size_t(n));
     return s;
 }
 
@@ -527,7 +658,7 @@ struct FastStringIdMap {
         table[slot] = {h, off, uint32_t(s.size()), val};
     }
 
-    inline uint32_t find(const char* s, size_t len) const {
+    SS_COLD_NOINLINE uint32_t find(const char* s, size_t len) const {
         uint64_t h = hash_bytes(s, len);
         if (h == 0) h = 1;
         uint32_t slot = uint32_t(h) & mask;
@@ -546,8 +677,10 @@ struct Campaigns {
     std::vector<std::string> ids;
     std::vector<std::string> channels;
     FastStringIdMap map;
-    static constexpr uint32_t FAST_CAP = 65536;
-    std::vector<uint32_t> fast_c;
+    // 8 KB L1D-hot direct LUT for c_1 .. c_4095!
+    static constexpr uint32_t FAST_CAP = 4096;
+    static constexpr uint16_t NF16 = 0xFFFFU;
+    uint16_t fast_c[FAST_CAP];
     uint32_t organic_idx = 0;
 
     void load(const std::string& path) {
@@ -562,7 +695,7 @@ struct Campaigns {
                 while (p < end) {
                     const char* eol = find_nl_simd(p, end);
                     const char* le = eol ? eol : end;
-                    if (parse_csv_line<2>(p, le, f)) {
+                    if (parse_csv_line_scalar<2>(p, le, f)) {
                         rows.emplace_back(std::string(f[0].ptr, f[0].len), std::string(f[1].ptr, f[1].len));
                     }
                     p = eol ? (eol + 1) : end;
@@ -572,21 +705,21 @@ struct Campaigns {
         ids.reserve(rows.size() + 1);
         channels.reserve(rows.size() + 1);
         map.init(rows.size() + 1);
-        fast_c.assign(FAST_CAP, FastStringIdMap::NOT_FOUND);
+        std::fill(std::begin(fast_c), std::end(fast_c), NF16);
         for (uint32_t i = 0; i < uint32_t(rows.size()); ++i) {
             ids.push_back(std::move(rows[i].first));
             channels.push_back(std::move(rows[i].second));
             map.insert(ids[i], i);
             const std::string& s = ids[i];
-            if (s.size() >= 3 && s[0] == 'c' && s[1] == '_' && s[2] >= '1' && s[2] <= '9') {
+            if (s.size() >= 3 && s.size() <= 6 && s[0] == 'c' && s[1] == '_' && s[2] >= '1' && s[2] <= '9') {
                 uint32_t n = 0;
                 bool ok = true;
                 for (size_t k = 2; k < s.size(); ++k) {
                     unsigned d = uint8_t(s[k]) - uint8_t('0');
-                    if (d > 9 || n > 100000) { ok = false; break; }
+                    if (d > 9) { ok = false; break; }
                     n = n * 10 + d;
                 }
-                if (ok && n < FAST_CAP) fast_c[n] = i;
+                if (ok && n < FAST_CAP && i < NF16) fast_c[n] = uint16_t(i);
             }
         }
         organic_idx = uint32_t(ids.size());
@@ -594,29 +727,44 @@ struct Campaigns {
         channels.emplace_back("organic");
     }
 
-    inline uint32_t lookup(const char* s, size_t len) const {
-        if (__builtin_expect(len >= 3 && s[0] == 'c' && s[1] == '_' && s[2] >= '1' && s[2] <= '9', 1)) {
-            uint32_t n = 0;
-            bool ok = true;
-            for (size_t k = 2; k < len; ++k) {
-                unsigned d = uint8_t(s[k]) - uint8_t('0');
-                if (__builtin_expect(d > 9, 0)) { ok = false; break; }
-                n = n * 10 + d;
-                if (__builtin_expect(n >= FAST_CAP, 0)) { ok = false; break; }
+    // Branchless 1..4 digit c_XXXX lookup (requires >= 4 readable pad bytes after s+2!)
+    SS_ALWAYS_INLINE uint32_t lookup_padded(const char* s, size_t len) const {
+        if (__builtin_expect((len - 3) <= 3 && s[0] == 'c' && s[1] == '_', 1)) {
+            uint32_t w;
+            std::memcpy(&w, s + 2, 4);
+            // Shift digits into top `ndig` bytes, fill low bytes with '0' (leading zeros!)
+            uint32_t sh = uint32_t(6 - len) << 3; // 0 for len=6, 8 for 5, 16 for 4, 24 for 3
+            uint32_t b0_ok = uint8_t(w) - uint8_t('1'); // first digit must be '1'..'9' (rejects c_0123!)
+            uint32_t shifted = (w << sh) | (0x30303030U & ~((~0U) << sh));
+            uint32_t bad = ((shifted & 0xF0F0F0F0U) ^ 0x30303030U) |
+                           (((shifted + 0x06060606U) & 0xF0F0F0F0U) ^ 0x30303030U);
+            if (__builtin_expect((bad == 0) & (b0_ok < 9U), 1)) {
+                uint32_t d = shifted & 0x0F0F0F0FU;
+                uint32_t p = (d * 10U + (d >> 8)) & 0x00FF00FFU;
+                uint32_t n = (p & 0xFFU) * 100U + (p >> 16);
+                if (__builtin_expect(n < FAST_CAP, 1)) {
+                    uint16_t r = fast_c[n];
+                    return __builtin_expect(r != NF16, 1) ? uint32_t(r) : FastStringIdMap::NOT_FOUND;
+                }
             }
-            if (__builtin_expect(ok, 1)) return fast_c[n];
         }
         return map.find(s, len);
     }
 };
 
 struct Products {
+    struct CatEntry {
+        uint32_t total_len; // 4 + str_len
+        char bytes[64];     // [4B len][chars] for len <= 60
+    };
     std::vector<std::string> cat_names;
+    std::vector<CatEntry> cat_pre;
     uint32_t unknown_cat_id = 0;
     size_t max_cat_len = 8;
     FastStringIdMap map;
-    static constexpr uint32_t FAST_CAP = 131072;
-    std::vector<uint32_t> fast_p;
+    static constexpr uint32_t FAST_CAP = 65536;
+    uint8_t fast_p8[FAST_CAP];
+    bool use_fast8 = false;
 
     void load(const std::string& path) {
         std::string data = read_small_file(path);
@@ -631,7 +779,7 @@ struct Products {
                 while (p < end) {
                     const char* eol = find_nl_simd(p, end);
                     const char* le = eol ? eol : end;
-                    if (parse_csv_line<2>(p, le, f)) {
+                    if (parse_csv_line_scalar<2>(p, le, f)) {
                         rows.push_back({{f[0].ptr, f[0].len}, {f[1].ptr, f[1].len}});
                     }
                     p = eol ? (eol + 1) : end;
@@ -648,10 +796,20 @@ struct Products {
         }
         std::sort(cats.begin(), cats.end());
         cat_names.reserve(cats.size());
+        cat_pre.resize(cats.size());
         max_cat_len = 8;
-        for (auto c : cats) {
+        for (size_t i = 0; i < cats.size(); ++i) {
+            auto c = cats[i];
             if (c.size() > max_cat_len) max_cat_len = c.size();
             cat_names.emplace_back(c);
+            if (c.size() <= 60) {
+                uint32_t l = uint32_t(c.size());
+                cat_pre[i].total_len = 4 + l;
+                std::memcpy(cat_pre[i].bytes, &l, 4);
+                std::memcpy(cat_pre[i].bytes + 4, c.data(), l);
+            } else {
+                cat_pre[i].total_len = 0;
+            }
         }
 
         FastStringIdMap cat_map;
@@ -661,22 +819,23 @@ struct Products {
             if (cat_names[i] == "unknown") unknown_cat_id = i;
         }
 
-        fast_p.assign(FAST_CAP, unknown_cat_id);
+        use_fast8 = (cat_names.size() < 256);
+        if (use_fast8) std::memset(fast_p8, uint8_t(unknown_cat_id), FAST_CAP);
         size_t non_fast = 0;
         std::vector<std::pair<std::string_view, uint32_t>> slow_rows;
         for (const auto& r : rows) {
             uint32_t cid = cat_map.find(r.second.data(), r.second.size());
             std::string_view s = r.first;
             bool is_fast = false;
-            if (s.size() >= 2 && s[0] == 'p' && s[1] >= '1' && s[1] <= '9') {
+            if (use_fast8 && s.size() >= 2 && s.size() <= 6 && s[0] == 'p' && s[1] >= '1' && s[1] <= '9') {
                 uint32_t n = 0;
                 bool ok = true;
                 for (size_t k = 1; k < s.size(); ++k) {
                     unsigned d = uint8_t(s[k]) - uint8_t('0');
-                    if (d > 9 || n > 200000) { ok = false; break; }
+                    if (d > 9) { ok = false; break; }
                     n = n * 10 + d;
                 }
-                if (ok && n < FAST_CAP) { fast_p[n] = cid; is_fast = true; }
+                if (ok && n < FAST_CAP) { fast_p8[n] = uint8_t(cid); is_fast = true; }
             }
             if (!is_fast) { ++non_fast; slow_rows.push_back({s, cid}); }
         }
@@ -684,17 +843,16 @@ struct Products {
         for (const auto& sr : slow_rows) map.insert(sr.first, sr.second);
     }
 
-    inline uint32_t lookup(const char* s, size_t len) const {
-        if (__builtin_expect(len >= 2 && s[0] == 'p' && s[1] >= '1' && s[1] <= '9', 1)) {
+    SS_ALWAYS_INLINE uint32_t lookup(const char* s, size_t len) const {
+        if (__builtin_expect(use_fast8 && (len - 2) <= 4 && s[0] == 'p' && s[1] >= '1' && s[1] <= '9', 1)) {
             uint32_t n = 0;
             bool ok = true;
             for (size_t k = 1; k < len; ++k) {
                 unsigned d = uint8_t(s[k]) - uint8_t('0');
                 if (__builtin_expect(d > 9, 0)) { ok = false; break; }
                 n = n * 10 + d;
-                if (__builtin_expect(n >= FAST_CAP, 0)) { ok = false; break; }
             }
-            if (__builtin_expect(ok, 1)) return fast_p[n];
+            if (__builtin_expect(ok && n < FAST_CAP, 1)) return fast_p8[n];
         }
         uint32_t r = map.find(s, len);
         return r == FastStringIdMap::NOT_FOUND ? unknown_cat_id : r;
@@ -702,7 +860,7 @@ struct Products {
 };
 
 // ============================================================================
-// Stage 1: 4-Barrier Lock-Free Direct Hash-DSU + 1-Word 3-Bit Blocked Bloom!
+// Stage 1: 3-Barrier Union-by-Key Lock-Free Huge-Page Hash-DSU + 1-Word Bloom
 // ============================================================================
 struct LinkMap {
     struct Slot {
@@ -713,34 +871,37 @@ struct LinkMap {
     size_t cap = 0;
     size_t mask = 0;
 
-    // 1-word (64-bit register-blocked) 3-bit Bloom filter -> 1 cacheline, 1 prefetch, ~0.5% FP!
     uint64_t* bloom = nullptr;
     size_t bloom_word_mask = 0;
     bool has_fallback = false;
 
-    static inline uint64_t bloom_mask3(uint64_t h) {
+    // Recycled huge-page DSU buffer to hand directly to event_store!
+    void* recycled_dsu = nullptr;
+    size_t recycled_dsu_bytes = 0;
+
+    static SS_ALWAYS_INLINE uint64_t bloom_mask3(uint64_t h) {
         return (1ULL << (h & 63U)) | (1ULL << ((h >> 6) & 63U)) | (1ULL << ((h >> 12) & 63U));
     }
 
-    inline bool bloom_might_contain(uint64_t h) const {
+    SS_ALWAYS_INLINE bool bloom_might_contain(uint64_t h) const {
         uint64_t word = bloom[(h >> 18) & bloom_word_mask];
         uint64_t m = bloom_mask3(h);
         return (word & m) == m;
     }
 
-    inline void prefetch_bloom(uint64_t h) const {
+    SS_ALWAYS_INLINE void prefetch_bloom(uint64_t h) const {
         if (__builtin_expect(bloom != nullptr, 1)) {
             __builtin_prefetch(&bloom[(h >> 18) & bloom_word_mask], 0, 1);
         }
     }
 
-    inline void prefetch_slot(uint64_t h) const {
+    SS_ALWAYS_INLINE void prefetch_slot(uint64_t h) const {
         if (__builtin_expect(slots != nullptr, 1)) {
             __builtin_prefetch(&slots[size_t(h) & mask], 0, 1);
         }
     }
 
-    inline uint64_t resolve_slot_only(uint64_t k, uint64_t h, const StringArenaPool& arenas) const {
+    SS_ALWAYS_INLINE uint64_t resolve_slot_only(uint64_t k, uint64_t h, const StringArenaPool& arenas) const {
         size_t idx = size_t(h) & mask;
         while (true) {
             uint64_t cur = slots[idx].key;
@@ -750,14 +911,7 @@ struct LinkMap {
         }
     }
 
-    inline uint64_t resolve_with_hash(uint64_t k, uint64_t h, const StringArenaPool& arenas) const {
-        if (__builtin_expect(cap == 0, 0)) return k;
-        if (__builtin_expect(!has_fallback && (k & FALLBACK_BIT) != 0, 0)) return k;
-        if (__builtin_expect(bloom != nullptr && !bloom_might_contain(h), 1)) return k;
-        return resolve_slot_only(k, h, arenas);
-    }
-
-    void build(const std::vector<MmapTask>& tasks, ThreadPool& pool, StringArenaPool& arenas) {
+    void build(const std::vector<CsvTask>& tasks, std::vector<ReadBuf>& rbufs, ThreadPool& pool, StringArenaPool& arenas) {
         if (tasks.empty()) return;
 
         struct Edge { uint64_t a, b; };
@@ -765,18 +919,19 @@ struct LinkMap {
         std::atomic<size_t> next_t{0};
         std::atomic<bool> any_fallback{false};
 
-        // Pass 1: Parallel zero-copy mmap SIMD scan of links/*.csv
+        // Pass 1: Parallel zero-fault pread single-word SIMD scan of links/*.csv
         pool.run([&](int tid) {
             auto& edges = thread_edges[size_t(tid)];
             edges.reserve(65536);
+            auto& rbuf = rbufs[size_t(tid)];
             bool local_fb = false;
             while (true) {
                 size_t ti = next_t.fetch_add(1, std::memory_order_relaxed);
                 if (ti >= tasks.size()) break;
-                scan_mmap_csv_simd<2>(tasks[ti], [&](const Slice f[2]) {
+                scan_pread_csv<2>(tasks[ti], rbuf, [&](const Slice f[2]) SS_LAMBDA_INLINE {
                     if (__builtin_expect(f[0].len > 0 && f[1].len > 0, 1)) {
-                        uint64_t ka = encode_key64(f[0].ptr, f[0].len, arenas, tid);
-                        uint64_t kb = encode_key64(f[1].ptr, f[1].len, arenas, tid);
+                        uint64_t ka = encode_key64_padded(f[0].ptr, f[0].len, arenas, tid);
+                        uint64_t kb = encode_key64_padded(f[1].ptr, f[1].len, arenas, tid);
                         if (__builtin_expect(ka == kb, 0)) return;
                         if (__builtin_expect(((ka | kb) & FALLBACK_BIT) != 0, 0)) local_fb = true;
                         edges.push_back({ka, kb});
@@ -793,21 +948,27 @@ struct LinkMap {
         has_fallback = any_fallback.load(std::memory_order_relaxed);
 
         if (!has_fallback && total_edges >= 2048) {
-            // Direct lock-free flat Hash-DSU: parent == 0 means root, parent == r + 1 links to r < s!
-            // inv_min[r] stores ~min_key (initialized to 0 by mmap -> ZERO init pass!).
+            // UNION-BY-KEY Lock-Free Hash-DSU:
+            //   - Always links larger key -> smaller key (strict total order => acyclic!)
+            //   - Root (parent == 0) IS AUTOMATICALLY the exact byte-wise min_key of the component!
+            //   - ZERO inv_min array, ZERO Pass 3!
+            //   - Exact total_nonmin == total successful union CAS ops in Pass 2!
             struct DsuSlot {
                 uint64_t key;
-                uint32_t parent;
+                uint32_t parent; // 0 = root (min_key!), r + 1 = parent slot r
                 uint32_t _pad;
             };
-            size_t hcap = 64;
-            while (hcap < total_edges * 4) hcap <<= 1;
-            size_t hmask = hcap - 1;
-            auto* dsu = static_cast<DsuSlot*>(alloc_mmap(hcap * sizeof(DsuSlot)));
-            auto* inv_min = static_cast<uint64_t*>(alloc_mmap(hcap * sizeof(uint64_t)));
+            // Size with fastrange: 2.5x total_edges rounded to 2 MB multiple -> ~50% typical load, <=80% worst-case!
+            size_t min_slots = total_edges * 2 + (total_edges >> 1) + 64;
+            size_t dsu_bytes = ((min_slots * sizeof(DsuSlot)) + (2ULL << 20) - 1) & ~((2ULL << 20) - 1);
+            size_t hcap = dsu_bytes / sizeof(DsuSlot);
+            auto* dsu = static_cast<DsuSlot*>(alloc_mmap(dsu_bytes, true));
 
-            auto insert_key = [&](uint64_t k) -> uint32_t {
-                size_t s = size_t(mix64(k)) & hmask;
+            auto slot_of = [hcap](uint64_t k) SS_LAMBDA_INLINE -> size_t {
+                return size_t((static_cast<unsigned __int128>(mix64(k)) * hcap) >> 64);
+            };
+            auto insert_key = [&](uint64_t k) SS_LAMBDA_INLINE -> uint32_t {
+                size_t s = slot_of(k);
                 while (true) {
                     std::atomic_ref<uint64_t> ak(dsu[s].key);
                     uint64_t cur = ak.load(std::memory_order_relaxed);
@@ -818,10 +979,10 @@ struct LinkMap {
                             return uint32_t(s);
                         }
                     }
-                    s = (s + 1) & hmask;
+                    if (++s == hcap) s = 0;
                 }
             };
-            auto find_root = [&](uint32_t x) -> uint32_t {
+            auto find_root = [&](uint32_t x) SS_LAMBDA_INLINE -> uint32_t {
                 while (true) {
                     std::atomic_ref<uint32_t> ap(dsu[x].parent);
                     uint32_t p1 = ap.load(std::memory_order_relaxed);
@@ -837,79 +998,70 @@ struct LinkMap {
                 }
             };
 
-            // Pass 2: Parallel fused Hash-Insert + Lock-Free Union!
+            // Pass 2: Parallel 16-ahead prefetched Hash-Insert + Lock-Free Union-by-Key!
+            std::vector<size_t> t_unions(static_cast<size_t>(pool.nthreads), 0);
             pool.run([&](int tid) {
                 const auto& ev = thread_edges[size_t(tid)];
-                for (const auto& e : ev) {
-                    uint32_t u = insert_key(e.a);
-                    uint32_t v = insert_key(e.b);
+                const size_t n = ev.size();
+                size_t local_unions = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    if (__builtin_expect(i + 16 < n, 1)) {
+                        __builtin_prefetch(&dsu[slot_of(ev[i + 16].a)], 1, 1);
+                        __builtin_prefetch(&dsu[slot_of(ev[i + 16].b)], 1, 1);
+                    }
+                    uint32_t u = insert_key(ev[i].a);
+                    uint32_t v = insert_key(ev[i].b);
                     while (u != v) {
                         u = find_root(u);
                         v = find_root(v);
                         if (u == v) break;
-                        if (u < v) std::swap(u, v); // always link larger slot -> smaller slot!
+                        // Union-by-Key: ALWAYS link LARGER key -> SMALLER key!
+                        if (dsu[u].key < dsu[v].key) std::swap(u, v);
                         uint32_t exp = 0;
                         if (std::atomic_ref<uint32_t>(dsu[u].parent).compare_exchange_weak(
                                 exp, v + 1, std::memory_order_relaxed)) {
+                            ++local_unions;
                             break;
                         }
                     }
                 }
-            });
-
-            // Pass 3: Parallel path compression + component min_key (~max) + exact non-minimal count!
-            std::vector<size_t> t_nonmin(static_cast<size_t>(pool.nthreads), 0);
-            pool.run([&](int tid) {
-                size_t s = (hcap * size_t(tid)) / size_t(pool.nthreads);
-                size_t e = (hcap * size_t(tid + 1)) / size_t(pool.nthreads);
-                size_t c = 0;
-                for (size_t i = s; i < e; ++i) {
-                    uint64_t k = dsu[i].key;
-                    if (k == 0) continue;
-                    uint32_t r = uint32_t(i);
-                    while (true) {
-                        uint32_t p1 = std::atomic_ref<uint32_t>(dsu[r].parent).load(std::memory_order_relaxed);
-                        if (p1 == 0) break;
-                        r = p1 - 1;
-                    }
-                    if (r != uint32_t(i)) {
-                        std::atomic_ref<uint32_t>(dsu[i].parent).store(r + 1, std::memory_order_relaxed);
-                        ++c;
-                    }
-                    uint64_t inv_k = ~k; // k has bit 63 == 0 -> inv_k >= 0x8000... > 0!
-                    std::atomic_ref<uint64_t> am(inv_min[r]);
-                    uint64_t cur = am.load(std::memory_order_relaxed);
-                    while (inv_k > cur && !am.compare_exchange_weak(cur, inv_k, std::memory_order_relaxed)) {}
-                }
-                t_nonmin[size_t(tid)] = c;
+                t_unions[size_t(tid)] = local_unions;
             });
 
             size_t total_nonmin = 0;
-            for (size_t c : t_nonmin) total_nonmin += c;
-            if (total_nonmin == 0) return;
+            for (size_t u : t_unions) total_nonmin += u;
+            if (total_nonmin == 0) {
+                recycled_dsu = dsu;
+                recycled_dsu_bytes = dsu_bytes;
+                return;
+            }
 
             cap = 64;
             while (cap < total_nonmin * 2) cap <<= 1;
             mask = cap - 1;
-            slots = static_cast<Slot*>(alloc_mmap(cap * sizeof(Slot)));
+            slots = static_cast<Slot*>(alloc_mmap(cap * sizeof(Slot), true));
 
-            // 1-word 3-bit blocked Bloom: ~16 bits/key (2x total_nonmin bytes / 8)
+            // 1-word 3-bit blocked Bloom (~12-16 bits/key -> 1 MB at 20M!)
             size_t bwords = 4096;
-            while (bwords * 4 < total_nonmin && bwords < (1ULL << 20)) bwords <<= 1;
+            while (bwords * 6 < total_nonmin && bwords < (1ULL << 20)) bwords <<= 1;
             bloom_word_mask = bwords - 1;
-            bloom = static_cast<uint64_t*>(alloc_mmap(bwords * sizeof(uint64_t)));
+            bloom = static_cast<uint64_t*>(alloc_mmap(bwords * sizeof(uint64_t), false));
 
-            // Pass 4: Populate compact non-minimal-only slots + 1-word 3-bit Bloom!
+            // Pass 3 (FINAL!): Compress non-root paths & populate compact LinkMap::slots + Bloom!
             pool.run([&](int tid) {
                 size_t s = (hcap * size_t(tid)) / size_t(pool.nthreads);
                 size_t e = (hcap * size_t(tid + 1)) / size_t(pool.nthreads);
                 for (size_t i = s; i < e; ++i) {
+                    uint32_t p1 = std::atomic_ref<uint32_t>(dsu[i].parent).load(std::memory_order_relaxed);
+                    if (p1 == 0) continue; // empty OR min-key root -> skip!
+                    uint32_t r = p1 - 1;
+                    while (true) {
+                        uint32_t np1 = std::atomic_ref<uint32_t>(dsu[r].parent).load(std::memory_order_relaxed);
+                        if (np1 == 0) break;
+                        r = np1 - 1;
+                    }
                     uint64_t k = dsu[i].key;
-                    if (k == 0) continue;
-                    uint32_t p1 = dsu[i].parent;
-                    uint32_t r = (p1 == 0) ? uint32_t(i) : (p1 - 1);
-                    uint64_t mk = ~inv_min[r];
-                    if (k == mk) continue;
+                    uint64_t mk = dsu[r].key;
                     uint64_t h = mix64(k);
                     std::atomic_ref<uint64_t>(bloom[(h >> 18) & bloom_word_mask]).fetch_or(
                         bloom_mask3(h), std::memory_order_relaxed);
@@ -925,11 +1077,14 @@ struct LinkMap {
                     }
                 }
             });
+
+            recycled_dsu = dsu;
+            recycled_dsu_bytes = dsu_bytes;
         } else {
             cap = 64;
             while (cap < total_edges * 4) cap <<= 1;
             mask = cap - 1;
-            slots = static_cast<Slot*>(alloc_mmap(cap * sizeof(Slot)));
+            slots = static_cast<Slot*>(alloc_mmap(cap * sizeof(Slot), false));
 
             std::vector<uint64_t> node_key, min_key;
             std::vector<uint32_t> parent;
@@ -982,67 +1137,81 @@ struct LinkMap {
 };
 
 // ============================================================================
-// Compact Record Structs (32b ts_off + 30b ingest_rel + Exact ms SideEvent!)
+// Ultra-Compact 16-Byte RawEvent16 (Zero mix64 in Dedup + 100% L2-Hot Buckets!)
 // ============================================================================
-static constexpr int EV_BUCKETS = 256;     // 256b x WC_CAP=8 x 24B = 48KB, 192B = 3x64B EXACT NT store!
-static constexpr int PERSON_BUCKETS = 512; // 512b x WC_CAP=4 x 16B = 32KB L1D-hot, 64B EXACT NT store!
+static constexpr int EV_BUCKETS = 512;     // 512b x WC_CAP=4 x 16B = 32 KB L1D! Bucket ~672KB+256KB = L2-hot!
+static constexpr int PERSON_BUCKETS = 512; // 512b x WC_CAP=4 x 16B = 32 KB L1D! Bucket ~600KB+16KB pht = L2-hot!
 
 struct SideEvent {
+    uint64_t eid_key64;
+    uint64_t user_key64;
     int64_t ts_ms;
     int64_t ingest_ms;
     uint32_t price;
     uint32_t cat_id;
 };
 
-struct RawEvent {
-    uint64_t event_id;
-    uint64_t user_id;
-    uint64_t meta;
+struct RawEvent16 {
+    uint64_t w0;
+    uint64_t w1;
 
-    // meta layout:
-    //   bit 63:     valid
-    //   bit 62:     has_side
-    //   bits 61..32 (30b): ingest_rel (whole-second offset + REL_BIAS, 0 = read exact ingest_ms from SideEvent!)
-    //   bits 31..0  (32b): if !has_side: ts_off in ms (covers 49.7 DAYS inline!)
-    //                      if has_side:  (tid << 26) | side_idx (67M/thread!)
-    static constexpr int64_t REL_BIAS = 1LL << 29;
-    static constexpr int64_t REL_MAX  = (1LL << 30) - 1;
+    // w0 layout:
+    //   bit 63:     is_side
+    //   bit 62:     valid
+    //   bits 61..41 (21b): ingest_rel21 = (ingest_sec - win_start_sec) + ING_BIAS (0 = read exact ingest_ms from SideEvent!)
+    //   bit 40:     if !is_side: delta_hi1 (bit 16 of delta = (ingest_sec - ts_sec) + 8, in [0..131071])
+    //               if  is_side: 0
+    //   bit 39:     eid_in_side (0 = exact 39-bit mix48 remainder in bits 38..0, 1 = fallback eid_key64 in SideEvent!)
+    //   bits 38..0  (39b): eid_rem39 (bottom 39 bits of mix48(eid48), OR bottom 39 bits of hash_key64 if eid_in_side==1)
+    //
+    // w1 layout:
+    //   if !is_side: [bits 63..16: uid48 (48b)] [bits 15..0: delta_lo16 (16b)]
+    //   if  is_side: (tid << 26) | side_idx
+    static constexpr int64_t ING_BIAS = 1LL << 19;      // -524,288s (-6d) to +1,572,863s (+18.2d)
+    static constexpr int64_t ING_MAX  = (1LL << 21) - 1;
+    static constexpr uint64_t EID40_MASK = (1ULL << 40) - 1ULL;
+    static constexpr uint64_t REM39_MASK = (1ULL << 39) - 1ULL;
 
-    inline bool is_valid() const { return (meta >> 63) != 0; }
-    inline bool has_side() const { return ((meta >> 62) & 1ULL) != 0; }
-    inline uint32_t ingest_rel() const { return uint32_t((meta >> 32) & 0x3FFFFFFFULL); }
-    inline uint32_t low32() const { return uint32_t(meta & 0xFFFFFFFFULL); }
+    SS_ALWAYS_INLINE bool is_side() const { return (w0 >> 63) != 0; }
+    SS_ALWAYS_INLINE bool is_valid() const { return ((w0 >> 62) & 1ULL) != 0; }
+    SS_ALWAYS_INLINE uint32_t ingest_rel() const { return uint32_t((w0 >> 41) & 0x1FFFFFULL); }
+    SS_ALWAYS_INLINE uint64_t eid40() const { return w0 & EID40_MASK; }
+    SS_ALWAYS_INLINE bool eid_in_side() const { return ((w0 >> 39) & 1ULL) != 0; }
 
-    static inline uint64_t pack_inline(bool valid, uint32_t ingest_rel30, uint32_t ts_off32) {
-        return (uint64_t(valid) << 63) | (uint64_t(ingest_rel30) << 32) | uint64_t(ts_off32);
+    static SS_ALWAYS_INLINE RawEvent16 make_inline(uint32_t ing_rel21, uint32_t delta17, uint64_t rem39, uint64_t uid48) {
+        uint64_t a = (1ULL << 62) | (uint64_t(ing_rel21) << 41) | (uint64_t((delta17 >> 16) & 1U) << 40) | rem39;
+        uint64_t b = (uid48 << 16) | uint64_t(delta17 & 0xFFFFU);
+        return {a, b};
     }
-    static inline uint64_t pack_side(bool valid, uint32_t ingest_rel30, int tid, uint32_t side_idx) {
-        return (uint64_t(valid) << 63) | (1ULL << 62) | (uint64_t(ingest_rel30) << 32) |
-               (uint64_t(tid) << 26) | uint64_t(side_idx);
+
+    static SS_ALWAYS_INLINE RawEvent16 make_side(bool valid, uint32_t ing_rel21, bool eid_side, uint64_t rem39, int tid, uint32_t sidx) {
+        uint64_t a = (1ULL << 63) | (uint64_t(valid) << 62) | (uint64_t(ing_rel21) << 41) |
+                     (uint64_t(eid_side) << 39) | rem39;
+        uint64_t b = (uint64_t(tid) << 26) | uint64_t(sidx);
+        return {a, b};
     }
 };
 
-static inline int64_t get_exact_ingest_ms(
-    const RawEvent& ev,
+static SS_COLD_NOINLINE int64_t get_exact_ingest_ms_slow(
+    const RawEvent16& ev,
     int64_t win_start_sec,
     const std::vector<std::vector<SideEvent>>& sides
 ) {
     uint32_t ir = ev.ingest_rel();
-    if (__builtin_expect(ir != 0, 1)) return (win_start_sec + int64_t(ir) - RawEvent::REL_BIAS) * 1000LL;
-    uint32_t lo = ev.low32();
-    return sides[lo >> 26][lo & 0x03FFFFFFU].ingest_ms;
+    if (ir != 0) return (win_start_sec + int64_t(ir) - RawEvent16::ING_BIAS) * 1000LL;
+    return sides[ev.w1 >> 26][ev.w1 & 0x03FFFFFFU].ingest_ms;
 }
 
-static inline bool ingest_strictly_earlier(
-    const RawEvent& a,
-    const RawEvent& b,
+static SS_ALWAYS_INLINE bool ingest_strictly_earlier(
+    const RawEvent16& a,
+    const RawEvent16& b,
     int64_t win_start_sec,
     const std::vector<std::vector<SideEvent>>& sides
 ) {
     uint32_t ia = a.ingest_rel();
     uint32_t ib = b.ingest_rel();
-    if (__builtin_expect(ia != 0 && ib != 0, 1)) return ia < ib;
-    return get_exact_ingest_ms(a, win_start_sec, sides) < get_exact_ingest_ms(b, win_start_sec, sides);
+    if (__builtin_expect((ia != 0) & (ib != 0), 1)) return ia < ib;
+    return get_exact_ingest_ms_slow(a, win_start_sec, sides) < get_exact_ingest_ms_slow(b, win_start_sec, sides);
 }
 
 struct CompactPersonEvent {
@@ -1063,23 +1232,22 @@ struct PersonClick {
     uint64_t ts_camp; // [44b: ts - click_start] [20b: camp_idx]
 };
 
-// Packed 16-byte LocalClick (down from 24B -> 1.5x faster scatter & sort!)
 struct LocalClick {
-    uint64_t ts_camp; // [44b: ts_off] [20b: camp_idx]
+    uint64_t ts_camp;
     uint64_t click_id;
-    inline uint64_t ts_off() const { return ts_camp >> 20; }
-    inline uint32_t camp_idx() const { return uint32_t(ts_camp & 0xFFFFFULL); }
+    SS_ALWAYS_INLINE uint64_t ts_off() const { return ts_camp >> 20; }
+    SS_ALWAYS_INLINE uint32_t camp_idx() const { return uint32_t(ts_camp & 0xFFFFFULL); }
 };
 
-struct CampCell {
+// Split & transposed campaign accumulators:
+//   cd_assist[camp * num_days + day]: 4B/cell (112 KB total -> 14 days = 1 cache line!)
+//   cd_cred  [camp * num_days + day]: 16B/cell (448 KB total!)
+struct CredCell {
     uint32_t sessions;
     uint32_t purchasing_sessions;
-    uint32_t assisted_sessions;
-    uint32_t _pad;
     uint64_t revenue_cents;
 };
 
-// Fused per-campaign state (1 cache line instead of 3 separate arrays!)
 struct CampState {
     uint32_t count;
     uint32_t enter_sess;
@@ -1087,12 +1255,11 @@ struct CampState {
 };
 
 // ============================================================================
-// Bounds-Safe Slab-Recycled Growable UserDailyBuffers (0 Faults + 0 Overflow!)
+// Bounds-Safe 2-Slab-Recycled UserDailyBuffers (Zero Faults + Zero Grows at 60M!)
 // ============================================================================
 struct UserDailyBuffers {
     uint8_t* uid_plain = nullptr;
     size_t uid_sz = 0, uid_cap = 0;
-    bool uid_owned = false;
 
     int32_t* day_vals = nullptr;
     int32_t* sess_vals = nullptr;
@@ -1100,26 +1267,40 @@ struct UserDailyBuffers {
     int64_t* rev_vals = nullptr;
     uint8_t* top_cat_bitmap = nullptr;
     size_t num_rows = 0, row_cap = 0;
-    bool rows_owned = false;
 
     uint8_t* top_cat_plain = nullptr;
     size_t top_cat_sz = 0, top_cat_cap = 0;
-    bool cat_owned = false;
 
     void init(size_t est_rows, size_t max_cat_len, const std::vector<void*>& dead_slabs, size_t slab_bytes) {
-        // Try to carve initial buffers directly out of a dead already-faulted 16 MB event_store slab!
-        // Layout inside one 16 MB slab (up to 480K rows -> covers 100% of 5M & 20M threads with ZERO page faults!):
-        //   day(4) + sess(4) + ev(4) + rev(8) + bm(1/8) = 20.125 B/row
-        //   uid_plain ~ 14 B/row, top_cat ~ 2 B/row -> ~36 B/row -> 400K rows = 14.4 MB < 16 MB!
+        if (dead_slabs.size() >= 2 && slab_bytes >= (16ULL << 20)) {
+            // Slab 0 (16 MB): fixed numeric columns for up to 786,432 rows (handles 60M Final with 0 grows!)
+            char* s0 = static_cast<char*>(dead_slabs[0]);
+            size_t rcap = 786432; // 786K * 20.125 B = 15.83 MB < 16 MB!
+            day_vals       = reinterpret_cast<int32_t*>(s0); s0 += rcap * 4;
+            sess_vals      = reinterpret_cast<int32_t*>(s0); s0 += rcap * 4;
+            ev_vals        = reinterpret_cast<int32_t*>(s0); s0 += rcap * 4;
+            rev_vals       = reinterpret_cast<int64_t*>(s0); s0 += rcap * 8;
+            size_t bm_sz   = ((rcap >> 3) + 64) & ~size_t(63);
+            top_cat_bitmap = reinterpret_cast<uint8_t*>(s0);
+            std::memset(top_cat_bitmap, 0, bm_sz);
+            row_cap        = rcap;
+            // Slab 1 (16 MB): string columns (12 MB uid_plain + 4 MB top_cat_plain)
+            char* s1 = static_cast<char*>(dead_slabs[1]);
+            uid_cap        = (slab_bytes * 3) / 4;
+            top_cat_cap    = slab_bytes - uid_cap;
+            uid_plain      = reinterpret_cast<uint8_t*>(s1);
+            top_cat_plain  = reinterpret_cast<uint8_t*>(s1 + uid_cap);
+            return;
+        }
         if (!dead_slabs.empty() && slab_bytes >= (16ULL << 20)) {
             char* s = static_cast<char*>(dead_slabs[0]);
-            size_t rcap = 393216; // 384K rows (fits 5M & 20M/8 threads with room to spare!)
-            day_vals       = reinterpret_cast<int32_t*>(s);                 s += rcap * 4;
-            sess_vals      = reinterpret_cast<int32_t*>(s);                 s += rcap * 4;
-            ev_vals        = reinterpret_cast<int32_t*>(s);                 s += rcap * 4;
-            rev_vals       = reinterpret_cast<int64_t*>(s);                 s += rcap * 8;
+            size_t rcap = 393216;
+            day_vals       = reinterpret_cast<int32_t*>(s); s += rcap * 4;
+            sess_vals      = reinterpret_cast<int32_t*>(s); s += rcap * 4;
+            ev_vals        = reinterpret_cast<int32_t*>(s); s += rcap * 4;
+            rev_vals       = reinterpret_cast<int64_t*>(s); s += rcap * 8;
             size_t bm_sz   = ((rcap >> 3) + 64) & ~size_t(63);
-            top_cat_bitmap = reinterpret_cast<uint8_t*>(s);                 s += bm_sz;
+            top_cat_bitmap = reinterpret_cast<uint8_t*>(s); s += bm_sz;
             std::memset(top_cat_bitmap, 0, bm_sz);
             size_t rem     = slab_bytes - size_t(s - static_cast<char*>(dead_slabs[0]));
             uid_cap        = (rem * 3) / 4;
@@ -1127,30 +1308,28 @@ struct UserDailyBuffers {
             uid_plain      = reinterpret_cast<uint8_t*>(s);
             top_cat_plain  = reinterpret_cast<uint8_t*>(s + uid_cap);
             row_cap        = rcap;
-            rows_owned = uid_owned = cat_owned = false;
             return;
         }
         size_t rcap = std::max<size_t>(est_rows * 2, 131072);
         row_cap = rcap;
         uid_cap = rcap * 20 + 4096;
         top_cat_cap = rcap * (4 + max_cat_len) + 4096;
-        day_vals = static_cast<int32_t*>(alloc_mmap(rcap * 4));
-        sess_vals = static_cast<int32_t*>(alloc_mmap(rcap * 4));
-        ev_vals = static_cast<int32_t*>(alloc_mmap(rcap * 4));
-        rev_vals = static_cast<int64_t*>(alloc_mmap(rcap * 8));
-        top_cat_bitmap = static_cast<uint8_t*>(alloc_mmap((rcap >> 3) + 64));
-        uid_plain = static_cast<uint8_t*>(alloc_mmap(uid_cap));
-        top_cat_plain = static_cast<uint8_t*>(alloc_mmap(top_cat_cap));
-        rows_owned = uid_owned = cat_owned = true;
+        day_vals = static_cast<int32_t*>(alloc_mmap(rcap * 4, true));
+        sess_vals = static_cast<int32_t*>(alloc_mmap(rcap * 4, true));
+        ev_vals = static_cast<int32_t*>(alloc_mmap(rcap * 4, true));
+        rev_vals = static_cast<int64_t*>(alloc_mmap(rcap * 8, true));
+        top_cat_bitmap = static_cast<uint8_t*>(alloc_mmap((rcap >> 3) + 64, false));
+        uid_plain = static_cast<uint8_t*>(alloc_mmap(uid_cap, true));
+        top_cat_plain = static_cast<uint8_t*>(alloc_mmap(top_cat_cap, true));
     }
 
-    __attribute__((noinline)) void grow_rows() {
+    SS_COLD_NOINLINE void grow_rows() {
         size_t new_cap = row_cap * 2;
-        auto* nd = static_cast<int32_t*>(alloc_mmap(new_cap * 4));
-        auto* ns = static_cast<int32_t*>(alloc_mmap(new_cap * 4));
-        auto* ne = static_cast<int32_t*>(alloc_mmap(new_cap * 4));
-        auto* nr = static_cast<int64_t*>(alloc_mmap(new_cap * 8));
-        auto* nb = static_cast<uint8_t*>(alloc_mmap((new_cap >> 3) + 64));
+        auto* nd = static_cast<int32_t*>(alloc_mmap(new_cap * 4, true));
+        auto* ns = static_cast<int32_t*>(alloc_mmap(new_cap * 4, true));
+        auto* ne = static_cast<int32_t*>(alloc_mmap(new_cap * 4, true));
+        auto* nr = static_cast<int64_t*>(alloc_mmap(new_cap * 8, true));
+        auto* nb = static_cast<uint8_t*>(alloc_mmap((new_cap >> 3) + 64, false));
         std::memcpy(nd, day_vals, num_rows * 4);
         std::memcpy(ns, sess_vals, num_rows * 4);
         std::memcpy(ne, ev_vals, num_rows * 4);
@@ -1158,107 +1337,89 @@ struct UserDailyBuffers {
         std::memcpy(nb, top_cat_bitmap, (num_rows + 7) >> 3);
         day_vals = nd; sess_vals = ns; ev_vals = ne; rev_vals = nr; top_cat_bitmap = nb;
         row_cap = new_cap;
-        rows_owned = true;
     }
 
-    __attribute__((noinline)) void grow_uid(size_t need) {
+    SS_COLD_NOINLINE void grow_uid(size_t need) {
         size_t new_cap = std::max(uid_cap * 2, uid_sz + need + 65536);
-        auto* np = static_cast<uint8_t*>(alloc_mmap(new_cap));
+        auto* np = static_cast<uint8_t*>(alloc_mmap(new_cap, true));
         if (uid_sz) std::memcpy(np, uid_plain, uid_sz);
         uid_plain = np;
         uid_cap = new_cap;
-        uid_owned = true;
     }
 
-    __attribute__((noinline)) void grow_cat(size_t need) {
+    SS_COLD_NOINLINE void grow_cat(size_t need) {
         size_t new_cap = std::max(top_cat_cap * 2, top_cat_sz + need + 65536);
-        auto* np = static_cast<uint8_t*>(alloc_mmap(new_cap));
+        auto* np = static_cast<uint8_t*>(alloc_mmap(new_cap, true));
         if (top_cat_sz) std::memcpy(np, top_cat_plain, top_cat_sz);
         top_cat_plain = np;
         top_cat_cap = new_cap;
-        cat_owned = true;
     }
 
-    inline void push_row_key(
-        uint64_t person_key,
-        const StringArenaPool& arenas,
-        int32_t day,
-        int32_t sessions,
-        int32_t events,
-        int64_t rev,
-        int32_t best_cat,
-        const std::vector<std::string>& cat_names
+    SS_ALWAYS_INLINE void push_row_pre(
+        const char* uid_pre, uint32_t uid_pre_len,
+        int32_t day, int32_t sessions, int32_t events, int64_t rev,
+        int32_t best_cat, const Products& products
     ) {
         if (__builtin_expect(num_rows >= row_cap, 0)) grow_rows();
-        if (__builtin_expect((person_key & FALLBACK_BIT) == 0, 1)) {
-            if (__builtin_expect(uid_sz + 16 > uid_cap, 0)) grow_uid(16);
-            uint8_t* dst = uid_plain + uid_sz;
-            uint32_t len = uint32_t(decode_inline(person_key, reinterpret_cast<char*>(dst + 4)));
-            std::memcpy(dst, &len, 4);
-            uid_sz += 4 + len;
+        if (__builtin_expect(uid_sz + uid_pre_len + 16 > uid_cap, 0)) grow_uid(uid_pre_len + 16);
+        if (__builtin_expect(uid_pre_len <= 16, 1)) {
+            std::memcpy(uid_plain + uid_sz, uid_pre, 16); // single 16B register store!
         } else {
-            auto sv = arenas.get_fallback(person_key);
-            uint32_t len = uint32_t(sv.size());
-            if (__builtin_expect(uid_sz + 4 + len > uid_cap, 0)) grow_uid(4 + len);
-            uint8_t* dst = uid_plain + uid_sz;
-            std::memcpy(dst, &len, 4);
-            if (len) std::memcpy(dst + 4, sv.data(), len);
-            uid_sz += 4 + len;
+            std::memcpy(uid_plain + uid_sz, uid_pre, uid_pre_len);
         }
+        uid_sz += uid_pre_len;
         size_t r = num_rows++;
         day_vals[r] = day;
         sess_vals[r] = sessions;
         ev_vals[r] = events;
         rev_vals[r] = rev;
-        if (best_cat >= 0) {
+        if (__builtin_expect(best_cat >= 0, 0)) {
             top_cat_bitmap[r >> 3] |= uint8_t(1U << (r & 7));
-            const std::string& cs = cat_names[size_t(best_cat)];
-            uint32_t len = uint32_t(cs.size());
-            if (__builtin_expect(top_cat_sz + 4 + len > top_cat_cap, 0)) grow_cat(4 + len);
-            uint8_t* dst = top_cat_plain + top_cat_sz;
-            std::memcpy(dst, &len, 4);
-            std::memcpy(dst + 4, cs.data(), len);
-            top_cat_sz += 4 + len;
+            const auto& cp = products.cat_pre[size_t(best_cat)];
+            if (__builtin_expect(cp.total_len > 0, 1)) {
+                if (__builtin_expect(top_cat_sz + cp.total_len > top_cat_cap, 0)) grow_cat(cp.total_len);
+                std::memcpy(top_cat_plain + top_cat_sz, cp.bytes, cp.total_len);
+                top_cat_sz += cp.total_len;
+            } else {
+                const std::string& cs = products.cat_names[size_t(best_cat)];
+                uint32_t len = uint32_t(cs.size());
+                if (__builtin_expect(top_cat_sz + 4 + len > top_cat_cap, 0)) grow_cat(4 + len);
+                std::memcpy(top_cat_plain + top_cat_sz, &len, 4);
+                std::memcpy(top_cat_plain + top_cat_sz + 4, cs.data(), len);
+                top_cat_sz += 4 + len;
+            }
         }
     }
 };
 
-// Fast L1-hot 256-bucket (uint16_t) LSD radix sort on 32-bit ts_off for en in [40, 65535].
-// Skips uniform bytes automatically (0 work if high bytes are identical!), ZERO branch mispredicts!
-static inline void radix_sort_256_u64(uint64_t* arr, uint32_t n, std::vector<uint64_t>& tmp) {
-    tmp.resize(n);
-    uint16_t c0[256]{}, c1[256]{}, c2[256]{}, c3[256]{};
-    uint32_t first = uint32_t(arr[0] >> 32);
-    uint32_t diff = 0;
-    for (uint32_t i = 0; i < n; ++i) {
-        uint32_t k = uint32_t(arr[i] >> 32);
-        diff |= (k ^ first);
-        c0[k & 255U]++;
-        c1[(k >> 8) & 255U]++;
-        c2[(k >> 16) & 255U]++;
-        c3[k >> 24]++;
-    }
-    if (diff == 0) return;
-    uint64_t* src = arr;
-    uint64_t* dst = tmp.data();
-    auto pass = [&](uint16_t* cnt, uint32_t shift) {
-        uint16_t acc = 0;
-        for (int i = 0; i < 256; ++i) { uint16_t t = cnt[i]; cnt[i] = acc; acc = uint16_t(acc + t); }
-        for (uint32_t i = 0; i < n; ++i) {
-            uint64_t v = src[i];
-            dst[cnt[(uint32_t(v >> 32) >> shift) & 255U]++] = v;
-        }
-        std::swap(src, dst);
-    };
-    if (diff & 0x000000FFU) pass(c0, 0);
-    if (diff & 0x0000FF00U) pass(c1, 8);
-    if (diff & 0x00FF0000U) pass(c2, 16);
-    if (diff & 0xFF000000U) pass(c3, 24);
-    if (src != arr) std::memcpy(arr, src, size_t(n) * sizeof(uint64_t));
+// ============================================================================
+// Fast Zero-Mispredict Event Sorting (Branchless Small + 1-Pass MSD Bucket Sort!)
+// ============================================================================
+static SS_ALWAYS_INLINE void cswap_u64(uint64_t& a, uint64_t& b) {
+    uint64_t lo = a < b ? a : b;
+    uint64_t hi = a < b ? b : a;
+    a = lo; b = hi;
 }
 
-// Full 3-pass LSD radix sort on all 32 bits of ts_off (used only for rare en >= 65536 whales/kiosks!)
-static inline void radix_sort_ts_u64(uint64_t* arr, uint32_t n, std::vector<uint64_t>& tmp) {
+static SS_ALWAYS_INLINE void sort_small_u64(uint64_t* a, uint32_t n) {
+    if (n <= 1) return;
+    if (n == 2) { cswap_u64(a[0], a[1]); return; }
+    if (n == 3) { cswap_u64(a[0], a[1]); cswap_u64(a[1], a[2]); cswap_u64(a[0], a[1]); return; }
+    if (n == 4) {
+        cswap_u64(a[0], a[1]); cswap_u64(a[2], a[3]);
+        cswap_u64(a[0], a[2]); cswap_u64(a[1], a[3]);
+        cswap_u64(a[1], a[2]);
+        return;
+    }
+    for (uint32_t i = 1; i < n; ++i) {
+        uint64_t x = a[i];
+        uint32_t j = i;
+        while (j > 0 && a[j - 1] > x) { a[j] = a[j - 1]; --j; }
+        a[j] = x;
+    }
+}
+
+static SS_COLD_NOINLINE void radix_sort_ts_u64(uint64_t* arr, uint32_t n, std::vector<uint64_t>& tmp) {
     tmp.resize(n);
     uint32_t c0[2048]{}, c1[2048]{}, c2[1024]{};
     for (uint32_t i = 0; i < n; ++i) {
@@ -1271,11 +1432,60 @@ static inline void radix_sort_ts_u64(uint64_t* arr, uint32_t n, std::vector<uint
     for (int i = 0; i < 2048; ++i) { uint32_t t = c0[i]; c0[i] = s0; s0 += t; }
     for (int i = 0; i < 2048; ++i) { uint32_t t = c1[i]; c1[i] = s1; s1 += t; }
     for (int i = 0; i < 1024; ++i) { uint32_t t = c2[i]; c2[i] = s2; s2 += t; }
-
     uint64_t* dst = tmp.data();
     for (uint32_t i = 0; i < n; ++i) { uint64_t v = arr[i]; dst[c0[uint32_t(v >> 32) & 2047U]++] = v; }
     for (uint32_t i = 0; i < n; ++i) { uint64_t v = dst[i]; arr[c1[uint32_t(v >> 43) & 2047U]++] = v; }
     for (uint32_t i = 0; i < n; ++i) { uint64_t v = arr[i]; dst[c2[uint32_t(v >> 54)]++] = v; }
+    std::memcpy(arr, dst, size_t(n) * sizeof(uint64_t));
+}
+
+// 1-pass top-8-bit MSD bucket sort (256 buckets of ~2.33h for 14d windows!) -> ~2-6 items/bucket!
+// Splits 25..65535 events in 1 pass instead of 6 passes, crushing std::sort branch mispredicts!
+static SS_ALWAYS_INLINE void sort_events_compact_u64(uint64_t* arr, uint32_t n, uint32_t shift_top, std::vector<uint64_t>& tmp) {
+    if (n <= 20) {
+        sort_small_u64(arr, n);
+        return;
+    }
+    if (__builtin_expect(n >= 65536, 0)) {
+        radix_sort_ts_u64(arr, n, tmp);
+        return;
+    }
+    if (tmp.size() < n) tmp.resize(n);
+    uint16_t cnt[256]{};
+    uint32_t bmin = 255, bmax = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t b = uint32_t((arr[i] >> shift_top) & 255U);
+        cnt[b]++;
+        if (b < bmin) bmin = b;
+        if (b > bmax) bmax = b;
+    }
+    if (__builtin_expect(bmin == bmax, 0)) {
+        std::sort(arr, arr + n);
+        return;
+    }
+    uint16_t off[256];
+    uint16_t acc = 0;
+    for (uint32_t b = bmin; b <= bmax; ++b) {
+        off[b] = acc;
+        acc = uint16_t(acc + cnt[b]);
+    }
+    uint64_t* dst = tmp.data();
+    for (uint32_t i = 0; i < n; ++i) {
+        uint64_t v = arr[i];
+        dst[off[(v >> shift_top) & 255U]++] = v;
+    }
+    uint32_t start = 0;
+    for (uint32_t b = bmin; b <= bmax; ++b) {
+        uint32_t c = cnt[b];
+        if (c == 0) continue;
+        uint64_t* p = dst + start;
+        if (c <= 20) {
+            sort_small_u64(p, c);
+        } else {
+            std::sort(p, p + c);
+        }
+        start += c;
+    }
     std::memcpy(arr, dst, size_t(n) * sizeof(uint64_t));
 }
 
@@ -1288,11 +1498,11 @@ static void mkdir_p(const std::string& path) {
 }
 
 // ============================================================================
-// Stage 2C + Stage 3 + Stage 4 FUSED: Dedup -> Coarse-Radix Sessionize -> writev()
+// Stage 2C + Stage 3 + Stage 4 FUSED: Zero-mix64 L2-Hot Dedup -> Sessionize -> writev()
 // ============================================================================
 template <bool Compact>
 bool run_dedup_sessionize_and_write(
-    PartitionedStore<RawEvent, 256, EV_BUCKETS, 8, true>& event_store,
+    PartitionedStore<RawEvent16, 256, EV_BUCKETS, 4, false>& event_store,
     const std::vector<std::vector<SideEvent>>& sides,
     PartitionedStore<PersonClick, 128, PERSON_BUCKETS, 4, false>& click_store,
     const LinkMap& links,
@@ -1311,8 +1521,7 @@ bool run_dedup_sessionize_and_write(
     bool prof
 ) {
     using PEv = std::conditional_t<Compact, CompactPersonEvent, WidePersonEvent>;
-    // WC_CAP = 4 for CompactPersonEvent (16B) -> 64B EXACT NT streaming store + 32 KB L1D fit!
-    PartitionedStore<PEv, 256, PERSON_BUCKETS, 4, Compact> person_ev_store;
+    PartitionedStore<PEv, 256, PERSON_BUCKETS, 4, false> person_ev_store;
     person_ev_store.init(pool.nthreads);
 
     auto now_ms = []() {
@@ -1321,15 +1530,23 @@ bool run_dedup_sessionize_and_write(
     };
     double td0 = now_ms();
 
-    // Stage 2C: IN-PLACE L2 Fingerprinted Dedup with 8-Ahead Single-Hash PREFETCHW + 1-Word Bloom Ring!
-    using EvBlock = typename PartitionedStore<RawEvent, 256, EV_BUCKETS, 8, true>::Block;
+    // Compute exact top-8-bit shift for 1-pass MSD sort of Compact ts_off!
+    uint32_t msd_shift = 55; // default (ts_off >> 23 in bits 32..63 -> shift 55)
+    {
+        uint64_t dur = (win_end_ms > win_start_ms) ? uint64_t(win_end_ms - win_start_ms) : 1ULL;
+        uint32_t bits = 64U - uint32_t(__builtin_clzll(dur));
+        msd_shift = (bits > 8U) ? (32U + bits - 8U) : 32U;
+    }
+
+    // Stage 2C: ZERO-mix64 L2-Hot Fingerprinted Dedup on RawEvent16 + 2-Stage Bloom Ring!
+    using EvBlock = typename PartitionedStore<RawEvent16, 256, EV_BUCKETS, 4, false>::Block;
     std::atomic<int> next_eb{0};
     pool.run([&](int tid) {
         struct DedupSlot8 { uint32_t fp; uint32_t handle1; };
         std::vector<uint32_t> ht4;
         std::vector<DedupSlot8> ht8;
         std::vector<EvBlock*> blks;
-        ht4.reserve(262144);
+        ht4.reserve(131072);
         blks.reserve(512);
 
         auto& out_ts = *person_ev_store.ts[size_t(tid)];
@@ -1337,35 +1554,50 @@ bool run_dedup_sessionize_and_write(
         const bool links_has_bloom = (links.bloom != nullptr);
 
         struct RingItem {
-            const RawEvent* ev;
+            uint64_t ukey;
             uint64_t uh;
+            uint64_t packed; // Compact: packed; Wide: pointer index (handled separately)
+            const RawEvent16* ev;
             bool probe_ht;
         };
         constexpr size_t RING_SZ = 64;
         constexpr size_t RING_MASK = RING_SZ - 1;
         RingItem ring[RING_SZ];
 
-        auto emit_resolved = [&](const RawEvent& ev, uint64_t uh, bool probe_ht) {
-            uint64_t pkey = probe_ht ? links.resolve_slot_only(ev.user_id, uh, arenas) : ev.user_id;
-            uint64_t ph = (pkey == ev.user_id) ? uh : hash_key64(pkey, arenas);
+        auto emit_resolved = [&](const RingItem& r) SS_LAMBDA_INLINE {
+            uint64_t pkey = r.probe_ht ? links.resolve_slot_only(r.ukey, r.uh, arenas) : r.ukey;
+            uint64_t ph = (pkey == r.ukey) ? r.uh : hash_key64(pkey, arenas);
             uint32_t pb = uint32_t(ph >> 55);
             if constexpr (Compact) {
-                uint64_t packed;
-                if (__builtin_expect(!ev.has_side(), 1)) {
-                    packed = uint64_t(ev.low32()) << 32;
-                } else {
-                    uint32_t lo = ev.low32();
-                    const SideEvent& se = sides[lo >> 26][lo & 0x03FFFFFFU];
-                    packed = (uint64_t(se.ts_ms - win_start_ms) << 32) | (uint64_t(se.price) << 8) | uint64_t(se.cat_id);
-                }
-                out_ts.push(pb, CompactPersonEvent{pkey, packed});
+                out_ts.push(pb, CompactPersonEvent{pkey, r.packed});
             } else {
-                if (!ev.has_side()) {
-                    out_ts.push(pb, WidePersonEvent{pkey, win_start_ms + int64_t(ev.low32()), 0, 0});
+                const RawEvent16& ev = *r.ev;
+                if (__builtin_expect(!ev.is_side(), 1)) {
+                    int64_t ing_rel_sec = int64_t(ev.ingest_rel()) - RawEvent16::ING_BIAS;
+                    int64_t delta_sec = int64_t(((ev.w0 >> 24) & 0x10000ULL) | (ev.w1 & 0xFFFFULL)) - 8LL;
+                    int64_t ts_ms = win_start_ms + (ing_rel_sec - delta_sec) * 1000LL;
+                    out_ts.push(pb, WidePersonEvent{pkey, ts_ms, 0, 0});
                 } else {
-                    uint32_t lo = ev.low32();
-                    const SideEvent& se = sides[lo >> 26][lo & 0x03FFFFFFU];
+                    const SideEvent& se = sides[ev.w1 >> 26][ev.w1 & 0x03FFFFFFU];
                     out_ts.push(pb, WidePersonEvent{pkey, se.ts_ms, se.price, se.cat_id});
+                }
+            }
+        };
+
+        auto unpack_ukey_and_packed = [&](const RawEvent16& ev, uint64_t& ukey, uint64_t& packed) SS_LAMBDA_INLINE {
+            if (__builtin_expect(!ev.is_side(), 1)) {
+                ukey = decode_uid48_to_key64(ev.w1 >> 16);
+                if constexpr (Compact) {
+                    int64_t ing_rel_sec = int64_t(ev.ingest_rel()) - RawEvent16::ING_BIAS;
+                    int64_t delta_sec = int64_t(((ev.w0 >> 24) & 0x10000ULL) | (ev.w1 & 0xFFFFULL)) - 8LL;
+                    uint64_t ts_off = uint64_t((ing_rel_sec - delta_sec) * 1000LL);
+                    packed = ts_off << 32;
+                }
+            } else {
+                const SideEvent& se = sides[ev.w1 >> 26][ev.w1 & 0x03FFFFFFU];
+                ukey = se.user_key64;
+                if constexpr (Compact) {
+                    packed = (uint64_t(se.ts_ms - win_start_ms) << 32) | (uint64_t(se.price) << 8) | uint64_t(se.cat_id);
                 }
             }
         };
@@ -1388,30 +1620,22 @@ bool run_dedup_sessionize_and_write(
             size_t hmask = hcap - 1;
             const uint32_t nblks = uint32_t(blks.size());
 
+            // Loop 1: ZERO-mix64 dedup touching ONLY w0 (8 bytes)!
             if (__builtin_expect(nblks < 4095, 1)) {
                 ht4.assign(hcap, 0);
                 uint32_t* htp = ht4.data();
-                uint64_t hring[8];
                 for (uint32_t bi = 0; bi < nblks; ++bi) {
                     EvBlock* blk = blks[bi];
                     const uint32_t cnt = blk->count;
-                    RawEvent* items = blk->items;
-                    const uint32_t pre = cnt < 8 ? cnt : 8;
-                    for (uint32_t p = 0; p < pre; ++p) {
-                        uint64_t hp = hash_key64(items[p].event_id, arenas);
-                        hring[p] = hp;
-                        __builtin_prefetch(&htp[size_t(hp >> 12) & hmask], 1, 1);
-                    }
+                    RawEvent16* items = blk->items;
                     for (uint32_t i = 0; i < cnt; ++i) {
-                        uint64_t h = hring[i & 7U];
                         if (__builtin_expect(i + 8 < cnt, 1)) {
-                            uint64_t hp = hash_key64(items[i + 8].event_id, arenas);
-                            hring[(i + 8) & 7U] = hp;
-                            __builtin_prefetch(&htp[size_t(hp >> 12) & hmask], 1, 1);
+                            __builtin_prefetch(&htp[size_t(items[i + 8].w0) & hmask], 1, 1);
                         }
-                        RawEvent& ev = items[i];
-                        uint32_t fp12 = uint32_t(h & 0xFFFULL) << 20;
-                        size_t slot = size_t(h >> 12) & hmask;
+                        RawEvent16& ev = items[i];
+                        uint64_t eid40 = ev.eid40();
+                        uint32_t fp12 = uint32_t((eid40 >> 27) & 0xFFFULL) << 20;
+                        size_t slot = size_t(eid40) & hmask;
                         while (true) {
                             uint32_t entry = htp[slot];
                             if (__builtin_expect(entry == 0, 1)) {
@@ -1420,13 +1644,21 @@ bool run_dedup_sessionize_and_write(
                             }
                             if (__builtin_expect((entry & 0xFFF00000U) == fp12, 0)) {
                                 uint32_t prev = (entry & 0x000FFFFFU) - 1;
-                                RawEvent& existing = blks[prev >> 8]->items[prev & 255U];
-                                if (key_eq(existing.event_id, ev.event_id, arenas)) {
-                                    if (ingest_strictly_earlier(ev, existing, win_start_sec, sides)) {
-                                        existing = ev;
+                                RawEvent16& existing = blks[prev >> 8]->items[prev & 255U];
+                                if (existing.eid40() == eid40) {
+                                    bool same = true;
+                                    if (__builtin_expect(ev.eid_in_side(), 0)) {
+                                        const SideEvent& sa = sides[existing.w1 >> 26][existing.w1 & 0x03FFFFFFU];
+                                        const SideEvent& sb = sides[ev.w1 >> 26][ev.w1 & 0x03FFFFFFU];
+                                        same = key_eq(sa.eid_key64, sb.eid_key64, arenas);
                                     }
-                                    ev.meta = 0;
-                                    break;
+                                    if (same) {
+                                        if (ingest_strictly_earlier(ev, existing, win_start_sec, sides)) {
+                                            existing = ev;
+                                        }
+                                        ev.w0 = 0; // clears valid bit!
+                                        break;
+                                    }
                                 }
                             }
                             slot = (slot + 1) & hmask;
@@ -1438,12 +1670,12 @@ bool run_dedup_sessionize_and_write(
                 for (uint32_t bi = 0; bi < nblks; ++bi) {
                     EvBlock* blk = blks[bi];
                     const uint32_t cnt = blk->count;
-                    RawEvent* items = blk->items;
+                    RawEvent16* items = blk->items;
                     for (uint32_t i = 0; i < cnt; ++i) {
-                        RawEvent& ev = items[i];
-                        uint64_t h = hash_key64(ev.event_id, arenas);
-                        uint32_t fp = uint32_t(h);
-                        size_t slot = size_t(h >> 16) & hmask;
+                        RawEvent16& ev = items[i];
+                        uint64_t eid40 = ev.eid40();
+                        uint32_t fp = uint32_t(eid40 >> 8);
+                        size_t slot = size_t(eid40) & hmask;
                         while (true) {
                             uint32_t h1 = ht8[slot].handle1;
                             if (__builtin_expect(h1 == 0, 1)) {
@@ -1452,13 +1684,21 @@ bool run_dedup_sessionize_and_write(
                             }
                             if (__builtin_expect(ht8[slot].fp == fp, 0)) {
                                 uint32_t prev = h1 - 1;
-                                RawEvent& existing = blks[prev >> 8]->items[prev & 255U];
-                                if (key_eq(existing.event_id, ev.event_id, arenas)) {
-                                    if (ingest_strictly_earlier(ev, existing, win_start_sec, sides)) {
-                                        existing = ev;
+                                RawEvent16& existing = blks[prev >> 8]->items[prev & 255U];
+                                if (existing.eid40() == eid40) {
+                                    bool same = true;
+                                    if (__builtin_expect(ev.eid_in_side(), 0)) {
+                                        const SideEvent& sa = sides[existing.w1 >> 26][existing.w1 & 0x03FFFFFFU];
+                                        const SideEvent& sb = sides[ev.w1 >> 26][ev.w1 & 0x03FFFFFFU];
+                                        same = key_eq(sa.eid_key64, sb.eid_key64, arenas);
                                     }
-                                    ev.meta = 0;
-                                    break;
+                                    if (same) {
+                                        if (ingest_strictly_earlier(ev, existing, win_start_sec, sides)) {
+                                            existing = ev;
+                                        }
+                                        ev.w0 = 0;
+                                        break;
+                                    }
                                 }
                             }
                             slot = (slot + 1) & hmask;
@@ -1467,15 +1707,18 @@ bool run_dedup_sessionize_and_write(
                 }
             }
 
+            // Loop 2 (100% L2 HIT!): Resolve LinkMap & scatter CompactPersonEvent!
             if (__builtin_expect(!links_active, 0)) {
                 for (uint32_t bi = 0; bi < nblks; ++bi) {
                     const EvBlock* blk = blks[bi];
                     const uint32_t cnt = blk->count;
-                    const RawEvent* items = blk->items;
+                    const RawEvent16* items = blk->items;
                     for (uint32_t i = 0; i < cnt; ++i) {
                         if (__builtin_expect(!items[i].is_valid(), 0)) continue;
-                        uint64_t uh = hash_key64(items[i].user_id, arenas);
-                        emit_resolved(items[i], uh, false);
+                        uint64_t ukey, packed = 0;
+                        unpack_ukey_and_packed(items[i], ukey, packed);
+                        uint64_t uh = hash_key64(ukey, arenas);
+                        emit_resolved({ukey, uh, packed, &items[i], false});
                     }
                 }
             } else {
@@ -1483,23 +1726,24 @@ bool run_dedup_sessionize_and_write(
                 for (uint32_t bi = 0; bi < nblks; ++bi) {
                     const EvBlock* blk = blks[bi];
                     const uint32_t cnt = blk->count;
-                    const RawEvent* items = blk->items;
+                    const RawEvent16* items = blk->items;
                     for (uint32_t i = 0; i < cnt; ++i) {
                         if (__builtin_expect(!items[i].is_valid(), 0)) continue;
-                        uint64_t uh = hash_key64(items[i].user_id, arenas);
-                        ring[pushed & RING_MASK] = {&items[i], uh, false};
+                        uint64_t ukey, packed = 0;
+                        unpack_ukey_and_packed(items[i], ukey, packed);
+                        uint64_t uh = hash_key64(ukey, arenas);
+                        ring[pushed & RING_MASK] = {ukey, uh, packed, &items[i], false};
                         if (links_has_bloom) links.prefetch_bloom(uh);
 
                         if (pushed >= 16) {
                             auto& r1 = ring[(pushed - 16) & RING_MASK];
-                            bool may_link = (links.has_fallback || (r1.ev->user_id & FALLBACK_BIT) == 0) &&
+                            bool may_link = (links.has_fallback || (r1.ukey & FALLBACK_BIT) == 0) &&
                                             (!links_has_bloom || links.bloom_might_contain(r1.uh));
                             r1.probe_ht = may_link;
                             if (may_link) links.prefetch_slot(r1.uh);
                         }
                         if (pushed >= 32) {
-                            const auto& r2 = ring[(pushed - 32) & RING_MASK];
-                            emit_resolved(*r2.ev, r2.uh, r2.probe_ht);
+                            emit_resolved(ring[(pushed - 32) & RING_MASK]);
                         }
                         ++pushed;
                     }
@@ -1507,15 +1751,14 @@ bool run_dedup_sessionize_and_write(
                 size_t s1_start = (pushed > 16) ? (pushed - 16) : 0;
                 for (size_t k = s1_start; k < pushed; ++k) {
                     auto& r1 = ring[k & RING_MASK];
-                    bool may_link = (links.has_fallback || (r1.ev->user_id & FALLBACK_BIT) == 0) &&
+                    bool may_link = (links.has_fallback || (r1.ukey & FALLBACK_BIT) == 0) &&
                                     (!links_has_bloom || links.bloom_might_contain(r1.uh));
                     r1.probe_ht = may_link;
                     if (may_link) links.prefetch_slot(r1.uh);
                 }
                 size_t s2_start = (pushed > 32) ? (pushed - 32) : 0;
                 for (size_t k = s2_start; k < pushed; ++k) {
-                    const auto& r2 = ring[k & RING_MASK];
-                    emit_resolved(*r2.ev, r2.uh, r2.probe_ht);
+                    emit_resolved(ring[k & RING_MASK]);
                 }
             }
         }
@@ -1523,7 +1766,7 @@ bool run_dedup_sessionize_and_write(
     });
     double td1 = now_ms();
 
-    // Stage 3 + Stage 4 FUSED: LPT 512-Bucket Coarse-Radix Sessionize + Immediate writev()!
+    // Stage 3 + Stage 4 FUSED: LPT 512-Bucket L1D-Hot Sessionize + Immediate writev()!
     int bucket_order[PERSON_BUCKETS];
     size_t bucket_sizes[PERSON_BUCKETS];
     size_t total_surviving = 0;
@@ -1555,7 +1798,8 @@ bool run_dedup_sessionize_and_write(
     };
 
     std::vector<UserDailyBuffers> thread_ud(static_cast<size_t>(pool.nthreads));
-    std::vector<std::vector<CampCell>> thread_cd(static_cast<size_t>(pool.nthreads));
+    std::vector<std::vector<uint32_t>> thread_cd_assist(static_cast<size_t>(pool.nthreads));
+    std::vector<std::vector<CredCell>> thread_cd_cred(static_cast<size_t>(pool.nthreads));
     std::atomic<size_t> total_ud_rows_written{0};
     std::atomic<int> finished_workers{0};
     std::atomic<bool> write_ok{true};
@@ -1570,10 +1814,13 @@ bool run_dedup_sessionize_and_write(
         ud.init(total_surviving / size_t(pool.nthreads * 6) + 4096,
                 products.max_cat_len,
                 event_store.ts[size_t(tid)]->slabs,
-                PartitionedStore<RawEvent, 256, EV_BUCKETS, 8, true>::SLAB_BYTES);
+                PartitionedStore<RawEvent16, 256, EV_BUCKETS, 4, false>::SLAB_BYTES);
 
-        auto& cd = thread_cd[size_t(tid)];
-        cd.assign(size_t(num_days) * size_t(camp_stride), CampCell{0, 0, 0, 0, 0});
+        const size_t n_cells = size_t(camp_stride) * size_t(num_days);
+        auto& cd_assist = thread_cd_assist[size_t(tid)];
+        auto& cd_cred = thread_cd_cred[size_t(tid)];
+        cd_assist.assign(n_cells, 0);
+        cd_cred.assign(n_cells, CredCell{0, 0, 0});
 
         std::vector<uint64_t> pkeys;
         std::vector<uint32_t> pht;
@@ -1582,7 +1829,7 @@ bool run_dedup_sessionize_and_write(
 
         using EvItem = std::conditional_t<Compact, uint64_t, WidePersonEvent>;
         std::vector<EvItem> grouped_evs;
-        std::vector<uint64_t> radix_tmp;
+        std::vector<uint64_t> sort_tmp;
         std::vector<LocalClick> grouped_clks;
         std::vector<uint64_t> cat_rev(num_cats, 0);
         std::vector<uint32_t> used_cats;
@@ -1591,6 +1838,8 @@ bool run_dedup_sessionize_and_write(
         std::vector<CampState> cstate(num_camps, {0, 0, 0});
         std::vector<uint32_t> active_camps;
         active_camps.reserve(num_camps);
+
+        std::vector<char> fb_uid_buf;
 
         while (true) {
             int ord = next_pb.fetch_add(1, std::memory_order_relaxed);
@@ -1604,13 +1853,14 @@ bool run_dedup_sessionize_and_write(
             ev_pids.clear();
             if (ev_pids.capacity() < nev) ev_pids.reserve(nev);
 
-            size_t est_people = std::max<size_t>(64, nev / 4);
+            // L1D-hot pht sizing: avg person has ~30 events (not 4!) -> 16 KB instead of 128 KB–1 MB!
+            size_t est_people = std::max<size_t>(64, nev / 20);
             size_t hcap = 64;
             while (hcap < est_people * 2) hcap <<= 1;
             pht.assign(hcap, 0);
             size_t hmask = hcap - 1;
 
-            auto rehash_pht = [&]() {
+            auto rehash_pht = [&]() SS_COLD_NOINLINE {
                 hcap <<= 1;
                 hmask = hcap - 1;
                 pht.assign(hcap, 0);
@@ -1718,6 +1968,8 @@ bool run_dedup_sessionize_and_write(
                 for (uint32_t p = 0; p < num_people; ++p) { clk_off[p] = cacc; cacc += clk_cnt[p]; }
             }
 
+            const size_t nd = size_t(num_days);
+
             for (uint32_t pid = 0; pid < num_people; ++pid) {
                 uint32_t es = ev_off[pid];
                 uint32_t ee = ev_off[pid + 1];
@@ -1725,21 +1977,7 @@ bool run_dedup_sessionize_and_write(
                 if (en == 0) continue;
 
                 if constexpr (Compact) {
-                    uint64_t* arr = grouped_evs.data() + es;
-                    if (en <= 24) {
-                        for (uint32_t i = 1; i < en; ++i) {
-                            uint64_t x = arr[i];
-                            uint32_t j = i;
-                            while (j > 0 && arr[j - 1] > x) { arr[j] = arr[j - 1]; --j; }
-                            arr[j] = x;
-                        }
-                    } else if (en < 256) {
-                        std::sort(arr, arr + en);
-                    } else if (en < 65536) {
-                        radix_sort_256_u64(arr, en, radix_tmp);
-                    } else {
-                        radix_sort_ts_u64(arr, en, radix_tmp);
-                    }
+                    sort_events_compact_u64(grouped_evs.data() + es, en, msd_shift, sort_tmp);
                 } else {
                     auto* arr = grouped_evs.data() + es;
                     std::sort(arr, arr + en, [](const WidePersonEvent& a, const WidePersonEvent& b) {
@@ -1752,7 +1990,7 @@ bool run_dedup_sessionize_and_write(
                 uint32_t cn = ce - cs;
                 LocalClick* clks = grouped_clks.data() + cs;
                 if (cn > 1) {
-                    auto clk_less = [&](const LocalClick& a, const LocalClick& b) -> bool {
+                    auto clk_less = [&](const LocalClick& a, const LocalClick& b) SS_LAMBDA_INLINE -> bool {
                         uint64_t ta = a.ts_off(), tb = b.ts_off();
                         if (ta != tb) return ta < tb;
                         return key_less(b.click_id, a.click_id, arenas);
@@ -1776,18 +2014,36 @@ bool run_dedup_sessionize_and_write(
                     cn = un;
                 }
 
+                // Decode person's user_id ONCE per person (not once per day -> 4.2x fewer decodes!)
+                alignas(16) char uid_pre_inline[16]{};
+                const char* uid_pre_ptr = uid_pre_inline;
+                uint32_t uid_pre_len = 0;
+                uint64_t pk = pkeys[pid];
+                if (__builtin_expect((pk & FALLBACK_BIT) == 0, 1)) {
+                    uint32_t ulen = uint32_t(decode_inline(pk, uid_pre_inline + 4));
+                    std::memcpy(uid_pre_inline, &ulen, 4);
+                    uid_pre_len = 4 + ulen;
+                } else {
+                    auto sv = arenas.get_fallback(pk);
+                    uint32_t ulen = uint32_t(sv.size());
+                    fb_uid_buf.resize(4 + ulen);
+                    std::memcpy(fb_uid_buf.data(), &ulen, 4);
+                    if (ulen) std::memcpy(fb_uid_buf.data() + 4, sv.data(), ulen);
+                    uid_pre_ptr = fb_uid_buf.data();
+                    uid_pre_len = 4 + ulen;
+                }
+
                 int32_t cur_day = -1;
                 int64_t cur_day_end_ms = INT64_MIN;
                 uint32_t day_sessions = 0, day_events = 0;
                 uint64_t day_rev = 0;
                 uint32_t L = 0, R = 0;
 
-                auto flush_day = [&]() {
+                auto flush_day = [&]() SS_LAMBDA_INLINE {
                     if (day_sessions == 0) return;
                     if (!active_camps.empty()) {
-                        CampCell* day_row = cd.data() + size_t(cur_day) * camp_stride;
                         for (uint32_t ac : active_camps) {
-                            day_row[ac].assisted_sessions += (day_sessions - cstate[ac].enter_sess);
+                            cd_assist[size_t(ac) * nd + size_t(cur_day)] += (day_sessions - cstate[ac].enter_sess);
                             cstate[ac].enter_sess = 0;
                         }
                     }
@@ -1804,13 +2060,13 @@ bool run_dedup_sessionize_and_write(
                         for (uint32_t c : used_cats) cat_rev[c] = 0;
                         used_cats.clear();
                     }
-                    ud.push_row_key(pkeys[pid], arenas, win_start_day + cur_day,
+                    ud.push_row_pre(uid_pre_ptr, uid_pre_len, win_start_day + cur_day,
                                     int32_t(day_sessions), int32_t(day_events), int64_t(day_rev),
-                                    best_c, products.cat_names);
+                                    best_c, products);
                     day_sessions = 0; day_events = 0; day_rev = 0;
                 };
 
-                auto get_ev = [&](uint32_t idx, int64_t& ts, uint32_t& price, uint32_t& cat) {
+                auto get_ev = [&](uint32_t idx, int64_t& ts, uint32_t& price, uint32_t& cat) SS_LAMBDA_INLINE {
                     if constexpr (Compact) {
                         uint64_t p = grouped_evs[idx];
                         ts = win_start_ms + int64_t(p >> 32);
@@ -1828,7 +2084,6 @@ bool run_dedup_sessionize_and_write(
                     uint32_t price, cat;
                     get_ev(i, s_start, price, cat);
                     prev_ts = s_start;
-                    // Monotonic day check (0 division on same day!)
                     if (__builtin_expect(s_start >= cur_day_end_ms, 0)) {
                         int32_t s_day = ms_to_day(s_start) - win_start_day;
                         if (s_day != cur_day) {
@@ -1854,9 +2109,8 @@ bool run_dedup_sessionize_and_write(
                         ++i;
                     }
 
-                    CampCell* day_row = cd.data() + size_t(cur_day) * camp_stride;
                     if (cn == 0) {
-                        auto& cell = day_row[campaigns.organic_idx];
+                        auto& cell = cd_cred[size_t(campaigns.organic_idx) * nd + size_t(cur_day)];
                         cell.sessions++;
                         cell.purchasing_sessions += (s_rev > 0);
                         cell.revenue_cents += s_rev;
@@ -1876,7 +2130,7 @@ bool run_dedup_sessionize_and_write(
                             uint32_t c = clks[L].camp_idx();
                             if (--cstate[c].count == 0) {
                                 if (day_sessions > cstate[c].enter_sess) {
-                                    day_row[c].assisted_sessions += (day_sessions - cstate[c].enter_sess);
+                                    cd_assist[size_t(c) * nd + size_t(cur_day)] += (day_sessions - cstate[c].enter_sess);
                                 }
                                 uint32_t pos = cstate[c].active_pos;
                                 uint32_t back = active_camps.back();
@@ -1887,7 +2141,7 @@ bool run_dedup_sessionize_and_write(
                             ++L;
                         }
                         uint32_t credit_c = (L < R) ? clks[R - 1].camp_idx() : campaigns.organic_idx;
-                        auto& cell = day_row[credit_c];
+                        auto& cell = cd_cred[size_t(credit_c) * nd + size_t(cur_day)];
                         cell.sessions++;
                         cell.purchasing_sessions += (s_rev > 0);
                         cell.revenue_cents += s_rev;
@@ -1902,7 +2156,7 @@ bool run_dedup_sessionize_and_write(
             }
         }
 
-        // FUSED STAGE 4: Write this worker's user_daily/part-{tid}.parquet immediately via writev()!
+        // FUSED STAGE 4: Write worker's user_daily/part-{tid}.parquet via writev()!
         if (ud.num_rows > 0) {
             total_ud_rows_written.fetch_add(ud.num_rows, std::memory_order_relaxed);
             std::string path = ud_dir + "/part-" + std::to_string(tid) + ".parquet";
@@ -1919,7 +2173,6 @@ bool run_dedup_sessionize_and_write(
             }
         }
 
-        // Last worker to finish writes campaign_daily (and empty user_daily if 0 total rows)!
         if (finished_workers.fetch_add(1, std::memory_order_acq_rel) == pool.nthreads - 1) {
             if (total_ud_rows_written.load(std::memory_order_acquire) == 0) {
                 std::string path = ud_dir + "/part-0.parquet";
@@ -1929,28 +2182,29 @@ bool run_dedup_sessionize_and_write(
                 }
             }
 
-            size_t total_cells = size_t(num_days) * size_t(camp_stride);
-            auto& agg = thread_cd[0];
+            auto& agg_a = thread_cd_assist[0];
+            auto& agg_c = thread_cd_cred[0];
             for (int t = 1; t < pool.nthreads; ++t) {
-                const auto& src = thread_cd[size_t(t)];
-                for (size_t i = 0; i < total_cells; ++i) {
-                    agg[i].sessions += src[i].sessions;
-                    agg[i].purchasing_sessions += src[i].purchasing_sessions;
-                    agg[i].assisted_sessions += src[i].assisted_sessions;
-                    agg[i].revenue_cents += src[i].revenue_cents;
+                const auto& sa = thread_cd_assist[size_t(t)];
+                const auto& sc = thread_cd_cred[size_t(t)];
+                for (size_t i = 0; i < n_cells; ++i) {
+                    agg_a[i] += sa[i];
+                    agg_c[i].sessions += sc[i].sessions;
+                    agg_c[i].purchasing_sessions += sc[i].purchasing_sessions;
+                    agg_c[i].revenue_cents += sc[i].revenue_cents;
                 }
             }
 
             std::vector<uint8_t> cid_plain, ch_plain;
             std::vector<int32_t> day_v, sess_v, psess_v, assist_v;
             std::vector<int64_t> rev_v;
-            cid_plain.reserve(total_cells * 10);
-            ch_plain.reserve(total_cells * 10);
-            day_v.reserve(total_cells);
-            sess_v.reserve(total_cells);
-            psess_v.reserve(total_cells);
-            rev_v.reserve(total_cells);
-            assist_v.reserve(total_cells);
+            cid_plain.reserve(n_cells * 10);
+            ch_plain.reserve(n_cells * 10);
+            day_v.reserve(n_cells);
+            sess_v.reserve(n_cells);
+            psess_v.reserve(n_cells);
+            rev_v.reserve(n_cells);
+            assist_v.reserve(n_cells);
 
             auto push_s = [](std::vector<uint8_t>& buf, const std::string& s) {
                 uint32_t len = uint32_t(s.size());
@@ -1960,18 +2214,21 @@ bool run_dedup_sessionize_and_write(
                 std::memcpy(buf.data() + old + 4, s.data(), len);
             };
 
+            const size_t nd = size_t(num_days);
             for (int32_t d = 0; d < num_days; ++d) {
                 int32_t abs_day = win_start_day + d;
                 for (uint32_t c = 0; c < camp_stride; ++c) {
-                    const auto& cell = agg[size_t(d) * camp_stride + c];
-                    if (cell.sessions == 0 && cell.assisted_sessions == 0) continue;
+                    size_t idx = size_t(c) * nd + size_t(d);
+                    uint32_t a = agg_a[idx];
+                    const auto& cell = agg_c[idx];
+                    if (cell.sessions == 0 && a == 0) continue;
                     push_s(cid_plain, campaigns.ids[c]);
                     push_s(ch_plain, campaigns.channels[c]);
                     day_v.push_back(abs_day);
                     sess_v.push_back(int32_t(cell.sessions));
                     psess_v.push_back(int32_t(cell.purchasing_sessions));
                     rev_v.push_back(int64_t(cell.revenue_cents));
-                    assist_v.push_back(int32_t(cell.assisted_sessions));
+                    assist_v.push_back(int32_t(a));
                 }
             }
 
@@ -2009,13 +2266,17 @@ int run_engine(int argc, char** argv) {
         out_dir = argv[argc - 1];
     }
 
-    int ncpu = detect_ncpu();
-    bool prof = std::getenv("PROFILE") != nullptr;
     auto now_ms = []() {
         return std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
     };
     double t0 = now_ms();
+    bool prof = std::getenv("PROFILE") != nullptr;
+
+    // Spawn & pin worker pool FIRST so thread creation overlaps with manifest/dir setup!
+    CpuTopology topo = detect_topology();
+    int ncpu = topo.ncpu;
+    ThreadPool pool(topo);
 
     DateLut lut;
     int64_t win_start_ms = 0, win_end_ms = 0;
@@ -2032,9 +2293,10 @@ int run_engine(int argc, char** argv) {
             std::fprintf(stderr, "Failed to parse manifest timestamps\n");
             return 1;
         }
-        lut.init(win_start_ms - CLICK_WINDOW_MS, win_end_ms);
+        lut.init(win_start_ms - CLICK_WINDOW_MS, win_start_ms, win_end_ms);
     }
     int64_t win_start_sec = win_start_ms / 1000LL;
+    int64_t win_dur_ms = win_end_ms - win_start_ms;
     int64_t click_start_ms = win_start_ms - CLICK_WINDOW_MS;
     int32_t win_start_day = ms_to_day(win_start_ms);
     int32_t win_end_day = (win_end_ms > win_start_ms) ? ms_to_day(win_end_ms - 1) : win_start_day;
@@ -2045,18 +2307,20 @@ int run_engine(int argc, char** argv) {
     mkdir_p(ud_dir);
     mkdir_p(cd_dir);
 
-    ThreadPool pool(ncpu);
     StringArenaPool arenas;
     arenas.init(ncpu);
+    std::vector<ReadBuf> rbufs(static_cast<size_t>(ncpu));
+    for (int t = 0; t < ncpu; ++t) rbufs[size_t(t)].init();
 
-    // Stage 0: Overlap products/campaigns load (Thread 0) with parallel mmap of ALL 3 CSV dirs!
+    // Stage 0: Overlap products/campaigns load with parallel open+fstat of CSV files!
     std::vector<std::pair<std::string, uint8_t>> all_paths;
     all_paths.reserve(256);
     list_csv_paths(data_dir + "/links", 2, all_paths);
     list_csv_paths(data_dir + "/clicks", 0, all_paths);
     list_csv_paths(data_dir + "/events", 1, all_paths);
 
-    std::vector<MmapCsvFile> mapped_files(all_paths.size());
+    const bool keep_fds = (all_paths.size() < 480);
+    std::vector<CsvFile> csv_files(all_paths.size());
     Products products;
     Campaigns campaigns;
     std::atomic<size_t> next_f{0};
@@ -2069,25 +2333,39 @@ int run_engine(int argc, char** argv) {
         while (true) {
             size_t i = next_f.fetch_add(1, std::memory_order_relaxed);
             if (i >= all_paths.size()) break;
-            mapped_files[i] = open_and_mmap_csv(all_paths[i].first, all_paths[i].second);
+            int fd = ::open(all_paths[i].first.c_str(), O_RDONLY);
+            if (fd < 0) continue;
+            struct stat st{};
+            size_t fsz = (::fstat(fd, &st) == 0 && st.st_size > 0) ? size_t(st.st_size) : 0;
+            if (!keep_fds || fsz == 0) { ::close(fd); fd = -1; }
+            csv_files[i] = {all_paths[i].first, fd, fsz, all_paths[i].second};
         }
     });
 
-    std::vector<MmapTask> link_tasks, io_tasks;
-    build_mmap_tasks(mapped_files, 1U << 2, ncpu, link_tasks);
-    build_mmap_tasks(mapped_files, (1U << 0) | (1U << 1), ncpu, io_tasks);
+    std::vector<CsvTask> link_tasks, io_tasks;
+    build_csv_tasks(csv_files, 1U << 2, ncpu, link_tasks);
+    build_csv_tasks(csv_files, (1U << 0) | (1U << 1), ncpu, io_tasks);
     double t_init = now_ms();
 
-    // Stage 1: Blazing 4-Barrier Lock-Free Direct Hash-DSU + 1-Word Bloom
+    // Stage 1: Blazing 3-Barrier Union-by-Key Huge-Page Hash-DSU + 1-Word Bloom
     LinkMap links;
-    links.build(link_tasks, pool, arenas);
+    links.build(link_tasks, rbufs, pool, arenas);
     double t_links = now_ms();
 
-    // Stage 2: Fused Non-Overlapping 64B SIMD Scan of clicks/ + events/
+    // Stage 2: Zero-Fault pread(256KB) + Shifted-Remainder 6-tzcnt SIMD Scan + RawEvent16!
     PartitionedStore<PersonClick, 128, PERSON_BUCKETS, 4, false> click_store;
-    PartitionedStore<RawEvent, 256, EV_BUCKETS, 8, true> event_store;
+    PartitionedStore<RawEvent16, 256, EV_BUCKETS, 4, false> event_store;
     click_store.init(ncpu);
     event_store.init(ncpu);
+
+    // Recycle LinkMap's already-faulted huge-page DSU memory into event_store (0 new page faults!)
+    if (links.recycled_dsu && links.recycled_dsu_bytes >= (4ULL << 20)) {
+        size_t slice = (links.recycled_dsu_bytes / size_t(ncpu)) & ~size_t(4095);
+        char* p = static_cast<char*>(links.recycled_dsu);
+        for (int t = 0; t < ncpu; ++t) {
+            event_store.ts[size_t(t)]->donate_slab(p + size_t(t) * slice, slice);
+        }
+    }
 
     std::vector<std::vector<SideEvent>> thread_sides(static_cast<size_t>(ncpu));
 
@@ -2106,9 +2384,9 @@ int run_engine(int argc, char** argv) {
             auto& clk_out = *click_store.ts[size_t(tid)];
             auto& ev_out = *event_store.ts[size_t(tid)];
             auto& side_vec = thread_sides[size_t(tid)];
+            auto& rbuf = rbufs[size_t(tid)];
             side_vec.reserve(65536);
 
-            // 64-entry L1 prefetch ring for clicks LinkMap resolution!
             struct ClickRing {
                 uint64_t ukey;
                 uint64_t uh;
@@ -2120,12 +2398,42 @@ int run_engine(int argc, char** argv) {
             constexpr size_t CR_MASK = CR_SZ - 1;
             ClickRing cring[CR_SZ];
             size_t cpushed = 0;
+            bool clicks_flushed = false;
 
-            auto emit_click = [&](const ClickRing& r) {
+            auto emit_click = [&](const ClickRing& r) SS_LAMBDA_INLINE {
                 uint64_t pkey = r.probe_ht ? links.resolve_slot_only(r.ukey, r.uh, arenas) : r.ukey;
                 uint64_t ph = (pkey == r.ukey) ? r.uh : hash_key64(pkey, arenas);
                 uint32_t pb = uint32_t(ph >> 55);
                 clk_out.push(pb, PersonClick{pkey, r.cid, r.ts_camp});
+            };
+
+            auto drain_clicks = [&]() SS_COLD_NOINLINE {
+                if (cpushed > 0) {
+                    size_t s1 = (cpushed > 16) ? (cpushed - 16) : 0;
+                    for (size_t k = s1; k < cpushed; ++k) {
+                        auto& r1 = cring[k & CR_MASK];
+                        bool ml = (links.has_fallback || (r1.ukey & FALLBACK_BIT) == 0) &&
+                                  (!links_has_bloom || links.bloom_might_contain(r1.uh));
+                        r1.probe_ht = ml;
+                        if (ml) links.prefetch_slot(r1.uh);
+                    }
+                    size_t s2 = (cpushed > 32) ? (cpushed - 32) : 0;
+                    for (size_t k = s2; k < cpushed; ++k) {
+                        emit_click(cring[k & CR_MASK]);
+                    }
+                    cpushed = 0;
+                }
+                clk_out.flush_all();
+                clicks_flushed = true;
+            };
+
+            auto push_side_ev = [&](bool valid, uint32_t irel21, bool eid_in_side, uint32_t eb, uint64_t rem39,
+                                    uint64_t eid_k64, uint64_t ukey, int64_t ts_ms, int64_t ing_ms,
+                                    uint32_t price, uint32_t cat_id) SS_COLD_NOINLINE {
+                uint32_t sidx = uint32_t(side_vec.size());
+                if (__builtin_expect(sidx >= (1U << 26), 0)) std::abort();
+                side_vec.push_back({eid_k64, ukey, ts_ms, ing_ms, price, cat_id});
+                ev_out.push(eb, RawEvent16::make_side(valid, irel21, eid_in_side, rem39, tid, sidx));
             };
 
             while (true) {
@@ -2133,21 +2441,20 @@ int run_engine(int argc, char** argv) {
                 if (ti >= io_tasks.size()) break;
                 const auto& task = io_tasks[ti];
                 if (task.kind == 0) {
-                    // Clicks with 2-stage prefetched LinkMap resolution!
-                    scan_mmap_csv_simd<4>(task, [&](const Slice f[4]) {
-                        if (__builtin_expect(f[0].len > 0 && f[1].len > 0 && f[2].len > 0 && f[3].len > 0, 1)) {
-                            uint32_t camp_idx = campaigns.lookup(f[2].ptr, f[2].len);
+                    // Clicks: single-word L<64 SIMD + 8KB L1D branchless campaign lookup!
+                    scan_pread_csv<4>(task, rbuf, [&](const Slice f[4]) SS_LAMBDA_INLINE {
+                        if (__builtin_expect((f[0].len > 0) & (f[1].len > 0) & (f[2].len > 0) & (f[3].len > 0), 1)) {
+                            uint32_t camp_idx = campaigns.lookup_padded(f[2].ptr, f[2].len);
                             if (__builtin_expect(camp_idx != FastStringIdMap::NOT_FOUND, 1)) {
                                 int64_t ts = 0;
                                 if (__builtin_expect(parse_ts(f[3].ptr, f[3].len, ts, lut) &&
                                                      ts >= click_start_ms && ts < win_end_ms, 1)) {
-                                    uint64_t ukey = encode_key64(f[1].ptr, f[1].len, arenas, tid);
-                                    uint64_t cid = encode_key64(f[0].ptr, f[0].len, arenas, tid);
+                                    uint64_t ukey = encode_key64_padded(f[1].ptr, f[1].len, arenas, tid);
+                                    uint64_t cid = encode_key64_padded(f[0].ptr, f[0].len, arenas, tid);
                                     uint64_t ts_camp = (uint64_t(ts - click_start_ms) << 20) | uint64_t(camp_idx);
                                     uint64_t uh = hash_key64(ukey, arenas);
                                     if (__builtin_expect(!links_active, 0)) {
-                                        uint32_t pb = uint32_t(uh >> 55);
-                                        clk_out.push(pb, PersonClick{ukey, cid, ts_camp});
+                                        clk_out.push(uint32_t(uh >> 55), PersonClick{ukey, cid, ts_camp});
                                     } else {
                                         cring[cpushed & CR_MASK] = {ukey, uh, cid, ts_camp, false};
                                         if (links_has_bloom) links.prefetch_bloom(uh);
@@ -2158,9 +2465,7 @@ int run_engine(int argc, char** argv) {
                                             r1.probe_ht = ml;
                                             if (ml) links.prefetch_slot(r1.uh);
                                         }
-                                        if (cpushed >= 32) {
-                                            emit_click(cring[(cpushed - 32) & CR_MASK]);
-                                        }
+                                        if (cpushed >= 32) emit_click(cring[(cpushed - 32) & CR_MASK]);
                                         ++cpushed;
                                     }
                                 }
@@ -2168,137 +2473,115 @@ int run_engine(int argc, char** argv) {
                         }
                     });
                 } else {
-                    // Events: zero-pext event_id + same-10B date reuse + exact ms ingest_ts!
-                    scan_mmap_csv_simd<7>(task, [&](const Slice f[7]) {
-                        if (__builtin_expect(f[0].len > 0, 1)) {
-                            int64_t ingest_ms = 0;
-                            int64_t ing_day_sec = 0;
-                            bool ing_is_f1 = false;
-                            bool ing_whole_sec = false;
-                            if (__builtin_expect(f[3].len == 20 && f[3].ptr[19] == 'Z', 1)) {
-                                int64_t isec;
-                                if (__builtin_expect(!parse_iso19_sec_day(f[3].ptr, isec, ing_day_sec, lut), 0)) return;
-                                ingest_ms = isec * 1000LL;
-                                ing_is_f1 = true;
-                                ing_whole_sec = true;
-                            } else {
-                                if (!parse_ts(f[3].ptr, f[3].len, ingest_ms, lut)) return;
-                                ing_whole_sec = (ingest_ms % 1000LL == 0);
-                            }
+                    if (__builtin_expect(!clicks_flushed && cpushed > 0, 0)) drain_clicks();
+                    // Events: 6-tzcnt shifted-remainder SIMD + FastDay[256] + SWAR + RawEvent16!
+                    scan_pread_csv<7>(task, rbuf, [&](const Slice f[7]) SS_LAMBDA_INLINE {
+                        if (__builtin_expect(f[0].len == 0, 0)) return;
 
-                            uint64_t eid = encode_event_id(f[0].ptr, f[0].len, arenas, tid);
-                            uint32_t eb = uint32_t(hash_key64(eid, arenas) >> 56); // 256 event buckets!
+                        // 1. Parse ingest_ts (99.99% F1!)
+                        int64_t ing_rel_sec = 0;
+                        int64_t ing_ms = 0;
+                        bool ing_whole_sec = true;
+                        if (__builtin_expect(f[3].len == 20 && f[3].ptr[19] == 'Z', 1)) {
+                            if (__builtin_expect(!lut.parse_iso19_rel_sec(f[3].ptr, ing_rel_sec), 0)) return;
+                            ing_ms = (win_start_sec + ing_rel_sec) * 1000LL;
+                        } else {
+                            if (!parse_ts(f[3].ptr, f[3].len, ing_ms, lut)) return;
+                            ing_whole_sec = (ing_ms % 1000LL == 0);
+                            ing_rel_sec = ing_ms / 1000LL - win_start_sec;
+                        }
 
-                            uint32_t irel30 = 0U;
-                            if (__builtin_expect(ing_whole_sec, 1)) {
-                                int64_t irel_s = (ingest_ms / 1000LL - win_start_sec) + RawEvent::REL_BIAS;
-                                if (__builtin_expect(irel_s > 0 && irel_s <= RawEvent::REL_MAX, 1)) {
-                                    irel30 = uint32_t(irel_s);
-                                }
-                            }
+                        // 2. Encode event_id -> 48b bijection (eb = top 9b, rem39 = low 39b)
+                        uint64_t eid48 = 0, eid_k64 = 0;
+                        uint32_t eb = 0;
+                        uint64_t rem39 = 0;
+                        bool eid_in_side = false;
+                        if (__builtin_expect(encode_eid48_padded(f[0].ptr, f[0].len, eid48), 1)) {
+                            uint64_t h48 = mix48(eid48);
+                            eb = uint32_t(h48 >> 39);
+                            rem39 = h48 & RawEvent16::REM39_MASK;
+                        } else {
+                            eid_in_side = true;
+                            eid_k64 = encode_key64_padded(f[0].ptr, f[0].len, arenas, tid);
+                            uint64_t h64 = hash_key64(eid_k64, arenas);
+                            eb = uint32_t(h64 >> 55);
+                            rem39 = h64 & RawEvent16::REM39_MASK;
+                        }
 
-                            bool ok = (f[1].len > 0 && f[5].len > 0);
-                            int etype = 0;
-                            if (__builtin_expect(ok, 1)) {
-                                if (f[4].len == 4) {
-                                    uint32_t v;
-                                    std::memcpy(&v, f[4].ptr, 4);
-                                    if (v == view_u32 || v == cart_u32) etype = 1;
-                                    else ok = false;
-                                } else if (f[4].len == 8) {
-                                    uint64_t v;
-                                    std::memcpy(&v, f[4].ptr, 8);
-                                    if (v == pur_u64) etype = 2;
-                                    else ok = false;
-                                } else {
-                                    ok = false;
-                                }
-                            }
-
-                            int64_t ts = 0;
-                            if (__builtin_expect(ok, 1)) {
-                                bool ts_ok = false;
-                                if (f[2].len == 20 && f[2].ptr[19] == 'Z') {
-                                    int64_t tsec = 0;
-                                    if (__builtin_expect(ing_is_f1, 1)) {
-                                        uint64_t a8, b8;
-                                        uint16_t a2, b2;
-                                        std::memcpy(&a8, f[2].ptr, 8);
-                                        std::memcpy(&b8, f[3].ptr, 8);
-                                        std::memcpy(&a2, f[2].ptr + 8, 2);
-                                        std::memcpy(&b2, f[3].ptr + 8, 2);
-                                        if (__builtin_expect(a8 == b8 && a2 == b2, 1)) {
-                                            ts_ok = parse_hms_only(f[2].ptr, ing_day_sec, tsec);
-                                        } else {
-                                            ts_ok = parse_iso19_sec(f[2].ptr, tsec, lut);
-                                        }
-                                    } else {
-                                        ts_ok = parse_iso19_sec(f[2].ptr, tsec, lut);
-                                    }
-                                    ts = tsec * 1000LL;
-                                } else if (f[2].len == 13) {
-                                    ts_ok = parse_13d_swar(f[2].ptr, ts);
-                                } else {
-                                    ts_ok = parse_ts(f[2].ptr, f[2].len, ts, lut);
-                                }
-                                if (__builtin_expect(!ts_ok || ts < win_start_ms || ts >= win_end_ms ||
-                                                     ingest_ms - ts > DAY_MS, 0)) {
-                                    ok = false;
-                                }
-                            }
-
-                            uint32_t price = 0;
-                            uint32_t cat_id = 0;
-                            if (__builtin_expect(ok && etype == 2, 0)) {
-                                if (!parse_price_cents(f[6].ptr, f[6].len, price)) {
-                                    ok = false;
-                                } else {
-                                    cat_id = products.lookup(f[5].ptr, f[5].len);
-                                }
-                            }
-
-                            if (__builtin_expect(ok, 1)) {
-                                uint64_t ukey = encode_key64(f[1].ptr, f[1].len, arenas, tid);
-                                uint64_t ts_off = uint64_t(ts - win_start_ms);
-                                if (__builtin_expect(etype == 1 && irel30 != 0 && ts_off <= 0xFFFFFFFFULL, 1)) {
-                                    ev_out.push(eb, RawEvent{eid, ukey, RawEvent::pack_inline(true, irel30, uint32_t(ts_off))});
-                                } else {
-                                    uint32_t sidx = uint32_t(side_vec.size());
-                                    if (__builtin_expect(sidx >= (1U << 26), 0)) std::abort();
-                                    side_vec.push_back({ts, ingest_ms, price, cat_id});
-                                    ev_out.push(eb, RawEvent{eid, ukey, RawEvent::pack_side(true, irel30, tid, sidx)});
-                                }
-                            } else {
-                                if (__builtin_expect(irel30 != 0, 1)) {
-                                    ev_out.push(eb, RawEvent{eid, 0, RawEvent::pack_inline(false, irel30, 0)});
-                                } else {
-                                    uint32_t sidx = uint32_t(side_vec.size());
-                                    if (__builtin_expect(sidx >= (1U << 26), 0)) std::abort();
-                                    side_vec.push_back({0, ingest_ms, 0, 0});
-                                    ev_out.push(eb, RawEvent{eid, 0, RawEvent::pack_side(false, 0, tid, sidx)});
-                                }
+                        uint32_t irel21 = 0U;
+                        if (__builtin_expect(ing_whole_sec, 1)) {
+                            int64_t ir = ing_rel_sec + RawEvent16::ING_BIAS;
+                            if (__builtin_expect(ir > 0 && ir <= RawEvent16::ING_MAX, 1)) {
+                                irel21 = uint32_t(ir);
                             }
                         }
+
+                        // 3. Branchless event_type + non-empty user_id/product_id check
+                        uint32_t v4 = 0;
+                        uint64_t v8 = 0;
+                        std::memcpy(&v4, f[4].ptr, 4); // safe: 64B zero-pad!
+                        std::memcpy(&v8, f[4].ptr, 8);
+                        bool is_vc = (f[4].len == 4) & ((v4 == view_u32) | (v4 == cart_u32));
+                        bool is_pur = (f[4].len == 8) & (v8 == pur_u64);
+                        bool ok = (f[1].len > 0) & (f[5].len > 0) & (is_vc | is_pur);
+
+                        // 4. Parse ts (F1 / F3 / F2)
+                        int64_t ts_ms = 0;
+                        int64_t ts_rel_sec = 0;
+                        bool ts_whole_sec = false;
+                        if (__builtin_expect(ok, 1)) {
+                            bool ts_ok = false;
+                            if (f[2].len == 20 && f[2].ptr[19] == 'Z') {
+                                ts_ok = lut.parse_iso19_rel_sec(f[2].ptr, ts_rel_sec);
+                                ts_ms = (win_start_sec + ts_rel_sec) * 1000LL;
+                                ts_whole_sec = true;
+                            } else if (f[2].len == 13) {
+                                ts_ok = parse_13d_swar(f[2].ptr, ts_ms);
+                                // Fast check if whole second (95% of F3!)
+                                if (__builtin_expect(f[2].ptr[10] == '0' && f[2].ptr[11] == '0' && f[2].ptr[12] == '0', 1)) {
+                                    ts_whole_sec = true;
+                                    ts_rel_sec = ts_ms / 1000LL - win_start_sec;
+                                }
+                            } else if (f[2].len == 25) {
+                                ts_ok = lut.parse_f2_rel_sec(f[2].ptr, ts_rel_sec);
+                                ts_ms = (win_start_sec + ts_rel_sec) * 1000LL;
+                                ts_whole_sec = true;
+                            } else {
+                                ts_ok = parse_ts_slow(f[2].ptr, f[2].len, ts_ms, lut);
+                            }
+                            if (__builtin_expect(!ts_ok || uint64_t(ts_ms - win_start_ms) >= uint64_t(win_dur_ms) ||
+                                                 ing_ms - ts_ms > DAY_MS, 0)) {
+                                ok = false;
+                            }
+                        }
+
+                        // 5. FAST PATH (92%+ of all rows!): valid view/cart, whole-sec, base36 IDs, delta in [-8..131063]
+                        if (__builtin_expect(ok & is_vc & ts_whole_sec & (!eid_in_side) & (irel21 != 0), 1)) {
+                            int64_t delta = (ing_rel_sec - ts_rel_sec) + 8LL;
+                            uint64_t uid48 = 0;
+                            if (__builtin_expect(uint64_t(delta) < 131072ULL &&
+                                                 encode_uid48_padded(f[1].ptr, f[1].len, uid48), 1)) {
+                                ev_out.push(eb, RawEvent16::make_inline(irel21, uint32_t(delta), rem39, uid48));
+                                return;
+                            }
+                        }
+
+                        // 6. SIDE PATH (~7-8%: purchase 3%, ms-ts 1.5%, invalid/late 2.5%, uppercase/long/clock-skew)
+                        uint32_t price = 0, cat_id = 0;
+                        if (ok && is_pur) {
+                            if (!parse_price_cents(f[6].ptr, f[6].len, price)) {
+                                ok = false;
+                            } else {
+                                cat_id = products.lookup(f[5].ptr, f[5].len);
+                            }
+                        }
+                        uint64_t ukey = ok ? encode_key64_padded(f[1].ptr, f[1].len, arenas, tid) : 0ULL;
+                        push_side_ev(ok, irel21, eid_in_side, eb, rem39, eid_k64, ukey, ts_ms, ing_ms, price, cat_id);
                     });
                 }
             }
 
-            // Drain remaining <= 32 clicks in prefetch ring!
-            if (cpushed > 0) {
-                size_t s1 = (cpushed > 16) ? (cpushed - 16) : 0;
-                for (size_t k = s1; k < cpushed; ++k) {
-                    auto& r1 = cring[k & CR_MASK];
-                    bool ml = (links.has_fallback || (r1.ukey & FALLBACK_BIT) == 0) &&
-                              (!links_has_bloom || links.bloom_might_contain(r1.uh));
-                    r1.probe_ht = ml;
-                    if (ml) links.prefetch_slot(r1.uh);
-                }
-                size_t s2 = (cpushed > 32) ? (cpushed - 32) : 0;
-                for (size_t k = s2; k < cpushed; ++k) {
-                    emit_click(cring[k & CR_MASK]);
-                }
-            }
-            clk_out.flush_all();
+            if (!clicks_flushed) drain_clicks();
             ev_out.flush_all();
         });
     }
