@@ -27,7 +27,6 @@ static constexpr int64_t CLICK_WINDOW_MS = 7LL * DAY_MS;
 
 static constexpr uint64_t FALLBACK_BIT = 1ULL << 63;
 
-// Fast anonymous mmap helper (uses THP on Linux where available).
 static inline void* alloc_mmap(size_t bytes) {
     if (bytes == 0) bytes = 4096;
     void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -43,7 +42,6 @@ static inline void* alloc_mmap(size_t bytes) {
     return p;
 }
 
-// Per-thread virtual-reserved bump arena for fallback strings (>10 bytes or non-[0-9A-Za-z_]).
 struct StringArenaPool {
     static constexpr int MAX_THREADS = 64;
     static constexpr size_t RESERVATION = 256ULL << 20;
@@ -76,96 +74,86 @@ struct StringArenaPool {
     }
 };
 
-// 6-bit ASCII-order-preserving encoding for [0-9A-Za-z_] (length 1..10).
-// Valid chars map to 1..63; invalid chars map to 0x80 (so single OR & 0x80 checks all chars!).
-alignas(64) static constexpr uint8_t ENC6[256] = {
-    0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,
-    0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,
-    0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,
-    1,2,3,4,5,6,7,8, 9,10,0x80,0x80,0x80,0x80,0x80,0x80, // '0'..'9'
-    0x80,11,12,13,14,15,16,17, 18,19,20,21,22,23,24,25,  // 'A'..'O'
-    26,27,28,29,30,31,32,33, 34,35,36,0x80,0x80,0x80,0x80,37, // 'P'..'Z', '_'
-    0x80,38,39,40,41,42,43,44, 45,46,47,48,49,50,51,52,  // 'a'..'o'
-    53,54,55,56,57,58,59,60, 61,62,63,0x80,0x80,0x80,0x80,0x80, // 'p'..'z'
-    0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,
-    0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,
-    0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,
-    0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,
-    0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,
-    0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,
-    0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,
-    0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,
-};
+// ============================================================================
+// 9-Byte 7-Bit ASCII Order-Preserving Key64 via BMI2 PEXT/PDEP (SWAR fallback)
+// - Bit 63 == 0: inline 1..9 byte string, every byte in 0x01..0x7F.
+//   Bits 62..56 = s[0], Bits 55..0 = 8x 7-bit packed s[1..8] (0-padded right).
+//   Unsigned u64 '<' is 100% identical to exact byte-wise lexicographic order!
+//   Encode/Decode: 1 BMI2 instruction (3 cycles) on x86-64-v3/v4, 9 ALU ops on ARM64!
+// - Bit 63 == 1: fallback arena (>9 bytes, NUL byte, or non-ASCII UTF-8).
+// ============================================================================
+static inline uint64_t pext56(uint64_t be) {
+#if defined(__BMI2__)
+    return _pext_u64(be, 0x7F7F7F7F7F7F7F7FULL);
+#else
+    uint64_t t = ((be & 0x7F007F007F007F00ULL) >> 1) | (be & 0x007F007F007F007FULL);
+    t = ((t & 0x3FFF00003FFF0000ULL) >> 2) | (t & 0x00003FFF00003FFFULL);
+    return ((t & 0x0FFFFFFF00000000ULL) >> 4) | (t & 0x000000000FFFFFFFULL);
+#endif
+}
 
-alignas(64) static constexpr char DEC6[64] = {
-    0,
-    '0','1','2','3','4','5','6','7','8','9',
-    'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
-    '_',
-    'a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v','w','x','y','z'
-};
+static inline uint64_t pdep56(uint64_t k) {
+#if defined(__BMI2__)
+    return _pdep_u64(k, 0x7F7F7F7F7F7F7F7FULL);
+#else
+    uint64_t t = ((k & 0x00FFFFFFF0000000ULL) << 4) | (k & 0x000000000FFFFFFFULL);
+    t = ((t & 0x0FFFC0000FFFC000ULL) << 2) | (t & 0x00003FFF00003FFFULL);
+    return ((t & 0x3F803F803F803F80ULL) << 1) | (t & 0x007F007F007F007FULL);
+#endif
+}
 
-// Unrolled branchless fast path for len==9 (93% of generator IDs) and len==8 (7%)!
 static inline uint64_t encode_key64(const char* s, size_t len, StringArenaPool& arenas, int tid) {
     if (__builtin_expect(len == 9, 1)) {
-        uint8_t c0 = ENC6[uint8_t(s[0])];
-        uint8_t c1 = ENC6[uint8_t(s[1])];
-        uint8_t c2 = ENC6[uint8_t(s[2])];
-        uint8_t c3 = ENC6[uint8_t(s[3])];
-        uint8_t c4 = ENC6[uint8_t(s[4])];
-        uint8_t c5 = ENC6[uint8_t(s[5])];
-        uint8_t c6 = ENC6[uint8_t(s[6])];
-        uint8_t c7 = ENC6[uint8_t(s[7])];
-        uint8_t c8 = ENC6[uint8_t(s[8])];
-        if (__builtin_expect(((c0 | c1 | c2 | c3 | c4 | c5 | c6 | c7 | c8) & 0x80) == 0, 1)) {
-            return (uint64_t(c0) << 54) | (uint64_t(c1) << 48) | (uint64_t(c2) << 42) |
-                   (uint64_t(c3) << 36) | (uint64_t(c4) << 30) | (uint64_t(c5) << 24) |
-                   (uint64_t(c6) << 18) | (uint64_t(c7) << 12) | (uint64_t(c8) << 6);
+        uint8_t b0 = uint8_t(s[0]);
+        uint64_t raw8;
+        std::memcpy(&raw8, s + 1, 8);
+        uint64_t bad = (raw8 & 0x8080808080808080ULL) |
+                       ((raw8 - 0x0101010101010101ULL) & ~raw8 & 0x8080808080808080ULL);
+        if (__builtin_expect(bad == 0 && uint8_t(b0 - 1) < 127, 1)) {
+            return (uint64_t(b0) << 56) | pext56(__builtin_bswap64(raw8));
         }
         return arenas.store_fallback(tid, s, len);
     }
     if (__builtin_expect(len == 8, 1)) {
-        uint8_t c0 = ENC6[uint8_t(s[0])];
-        uint8_t c1 = ENC6[uint8_t(s[1])];
-        uint8_t c2 = ENC6[uint8_t(s[2])];
-        uint8_t c3 = ENC6[uint8_t(s[3])];
-        uint8_t c4 = ENC6[uint8_t(s[4])];
-        uint8_t c5 = ENC6[uint8_t(s[5])];
-        uint8_t c6 = ENC6[uint8_t(s[6])];
-        uint8_t c7 = ENC6[uint8_t(s[7])];
-        if (__builtin_expect(((c0 | c1 | c2 | c3 | c4 | c5 | c6 | c7) & 0x80) == 0, 1)) {
-            return (uint64_t(c0) << 54) | (uint64_t(c1) << 48) | (uint64_t(c2) << 42) |
-                   (uint64_t(c3) << 36) | (uint64_t(c4) << 30) | (uint64_t(c5) << 24) |
-                   (uint64_t(c6) << 18) | (uint64_t(c7) << 12);
+        uint8_t b0 = uint8_t(s[0]);
+        uint64_t raw8 = 0;
+        std::memcpy(&raw8, s + 1, 7);
+        uint64_t check = raw8 | 0x0100000000000000ULL;
+        uint64_t bad = (check & 0x8080808080808080ULL) |
+                       ((check - 0x0101010101010101ULL) & ~check & 0x8080808080808080ULL);
+        if (__builtin_expect(bad == 0 && uint8_t(b0 - 1) < 127, 1)) {
+            return (uint64_t(b0) << 56) | pext56(__builtin_bswap64(raw8));
         }
         return arenas.store_fallback(tid, s, len);
     }
     if (__builtin_expect(len == 0, 0)) return 0;
-    if (__builtin_expect(len <= 10, 1)) {
-        uint64_t acc = 0;
-        int shift = 54;
-        uint8_t bad = 0;
-        for (size_t i = 0; i < len; ++i) {
-            uint8_t c = ENC6[uint8_t(s[i])];
-            bad |= c;
-            acc |= uint64_t(c) << shift;
-            shift -= 6;
+    if (__builtin_expect(len <= 9, 1)) {
+        uint8_t b0 = uint8_t(s[0]);
+        if (uint8_t(b0 - 1) < 127) {
+            uint8_t tmp[8]{};
+            bool ok = true;
+            for (size_t i = 1; i < len; ++i) {
+                uint8_t c = uint8_t(s[i]);
+                if (uint8_t(c - 1) >= 127) { ok = false; break; }
+                tmp[i - 1] = c;
+            }
+            if (ok) {
+                uint64_t raw8;
+                std::memcpy(&raw8, tmp, 8);
+                return (uint64_t(b0) << 56) | pext56(__builtin_bswap64(raw8));
+            }
         }
-        if (__builtin_expect((bad & 0x80) == 0, 1)) return acc;
     }
     return arenas.store_fallback(tid, s, len);
 }
 
-static inline size_t decode_inline(uint64_t k, char out[10]) {
-    size_t n = 0;
-    int shift = 54;
-    while (shift >= 0) {
-        uint8_t c = uint8_t((k >> shift) & 63);
-        if (c == 0) break;
-        out[n++] = DEC6[c];
-        shift -= 6;
-    }
-    return n;
+// Decode inline Key64 (writes up to 9 bytes into `out`, returns exact length in 1..9).
+static inline size_t decode_inline(uint64_t k, char* out) {
+    out[0] = char(k >> 56);
+    uint64_t be = pdep56(k);
+    uint64_t le = __builtin_bswap64(be);
+    std::memcpy(out + 1, &le, 8);
+    return be ? (9U - (uint32_t(__builtin_ctzll(be)) >> 3)) : 1U;
 }
 
 static inline std::string_view key_to_sv(uint64_t k, char tmp[10], const StringArenaPool& arenas) {
@@ -262,8 +250,8 @@ static inline void civil_from_days(int64_t z, int& y, int& m, int& d) {
 static constexpr uint8_t DAYS_IN_MONTH[13] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
 
 struct FastMonth {
-    uint64_t prefix_u64; // "YYYY-MM-" little-endian u64
-    int64_t day0_sec;    // epoch seconds of YYYY-MM-00T00:00:00Z
+    uint64_t prefix_u64;
+    int64_t day0_sec;
     uint8_t max_day;
 };
 
@@ -291,8 +279,6 @@ struct DateLut {
                 }
             }
         }
-        // Populate up to 4 FastMonth entries covering [y1-m1 .. y2-m2]
-        // Put the main window months FIRST so branch predictor hits fm[0]/fm[1]!
         num_fm = 0;
         int wy, wm, wd;
         civil_from_days((win_end_ms / DAY_MS) - 1, wy, wm, wd);
@@ -367,7 +353,6 @@ static inline bool parse_4d(const char* p, int& out) {
     return true;
 }
 
-// Parse 8 ASCII digits via SWAR (strictly '0'..'9', zero borrow risk!)
 static inline bool parse_8d_swar(const char* p, uint64_t& out) {
     uint64_t v;
     std::memcpy(&v, p, 8);
@@ -381,7 +366,6 @@ static inline bool parse_8d_swar(const char* p, uint64_t& out) {
     return true;
 }
 
-// Fast 19-byte YYYY-MM-DDTHH:MM:SS core -> UTC seconds (before offset/Z).
 static inline bool parse_iso19_sec(const char* s, int64_t& out_sec, const DateLut& lut) {
     if (__builtin_expect(s[10] != 'T' || s[13] != ':' || s[16] != ':', 0)) return false;
     int dd, hh, mm, ss;
@@ -408,7 +392,6 @@ static inline bool parse_iso19_sec(const char* s, int64_t& out_sec, const DateLu
     return true;
 }
 
-// Fast strict F1/F2/F3 timestamp parser -> epoch milliseconds UTC.
 static inline bool parse_ts(const char* s, size_t len, int64_t& out_ms, const DateLut& lut) {
     if (__builtin_expect(len == 20 && s[19] == 'Z', 1)) {
         int64_t sec;
@@ -442,7 +425,6 @@ static inline bool parse_ts(const char* s, size_t len, int64_t& out_ms, const Da
     }
 
     if (__builtin_expect(len == 0, 0)) return false;
-    // General F3: ASCII digits only, leading zeros allowed, huge values overflow -> outside window
     size_t i = 0;
     while (i < len && s[i] == '0') ++i;
     if (i == len) {
@@ -472,7 +454,6 @@ static inline bool parse_ingest_sec(const char* s, size_t len, int64_t& out_sec,
     return true;
 }
 
-// Strict purchase price parser: ASCII digits only, value in [1, 10_000_000], leading zeros allowed.
 static inline bool parse_price_cents(const char* s, size_t len, uint32_t& out_price) {
     if (__builtin_expect(len == 0, 0)) return false;
     uint32_t v = 0;
@@ -488,7 +469,7 @@ static inline bool parse_price_cents(const char* s, size_t len, uint32_t& out_pr
 }
 
 // ============================================================================
-// Strict CSV Line Parser (Scalar Fallback + Runtime-Dispatched AVX2/SSE2/NEON!)
+// Compile-Time Multi-ISA Single-Pass 64-Byte SIMD CSV Scanner + 3-Cycle Quotes
 // ============================================================================
 struct Slice {
     const char* ptr;
@@ -526,15 +507,89 @@ static inline bool parse_csv_line_scalar(const char* line, const char* end, Slic
             if (__builtin_expect(flen < 2 || fs[0] != '"' || fe[-1] != '"', 0)) return false;
             const char* is = fs + 1;
             const char* ie = fe - 1;
-            if (__builtin_expect(std::memchr(is, '"', size_t(ie - is)) != nullptr, 0)) return false;
+            for (const char* q = is; q < ie; ++q) {
+                if (__builtin_expect(*q == '"', 0)) return false;
+            }
             out[f] = {is, size_t(ie - is)};
         }
     }
     return true;
 }
 
-// Helper: given exact 128-bit comma & quote bitmasks over a line of length L in [1, 128],
-// extract N fields and validate quotes strictly using bit operations!
+template <int N>
+static inline bool parse_csv_line(const char* line, const char* end, Slice out[N]) {
+    return parse_csv_line_scalar<N>(line, end, out);
+}
+
+#if defined(__AVX512BW__)
+struct Vec64 {
+    __m512i v;
+    static inline Vec64 load(const char* p) { return {_mm512_loadu_si512(p)}; }
+    inline uint64_t eq(char ch) const {
+        return uint64_t(_mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(ch)));
+    }
+};
+#elif defined(__AVX2__)
+struct Vec64 {
+    __m256i v0, v1;
+    static inline Vec64 load(const char* p) {
+        return {
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32))
+        };
+    }
+    inline uint64_t eq(char ch) const {
+        __m256i vc = _mm256_set1_epi8(ch);
+        uint64_t m0 = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, vc)));
+        uint64_t m1 = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, vc)));
+        return m0 | (m1 << 32);
+    }
+};
+#elif defined(__aarch64__)
+struct Vec64 {
+    uint8x16_t v0, v1, v2, v3;
+    static inline Vec64 load(const char* p) {
+        const uint8_t* u = reinterpret_cast<const uint8_t*>(p);
+        return {vld1q_u8(u), vld1q_u8(u + 16), vld1q_u8(u + 32), vld1q_u8(u + 48)};
+    }
+    inline uint64_t eq(char ch) const {
+        const uint8x16_t vc = vdupq_n_u8(uint8_t(ch));
+        const uint8x16_t bm = {0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,
+                               0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80};
+        uint8x16_t t0 = vandq_u8(vceqq_u8(v0, vc), bm);
+        uint8x16_t t1 = vandq_u8(vceqq_u8(v1, vc), bm);
+        uint8x16_t t2 = vandq_u8(vceqq_u8(v2, vc), bm);
+        uint8x16_t t3 = vandq_u8(vceqq_u8(v3, vc), bm);
+        uint8x16_t s0 = vpaddq_u8(t0, t1);
+        uint8x16_t s1 = vpaddq_u8(t2, t3);
+        s0 = vpaddq_u8(s0, s1);
+        s0 = vpaddq_u8(s0, s0);
+        return vgetq_lane_u64(vreinterpretq_u64_u8(s0), 0);
+    }
+};
+#elif defined(__SSE2__)
+struct Vec64 {
+    __m128i v0, v1, v2, v3;
+    static inline Vec64 load(const char* p) {
+        return {
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(p)),
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 16)),
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 32)),
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 48))
+        };
+    }
+    inline uint64_t eq(char ch) const {
+        __m128i vc = _mm_set1_epi8(ch);
+        uint64_t m0 = uint32_t(_mm_movemask_epi8(_mm_cmpeq_epi8(v0, vc)));
+        uint64_t m1 = uint32_t(_mm_movemask_epi8(_mm_cmpeq_epi8(v1, vc)));
+        uint64_t m2 = uint32_t(_mm_movemask_epi8(_mm_cmpeq_epi8(v2, vc)));
+        uint64_t m3 = uint32_t(_mm_movemask_epi8(_mm_cmpeq_epi8(v3, vc)));
+        return m0 | (m1 << 16) | (m2 << 32) | (m3 << 48);
+    }
+};
+#endif
+
+// Ultra-fast field extractor with 3-cycle line-wide quote position validation!
 template <int N>
 static inline bool extract_fields_from_masks(
     const char* line,
@@ -547,36 +602,28 @@ static inline bool extract_fields_from_masks(
         return false;
     }
     const bool any_q = (qm0 | qm1) != 0;
-    uint32_t fstart = 0;
+    if (any_q) {
+        // Every quote MUST sit at a field start (bit 0 or cm<<1) or field end (cm>>1 or bit L-1)!
+        uint64_t st0 = 1ULL | (cm0 << 1);
+        uint64_t st1 = (cm0 >> 63) | (cm1 << 1);
+        uint64_t en0 = (cm0 >> 1) | (cm1 << 63) | (L <= 64 ? (1ULL << (L - 1)) : 0ULL);
+        uint64_t en1 = (cm1 >> 1) | (L > 64 ? (1ULL << (L - 65)) : 0ULL);
+        if (__builtin_expect(((qm0 & ~(st0 | en0)) | (qm1 & ~(st1 | en1))) != 0, 0)) {
+            return false;
+        }
+    }
 
+    uint32_t fstart = 0;
     auto finish_field = [&](int f, uint32_t fend) -> bool {
-        if (__builtin_expect(!any_q || fstart == fend, 1)) {
-            out[f] = {line + fstart, size_t(fend - fstart)};
-            return true;
+        uint32_t fs = fstart, fe = fend;
+        if (any_q && fs < fe) {
+            bool qs = (line[fs] == '"');
+            bool qe = (line[fe - 1] == '"');
+            if (__builtin_expect(qs != qe || (qs && (fe - fs) < 2), 0)) return false;
+            fs += uint32_t(qs);
+            fe -= uint32_t(qs);
         }
-        // Check quote bits strictly in [fstart, fend)
-        uint64_t fq0 = 0, fq1 = 0;
-        if (fstart < 64) {
-            uint64_t hi_mask = (fend >= 64) ? ~0ULL : ((1ULL << fend) - 1ULL);
-            uint64_t lo_mask = ~((1ULL << fstart) - 1ULL);
-            fq0 = qm0 & hi_mask & lo_mask;
-        }
-        if (fend > 64) {
-            uint64_t hi_mask = (fend >= 128) ? ~0ULL : ((1ULL << (fend - 64)) - 1ULL);
-            uint64_t lo_mask = (fstart <= 64) ? ~0ULL : ~((1ULL << (fstart - 64)) - 1ULL);
-            fq1 = qm1 & hi_mask & lo_mask;
-        }
-        if (__builtin_expect((fq0 | fq1) == 0, 1)) {
-            out[f] = {line + fstart, size_t(fend - fstart)};
-            return true;
-        }
-        // Must be length >= 2 and quotes ONLY at fstart and fend - 1!
-        if (__builtin_expect(fend - fstart < 2, 0)) return false;
-        uint32_t last = fend - 1;
-        uint64_t exp0 = (fstart < 64 ? (1ULL << fstart) : 0ULL) | (last < 64 ? (1ULL << last) : 0ULL);
-        uint64_t exp1 = (fstart >= 64 ? (1ULL << (fstart - 64)) : 0ULL) | (last >= 64 ? (1ULL << (last - 64)) : 0ULL);
-        if (__builtin_expect(fq0 != exp0 || fq1 != exp1, 0)) return false;
-        out[f] = {line + fstart + 1, size_t(fend - fstart - 2)};
+        out[f] = {line + fs, size_t(fe - fs)};
         return true;
     };
 
@@ -584,151 +631,29 @@ static inline bool extract_fields_from_masks(
     while (cm0) {
         uint32_t pos = uint32_t(__builtin_ctzll(cm0));
         cm0 &= cm0 - 1;
-        if (!finish_field(f++, pos)) return false;
+        if (__builtin_expect(!finish_field(f++, pos), 0)) return false;
         fstart = pos + 1;
     }
     while (cm1) {
         uint32_t pos = 64U + uint32_t(__builtin_ctzll(cm1));
         cm1 &= cm1 - 1;
-        if (!finish_field(f++, pos)) return false;
+        if (__builtin_expect(!finish_field(f++, pos), 0)) return false;
         fstart = pos + 1;
     }
     return finish_field(f, uint32_t(L));
 }
 
-#if defined(__x86_64__)
-
-static inline bool has_avx2_runtime() {
-    static const bool supported = __builtin_cpu_supports("avx2");
-    return supported;
-}
-
-__attribute__((target("avx2")))
-static inline void scan_128_avx2(const char* p, size_t L, uint64_t& cm0, uint64_t& cm1, uint64_t& qm0, uint64_t& qm1) {
-    const __m256i vc = _mm256_set1_epi8(',');
-    const __m256i vq = _mm256_set1_epi8('"');
-    __m256i b0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-    __m256i b1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32));
-    uint64_t c0 = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b0, vc)));
-    uint64_t c1 = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b1, vc)));
-    uint64_t q0 = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b0, vq)));
-    uint64_t q1 = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b1, vq)));
-    cm0 = c0 | (c1 << 32);
-    qm0 = q0 | (q1 << 32);
-    if (L <= 64) {
-        uint64_t m = (L == 64) ? ~0ULL : ((1ULL << L) - 1ULL);
-        cm0 &= m; qm0 &= m;
-        cm1 = 0; qm1 = 0;
-    } else {
-        __m256i b2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 64));
-        __m256i b3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 96));
-        uint64_t c2 = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b2, vc)));
-        uint64_t c3 = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b3, vc)));
-        uint64_t q2 = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b2, vq)));
-        uint64_t q3 = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b3, vq)));
-        uint64_t m = (L == 128) ? ~0ULL : ((1ULL << (L - 64)) - 1ULL);
-        cm1 = (c2 | (c3 << 32)) & m;
-        qm1 = (q2 | (q3 << 32)) & m;
+static inline const char* find_nl_simd(const char* p, const char* end) {
+    while (p + 64 <= end) {
+        uint64_t m = Vec64::load(p).eq('\n');
+        if (m) return p + __builtin_ctzll(m);
+        p += 64;
     }
-}
-
-static inline void scan_128_sse2(const char* p, size_t L, uint64_t& cm0, uint64_t& cm1, uint64_t& qm0, uint64_t& qm1) {
-    const __m128i vc = _mm_set1_epi8(',');
-    const __m128i vq = _mm_set1_epi8('"');
-    auto chunk16 = [&](const char* ptr, uint64_t& c, uint64_t& q) {
-        __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr));
-        c = uint32_t(_mm_movemask_epi8(_mm_cmpeq_epi8(b, vc)));
-        q = uint32_t(_mm_movemask_epi8(_mm_cmpeq_epi8(b, vq)));
-    };
-    uint64_t c0, q0, c1, q1, c2, q2, c3, q3;
-    chunk16(p, c0, q0); chunk16(p + 16, c1, q1);
-    chunk16(p + 32, c2, q2); chunk16(p + 48, c3, q3);
-    cm0 = c0 | (c1 << 16) | (c2 << 32) | (c3 << 48);
-    qm0 = q0 | (q1 << 16) | (q2 << 32) | (q3 << 48);
-    if (L <= 64) {
-        uint64_t m = (L == 64) ? ~0ULL : ((1ULL << L) - 1ULL);
-        cm0 &= m; qm0 &= m;
-        cm1 = 0; qm1 = 0;
-    } else {
-        chunk16(p + 64, c0, q0); chunk16(p + 80, c1, q1);
-        chunk16(p + 96, c2, q2); chunk16(p + 112, c3, q3);
-        uint64_t m = (L == 128) ? ~0ULL : ((1ULL << (L - 64)) - 1ULL);
-        cm1 = (c0 | (c1 << 16) | (c2 << 32) | (c3 << 48)) & m;
-        qm1 = (q0 | (q1 << 16) | (q2 << 32) | (q3 << 48)) & m;
+    while (p < end) {
+        if (*p == '\n') return p;
+        ++p;
     }
-}
-
-#elif defined(__aarch64__)
-
-static inline uint64_t neon_movemask64(uint8x16_t a, uint8x16_t b, uint8x16_t c, uint8x16_t d) {
-    const uint8x16_t bit_mask = {0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,
-                                 0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80};
-    uint8x16_t t0 = vandq_u8(a, bit_mask);
-    uint8x16_t t1 = vandq_u8(b, bit_mask);
-    uint8x16_t t2 = vandq_u8(c, bit_mask);
-    uint8x16_t t3 = vandq_u8(d, bit_mask);
-    uint8x16_t sum0 = vpaddq_u8(t0, t1);
-    uint8x16_t sum1 = vpaddq_u8(t2, t3);
-    sum0 = vpaddq_u8(sum0, sum1);
-    sum0 = vpaddq_u8(sum0, sum0);
-    return vgetq_lane_u64(vreinterpretq_u64_u8(sum0), 0);
-}
-
-static inline void scan_128_neon(const char* p, size_t L, uint64_t& cm0, uint64_t& cm1, uint64_t& qm0, uint64_t& qm1) {
-    const uint8x16_t vc = vdupq_n_u8(',');
-    const uint8x16_t vq = vdupq_n_u8('"');
-    const uint8_t* u = reinterpret_cast<const uint8_t*>(p);
-    uint8x16_t b0 = vld1q_u8(u);
-    uint8x16_t b1 = vld1q_u8(u + 16);
-    uint8x16_t b2 = vld1q_u8(u + 32);
-    uint8x16_t b3 = vld1q_u8(u + 48);
-    cm0 = neon_movemask64(vceqq_u8(b0, vc), vceqq_u8(b1, vc), vceqq_u8(b2, vc), vceqq_u8(b3, vc));
-    qm0 = neon_movemask64(vceqq_u8(b0, vq), vceqq_u8(b1, vq), vceqq_u8(b2, vq), vceqq_u8(b3, vq));
-    if (L <= 64) {
-        uint64_t m = (L == 64) ? ~0ULL : ((1ULL << L) - 1ULL);
-        cm0 &= m; qm0 &= m;
-        cm1 = 0; qm1 = 0;
-    } else {
-        uint8x16_t b4 = vld1q_u8(u + 64);
-        uint8x16_t b5 = vld1q_u8(u + 80);
-        uint8x16_t b6 = vld1q_u8(u + 96);
-        uint8x16_t b7 = vld1q_u8(u + 112);
-        uint64_t m = (L == 128) ? ~0ULL : ((1ULL << (L - 64)) - 1ULL);
-        cm1 = neon_movemask64(vceqq_u8(b4, vc), vceqq_u8(b5, vc), vceqq_u8(b6, vc), vceqq_u8(b7, vc)) & m;
-        qm1 = neon_movemask64(vceqq_u8(b4, vq), vceqq_u8(b5, vq), vceqq_u8(b6, vq), vceqq_u8(b7, vq)) & m;
-    }
-}
-#endif
-
-// SIMD-accelerated CSV parser (REQUIRES >= 128 bytes of readable padding past `line` when `padded == true`!)
-template <int N>
-static inline bool parse_csv_line_padded(const char* line, const char* end, Slice out[N], bool use_avx2) {
-    size_t L = size_t(end - line);
-    if (__builtin_expect(L == 0, 0)) return false;
-    if (__builtin_expect(L <= 128, 1)) {
-        uint64_t cm0, cm1, qm0, qm1;
-#if defined(__x86_64__)
-        if (use_avx2) {
-            scan_128_avx2(line, L, cm0, cm1, qm0, qm1);
-        } else {
-            scan_128_sse2(line, L, cm0, cm1, qm0, qm1);
-        }
-#elif defined(__aarch64__)
-        (void)use_avx2;
-        scan_128_neon(line, L, cm0, cm1, qm0, qm1);
-#else
-        (void)use_avx2;
-        return parse_csv_line_scalar<N>(line, end, out);
-#endif
-        return extract_fields_from_masks<N>(line, L, cm0, cm1, qm0, qm1, out);
-    }
-    return parse_csv_line_scalar<N>(line, end, out);
-}
-
-// Keep non-padded alias for small files (products.csv / campaigns.csv)
-template <int N>
-static inline bool parse_csv_line(const char* line, const char* end, Slice out[N]) {
-    return parse_csv_line_scalar<N>(line, end, out);
+    return nullptr;
 }
 
 static inline int32_t ms_to_day(int64_t ms) {
