@@ -496,7 +496,7 @@ static SS_ALWAYS_INLINE void scan_pread_csv(const CsvTask& task, ReadBuf& rbuf, 
                     nm &= nm - 1;
                     uint32_t L = uint32_t(nl_rel - ls);
                     if constexpr (N == 7) {
-                        if (__builtin_expect(L >= 64U && L < 128U, 1)) {
+                        if (__builtin_expect(L >= 65U && L < 128U, 1)) {
                             size_t sbi = ls >> 6;
                             unsigned sh = unsigned(ls & 63);
                             uint64_t c0, c1, q0, q1;
