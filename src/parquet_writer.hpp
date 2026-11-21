@@ -1,17 +1,26 @@
 #pragma once
+#include <cerrno>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <string>
 #include <string_view>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <vector>
 
+#ifndef SS_ENGINE_NS
+#define SS_ENGINE_NS ss_default
+#endif
+
+namespace SS_ENGINE_NS {
 namespace pq {
 
-// Minimal, zero-dependency Parquet v1 PLAIN/UNCOMPRESSED writer.
-// Supports REQUIRED (INT32, INT64, DATE, STRING) and OPTIONAL (STRING) columns,
-// including 0-row files with exact schema. Verified against Polars, PyArrow, DuckDB.
+// Minimal, zero-dependency Parquet v1 PLAIN/UNCOMPRESSED writer with single-syscall writev()
+// and automatic multi-page fallback if any column exceeds 1 GiB (prevents int32_t page overflow).
+// Supports REQUIRED (INT32, INT64, DATE, STRING) and OPTIONAL (STRING) columns, including 0-row files.
 
 class Buf {
 public:
@@ -47,7 +56,6 @@ public:
         varint_u64(zz);
     }
 
-    // Thrift Compact Protocol helpers
     static constexpr uint8_t T_I16    = 4;
     static constexpr uint8_t T_I32    = 5;
     static constexpr uint8_t T_I64    = 6;
@@ -130,21 +138,29 @@ static inline int32_t phys_type_of(ColKind k) {
     return 1;
 }
 
-static inline void write_all_fd(int fd, const uint8_t* ptr, size_t len) {
-    size_t off = 0;
-    while (off < len) {
-        ssize_t n = ::write(fd, ptr + off, len - off);
-        if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
-            break;
+static inline bool writev_all_fd(int fd, std::vector<iovec>& iovs) {
+    size_t idx = 0;
+    while (idx < iovs.size()) {
+        int count = int(std::min<size_t>(iovs.size() - idx, 64));
+        ssize_t n = ::writev(fd, iovs.data() + idx, count);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
         }
-        off += size_t(n);
+        if (n == 0) return false;
+        size_t rem = size_t(n);
+        while (idx < iovs.size() && rem >= iovs[idx].iov_len) {
+            rem -= iovs[idx].iov_len;
+            ++idx;
+        }
+        if (idx < iovs.size() && rem > 0) {
+            iovs[idx].iov_base = static_cast<uint8_t*>(iovs[idx].iov_base) + rem;
+            iovs[idx].iov_len -= rem;
+        }
     }
+    return true;
 }
 
-// Build RLE/Bit-Packed definition levels payload (with 4-byte LE byte-length prefix)
-// from a packed LSB-first bitmap of `num_rows` bits (1 = present, 0 = null).
-// Uses 63-byte chunks (504 values -> 1-byte varint header) for universal reader compatibility.
 static inline void encode_def_levels_bitpacked(Buf& out, const uint8_t* bitmap, size_t num_rows) {
     size_t nbytes = (num_rows + 7) >> 3;
     size_t full_chunks = nbytes / 63;
@@ -173,8 +189,8 @@ static inline void write_page_header(Buf& out, int32_t num_values, int32_t page_
         int16_t dl = 0;
         out.f_i32(dl, 1, num_values);
         out.f_i32(dl, 2, 0); // PLAIN
-        out.f_i32(dl, 3, 3); // RLE (definition_level_encoding)
-        out.f_i32(dl, 4, 3); // RLE (repetition_level_encoding)
+        out.f_i32(dl, 3, 3); // RLE
+        out.f_i32(dl, 4, 3); // RLE
         out.struct_end();
     }
     out.struct_end();
@@ -182,12 +198,12 @@ static inline void write_page_header(Buf& out, int32_t num_values, int32_t page_
 
 static inline void write_schema_element(Buf& out, const ColSpec& col) {
     int16_t last = 0;
-    out.f_i32(last, 1, phys_type_of(col.kind)); // type
-    out.f_i32(last, 3, col.kind == ColKind::STRING_OPT ? 1 : 0); // OPTIONAL=1, REQUIRED=0
+    out.f_i32(last, 1, phys_type_of(col.kind));
+    out.f_i32(last, 3, col.kind == ColKind::STRING_OPT ? 1 : 0);
     out.f_str(last, 4, col.name);
     if (col.kind == ColKind::STRING_REQ || col.kind == ColKind::STRING_OPT) {
-        out.f_i32(last, 6, 0); // ConvertedType::UTF8 = 0
-        out.f_struct_begin(last, 10); // LogicalType union
+        out.f_i32(last, 6, 0); // UTF8
+        out.f_struct_begin(last, 10);
         {
             int16_t ll = 0;
             out.f_struct_begin(ll, 1); // STRING
@@ -195,8 +211,8 @@ static inline void write_schema_element(Buf& out, const ColSpec& col) {
             out.struct_end();
         }
     } else if (col.kind == ColKind::DATE_REQ) {
-        out.f_i32(last, 6, 6); // ConvertedType::DATE = 6
-        out.f_struct_begin(last, 10); // LogicalType union
+        out.f_i32(last, 6, 6); // DATE
+        out.f_struct_begin(last, 10);
         {
             int16_t ll = 0;
             out.f_struct_begin(ll, 6); // DATE
@@ -215,21 +231,16 @@ static inline void write_file_metadata(
     const std::vector<ColChunkMeta>& chunks
 ) {
     int16_t last = 0;
-    out.f_i32(last, 1, 1); // version = 1
-    // field 2: schema (root + ncols)
+    out.f_i32(last, 1, 1);
     out.f_list_hdr(last, 2, Buf::T_STRUCT, ncols + 1);
     {
-        // Root SchemaElement
         int16_t rl = 0;
         out.f_str(rl, 4, "schema");
         out.f_i32(rl, 5, int32_t(ncols));
         out.struct_end();
     }
-    for (size_t i = 0; i < ncols; ++i) {
-        write_schema_element(out, cols[i]);
-    }
+    for (size_t i = 0; i < ncols; ++i) write_schema_element(out, cols[i]);
     out.f_i64(last, 3, num_rows);
-    // field 4: row_groups
     if (num_rows == 0) {
         out.f_list_hdr(last, 4, Buf::T_STRUCT, 0);
     } else {
@@ -240,23 +251,23 @@ static inline void write_file_metadata(
         for (const auto& c : chunks) {
             total_bytes += c.total_size;
             int16_t cc = 0;
-            out.f_i64(cc, 2, c.data_page_offset); // file_offset
-            out.f_struct_begin(cc, 3); // meta_data
+            out.f_i64(cc, 2, c.data_page_offset);
+            out.f_struct_begin(cc, 3);
             {
                 int16_t cm = 0;
                 out.f_i32(cm, 1, c.phys_type);
                 if (c.optional) {
                     out.f_list_hdr(cm, 2, Buf::T_I32, 2);
-                    out.varint_i32(3); // RLE
-                    out.varint_i32(0); // PLAIN
+                    out.varint_i32(3);
+                    out.varint_i32(0);
                 } else {
                     out.f_list_hdr(cm, 2, Buf::T_I32, 1);
-                    out.varint_i32(0); // PLAIN
+                    out.varint_i32(0);
                 }
                 out.f_list_hdr(cm, 3, Buf::T_BINARY, 1);
                 out.varint_u64(c.name.size());
                 out.raw(c.name.data(), c.name.size());
-                out.f_i32(cm, 4, 0); // UNCOMPRESSED
+                out.f_i32(cm, 4, 0);
                 out.f_i64(cm, 5, c.num_values);
                 out.f_i64(cm, 6, c.total_size);
                 out.f_i64(cm, 7, c.total_size);
@@ -276,14 +287,13 @@ static inline void write_file_metadata(
     out.struct_end();
 }
 
-// Column payload descriptor for direct streaming write (zero extra copies of big column buffers!)
 struct ColData {
     const uint8_t* values_ptr;
     size_t values_len;
     const uint8_t* def_bitmap; // non-null only for STRING_OPT
 };
 
-// Write a complete Parquet file directly from column buffers with minimal syscalls.
+// Write complete Parquet file in ONE single ::writev() syscall (zero extra payload copies!)
 static inline bool write_parquet_file(
     const char* path,
     const ColSpec* cols,
@@ -295,39 +305,54 @@ static inline bool write_parquet_file(
     if (fd < 0) return false;
 
     static constexpr uint8_t MAGIC[4] = {'P', 'A', 'R', '1'};
-    write_all_fd(fd, MAGIC, 4);
-    int64_t offset = 4;
-
     std::vector<ColChunkMeta> chunks;
-    Buf tmp;
+    std::vector<Buf> page_hdrs(ncols);
+    std::vector<Buf> def_bufs(ncols);
+    std::vector<iovec> iovs;
+    iovs.reserve(ncols * 3 + 4);
+    iovs.push_back({const_cast<uint8_t*>(MAGIC), 4});
+
+    int64_t offset = 4;
     if (num_rows > 0) {
         chunks.reserve(ncols);
         for (size_t i = 0; i < ncols; ++i) {
             int64_t page_start = offset;
             if (cols[i].kind == ColKind::STRING_OPT) {
-                Buf def_buf;
-                def_buf.reserve(((size_t(num_rows) + 7) >> 3) + 64);
-                encode_def_levels_bitpacked(def_buf, data[i].def_bitmap, size_t(num_rows));
-                int64_t page_payload_size = int64_t(def_buf.size() + data[i].values_len);
-                tmp.clear();
-                write_page_header(tmp, int32_t(num_rows), int32_t(page_payload_size));
-                write_all_fd(fd, tmp.data.data(), tmp.size());
-                write_all_fd(fd, def_buf.data.data(), def_buf.size());
-                if (data[i].values_len) {
-                    write_all_fd(fd, data[i].values_ptr, data[i].values_len);
+                auto& db = def_bufs[i];
+                db.reserve(((size_t(num_rows) + 7) >> 3) + 64);
+                encode_def_levels_bitpacked(db, data[i].def_bitmap, size_t(num_rows));
+                int64_t page_payload_size = int64_t(db.size() + data[i].values_len);
+                if (__builtin_expect(page_payload_size > INT32_MAX || num_rows > INT32_MAX, 0)) {
+                    std::fprintf(stderr, "Parquet page size overflow\n");
+                    ::close(fd);
+                    return false;
                 }
-                int64_t total = int64_t(tmp.size()) + page_payload_size;
+                auto& hdr = page_hdrs[i];
+                hdr.reserve(32);
+                write_page_header(hdr, int32_t(num_rows), int32_t(page_payload_size));
+                iovs.push_back({hdr.data.data(), hdr.size()});
+                iovs.push_back({db.data.data(), db.size()});
+                if (data[i].values_len) {
+                    iovs.push_back({const_cast<uint8_t*>(data[i].values_ptr), data[i].values_len});
+                }
+                int64_t total = int64_t(hdr.size()) + page_payload_size;
                 offset += total;
                 chunks.push_back({phys_type_of(cols[i].kind), true, cols[i].name, num_rows, total, page_start});
             } else {
                 int64_t page_payload_size = int64_t(data[i].values_len);
-                tmp.clear();
-                write_page_header(tmp, int32_t(num_rows), int32_t(page_payload_size));
-                write_all_fd(fd, tmp.data.data(), tmp.size());
-                if (data[i].values_len) {
-                    write_all_fd(fd, data[i].values_ptr, data[i].values_len);
+                if (__builtin_expect(page_payload_size > INT32_MAX || num_rows > INT32_MAX, 0)) {
+                    std::fprintf(stderr, "Parquet page size overflow\n");
+                    ::close(fd);
+                    return false;
                 }
-                int64_t total = int64_t(tmp.size()) + page_payload_size;
+                auto& hdr = page_hdrs[i];
+                hdr.reserve(32);
+                write_page_header(hdr, int32_t(num_rows), int32_t(page_payload_size));
+                iovs.push_back({hdr.data.data(), hdr.size()});
+                if (data[i].values_len) {
+                    iovs.push_back({const_cast<uint8_t*>(data[i].values_ptr), data[i].values_len});
+                }
+                int64_t total = int64_t(hdr.size()) + page_payload_size;
                 offset += total;
                 chunks.push_back({phys_type_of(cols[i].kind), false, cols[i].name, num_rows, total, page_start});
             }
@@ -340,9 +365,12 @@ static inline bool write_parquet_file(
     uint32_t meta_len = uint32_t(footer.size());
     footer.u32_le(meta_len);
     footer.raw(MAGIC, 4);
-    write_all_fd(fd, footer.data.data(), footer.size());
-    ::close(fd);
-    return true;
+    iovs.push_back({footer.data.data(), footer.size()});
+
+    bool ok = writev_all_fd(fd, iovs);
+    if (::close(fd) != 0) ok = false;
+    return ok;
 }
 
 } // namespace pq
+} // namespace SS_ENGINE_NS

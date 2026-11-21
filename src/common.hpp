@@ -16,7 +16,11 @@
 #include <arm_neon.h>
 #endif
 
-namespace ss {
+#ifndef SS_ENGINE_NS
+#define SS_ENGINE_NS ss_default
+#endif
+
+namespace SS_ENGINE_NS {
 
 static constexpr int64_t SECOND_MS       = 1000LL;
 static constexpr int64_t MINUTE_MS       = 60LL * SECOND_MS;
@@ -27,6 +31,7 @@ static constexpr int64_t CLICK_WINDOW_MS = 7LL * DAY_MS;
 
 static constexpr uint64_t FALLBACK_BIT = 1ULL << 63;
 
+// Clean zero-THP-stall anonymous mmap (eliminates Linux THP compaction stalls on fresh containers!)
 static inline void* alloc_mmap(size_t bytes) {
     if (bytes == 0) bytes = 4096;
     void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -34,17 +39,12 @@ static inline void* alloc_mmap(size_t bytes) {
         std::fprintf(stderr, "mmap failed for %zu bytes\n", bytes);
         std::abort();
     }
-#ifdef MADV_HUGEPAGE
-    if (bytes >= (2ULL << 20)) {
-        ::madvise(p, bytes, MADV_HUGEPAGE);
-    }
-#endif
     return p;
 }
 
 struct StringArenaPool {
     static constexpr int MAX_THREADS = 64;
-    static constexpr size_t RESERVATION = 256ULL << 20;
+    static constexpr size_t RESERVATION = 2ULL << 30; // 2 GiB VA (0 physical RAM until touched!)
     char* base[MAX_THREADS]{};
     size_t pos[MAX_THREADS]{};
 
@@ -57,11 +57,11 @@ struct StringArenaPool {
 
     inline uint64_t store_fallback(int tid, const char* s, size_t len) {
         size_t off = pos[tid];
-        if (__builtin_expect(off + len > RESERVATION, 0)) {
-            std::fprintf(stderr, "StringArena overflow on thread %d\n", tid);
+        if (__builtin_expect(len > 0x1FFFFFFULL || off + len > RESERVATION, 0)) {
+            std::fprintf(stderr, "StringArena overflow on thread %d (off=%zu len=%zu)\n", tid, off, len);
             std::abort();
         }
-        std::memcpy(base[tid] + off, s, len);
+        if (len) std::memcpy(base[tid] + off, s, len);
         pos[tid] = off + len;
         return FALLBACK_BIT | (uint64_t(tid) << 57) | (uint64_t(off) << 25) | uint64_t(len);
     }
@@ -76,11 +76,6 @@ struct StringArenaPool {
 
 // ============================================================================
 // 9-Byte 7-Bit ASCII Order-Preserving Key64 via BMI2 PEXT/PDEP (SWAR fallback)
-// - Bit 63 == 0: inline 1..9 byte string, every byte in 0x01..0x7F.
-//   Bits 62..56 = s[0], Bits 55..0 = 8x 7-bit packed s[1..8] (0-padded right).
-//   Unsigned u64 '<' is 100% identical to exact byte-wise lexicographic order!
-//   Encode/Decode: 1 BMI2 instruction (3 cycles) on x86-64-v3/v4, 9 ALU ops on ARM64!
-// - Bit 63 == 1: fallback arena (>9 bytes, NUL byte, or non-ASCII UTF-8).
 // ============================================================================
 static inline uint64_t pext56(uint64_t be) {
 #if defined(__BMI2__)
@@ -147,7 +142,28 @@ static inline uint64_t encode_key64(const char* s, size_t len, StringArenaPool& 
     return arenas.store_fallback(tid, s, len);
 }
 
-// Decode inline Key64 (writes up to 9 bytes into `out`, returns exact length in 1..9).
+// Equality-only ultra-fast event_id encoder (ZERO pext56, ZERO bswap64, 100% lossless!):
+// - bit 63 == 0, bit 55 == 0: len == 9 && s[0] == 'e' && s[1..8] all 7-bit ASCII (raw8 != 0)
+// - bit 63 == 0, bit 55 == 1: len == 8 && s[0] == 'e' && s[1..7] all 7-bit ASCII
+// - bit 63 == 1: fallback arena
+static inline uint64_t encode_event_id(const char* s, size_t len, StringArenaPool& arenas, int tid) {
+    if (__builtin_expect(len == 9 && s[0] == 'e', 1)) {
+        uint64_t raw8;
+        std::memcpy(&raw8, s + 1, 8);
+        if (__builtin_expect((raw8 & 0x8080808080808080ULL) == 0 && raw8 != 0, 1)) {
+            return raw8;
+        }
+    } else if (__builtin_expect(len == 8 && s[0] == 'e', 1)) {
+        uint64_t raw7 = 0;
+        std::memcpy(&raw7, s + 1, 7);
+        if (__builtin_expect((raw7 & 0x8080808080808080ULL) == 0, 1)) {
+            return raw7 | (1ULL << 55);
+        }
+    }
+    return arenas.store_fallback(tid, s, len);
+}
+
+// Decode inline Key64 (writes 9 bytes into `out`, returns exact length in 1..9).
 static inline size_t decode_inline(uint64_t k, char* out) {
     out[0] = char(k >> 56);
     uint64_t be = pdep56(k);
@@ -219,7 +235,7 @@ static inline bool key_less(uint64_t a, uint64_t b, const StringArenaPool& arena
 }
 
 // ============================================================================
-// Calendar & FastMonth + SWAR Timestamp Parsing (Strict F1, F2, F3 per rules.md)
+// Calendar & Branchless FastMonth + SWAR Timestamp Parsing (Strict F1, F2, F3)
 // ============================================================================
 static inline bool is_leap_year(int64_t y) {
     return (y % 4 == 0) && ((y % 100 != 0) || (y % 400 == 0));
@@ -353,33 +369,79 @@ static inline bool parse_4d(const char* p, int& out) {
     return true;
 }
 
-static inline bool parse_8d_swar(const char* p, uint64_t& out) {
-    uint64_t v;
-    std::memcpy(&v, p, 8);
-    uint64_t bad = ((v & 0xF0F0F0F0F0F0F0F0ULL) ^ 0x3030303030303030ULL) |
-                   (((v + 0x0606060606060606ULL) & 0xF0F0F0F0F0F0F0F0ULL) ^ 0x3030303030303030ULL);
-    if (__builtin_expect(bad != 0, 0)) return false;
-    v &= 0x0F0F0F0F0F0F0F0FULL;
-    v = (v * 10 + (v >> 8)) & 0x00FF00FF00FF00FFULL;
-    v = (v * 100 + (v >> 16)) & 0x0000FFFF0000FFFFULL;
-    out = (v * 10000 + (v >> 32)) & 0xFFFFFFFFULL;
+// Branchless 13-digit SWAR parser (ZERO division, 2 unaligned 64-bit loads inside 13B field!)
+static inline bool parse_13d_swar(const char* s, int64_t& out_ms) {
+    uint64_t v0, w;
+    std::memcpy(&v0, s, 8);
+    std::memcpy(&w, s + 5, 8);
+    uint64_t bad0 = ((v0 & 0xF0F0F0F0F0F0F0F0ULL) ^ 0x3030303030303030ULL) |
+                    (((v0 + 0x0606060606060606ULL) & 0xF0F0F0F0F0F0F0F0ULL) ^ 0x3030303030303030ULL);
+    uint64_t bad1 = ((w & 0xF0F0F0F0F0F0F0F0ULL) ^ 0x3030303030303030ULL) |
+                    (((w + 0x0606060606060606ULL) & 0xF0F0F0F0F0F0F0F0ULL) ^ 0x3030303030303030ULL);
+    if (__builtin_expect((bad0 | bad1) != 0, 0)) return false;
+    v0 &= 0x0F0F0F0F0F0F0F0FULL;
+    v0 = (v0 * 10 + (v0 >> 8)) & 0x00FF00FF00FF00FFULL;
+    v0 = (v0 * 100 + (v0 >> 16)) & 0x0000FFFF0000FFFFULL;
+    uint64_t hi8 = (v0 * 10000 + (v0 >> 32)) & 0xFFFFFFFFULL;
+
+    uint64_t lo = w & 0x0F0F0F0F0F000000ULL;
+    lo = (lo * 10 + (lo >> 8)) & 0x00FF00FF00FF00FFULL;
+    lo = (lo * 100 + (lo >> 16)) & 0x0000FFFF0000FFFFULL;
+    uint64_t lo5 = (lo * 10000 + (lo >> 32)) & 0xFFFFFFFFULL;
+    out_ms = int64_t(hi8 * 100000ULL + lo5);
     return true;
 }
 
-static inline bool parse_iso19_sec(const char* s, int64_t& out_sec, const DateLut& lut) {
-    if (__builtin_expect(s[10] != 'T' || s[13] != ':' || s[16] != ':', 0)) return false;
-    int dd, hh, mm, ss;
-    if (__builtin_expect(!parse_2d(s + 8, dd) || !parse_2d(s + 11, hh) ||
-                         !parse_2d(s + 14, mm) || !parse_2d(s + 17, ss), 0)) return false;
-    if (__builtin_expect(hh > 23 || mm > 59 || ss > 59, 0)) return false;
+// Branchless single-check ISO-19 parser returning both `out_sec` and `out_day_sec` (for same-day reuse!)
+// Uses 128-bit SSSE3/AVX2 SIMD on x86-64-v3/v4 (11 instructions, 1 branch for all 8 digits + 3 seps + ranges!)
+static inline bool parse_iso19_sec_day(const char* s, int64_t& out_sec, int64_t& out_day_sec, const DateLut& lut) {
+#if defined(__SSSE3__)
+    // Bytes s[4..19] are always strictly inside a 20+ byte ISO-19 timestamp (0 overread!).
+    __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s + 4));
+    // Lanes 0..7: D0,D1,H0,H1,m0,m1,S0,S1; Lanes 8..10: s[10]='T', s[13]=':', s[16]=':'; Lanes 11..15: 0
+    const __m128i shuf = _mm_setr_epi8(4, 5, 7, 8, 10, 11, 13, 14, 6, 9, 12, -1, -1, -1, -1, -1);
+    __m128i d = _mm_shuffle_epi8(raw, shuf);
+    const __m128i bias = _mm_setr_epi8(
+        char('0' - 128), char('0' - 128), char('0' - 128), char('0' - 128),
+        char('0' - 128), char('0' - 128), char('0' - 128), char('0' - 128),
+        char('T' - 128), char(':' - 128), char(':' - 128), -128, -128, -128, -128, -128);
+    const __m128i maxv = _mm_setr_epi8(
+        -119, -119, -119, -119, -119, -119, -119, -119,
+        -128, -128, -128, -128, -128, -128, -128, -128);
+    int bad_ds = _mm_movemask_epi8(_mm_cmpgt_epi8(_mm_sub_epi8(d, bias), maxv));
+    __m128i dig = _mm_sub_epi8(d, _mm_set1_epi8('0'));
+    __m128i pairs = _mm_maddubs_epi16(dig, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0));
+    int bad_rng = _mm_movemask_epi8(_mm_cmpgt_epi16(pairs, _mm_setr_epi16(99, 23, 59, 59, 0, 0, 0, 0)));
+    if (__builtin_expect((bad_ds | bad_rng) != 0, 0)) return false;
+    __m128i sec_v = _mm_madd_epi16(pairs, _mm_setr_epi16(0, 3600, 60, 1, 0, 0, 0, 0));
+    uint64_t sp = uint64_t(_mm_cvtsi128_si64(sec_v));
+    int64_t hms_sec = int64_t(uint32_t(sp)) + int64_t(uint32_t(sp >> 32));
+    unsigned dd = uint16_t(_mm_extract_epi16(pairs, 0));
+#else
+    uint32_t sep = (uint8_t(s[10]) ^ 'T') | (uint8_t(s[13]) ^ ':') | (uint8_t(s[16]) ^ ':');
+    unsigned d0 = uint8_t(s[8]) - '0',  d1 = uint8_t(s[9]) - '0';
+    unsigned h0 = uint8_t(s[11]) - '0', h1 = uint8_t(s[12]) - '0';
+    unsigned m0 = uint8_t(s[14]) - '0', m1 = uint8_t(s[15]) - '0';
+    unsigned s0 = uint8_t(s[17]) - '0', s1 = uint8_t(s[18]) - '0';
+    unsigned dd = d0 * 10 + d1;
+    unsigned hh = h0 * 10 + h1;
+    unsigned mm = m0 * 10 + m1;
+    unsigned sc = s0 * 10 + s1;
+    uint32_t bad = sep | (d0 > 9) | (d1 > 9) | (h0 > 9) | (h1 > 9) |
+                   (m0 > 9) | (m1 > 9) | (s0 > 9) | (s1 > 9) |
+                   (hh > 23) | (mm > 59) | (sc > 59);
+    if (__builtin_expect(bad != 0, 0)) return false;
+    int64_t hms_sec = int64_t(hh * 3600U + mm * 60U + sc);
+#endif
 
     uint64_t ym_u64;
     std::memcpy(&ym_u64, s, 8);
     int fi;
     if (__builtin_expect(lut.lookup_fast_ym(ym_u64, fi), 1)) {
         const FastMonth& m = lut.fm[fi];
-        if (__builtin_expect(dd < 1 || dd > m.max_day, 0)) return false;
-        out_sec = m.day0_sec + int64_t(dd) * 86400LL + hh * 3600LL + mm * 60LL + ss;
+        if (__builtin_expect(unsigned(dd - 1) >= unsigned(m.max_day), 0)) return false;
+        out_day_sec = m.day0_sec + int64_t(dd) * 86400LL;
+        out_sec = out_day_sec + hms_sec;
         return true;
     }
 
@@ -387,9 +449,53 @@ static inline bool parse_iso19_sec(const char* s, int64_t& out_sec, const DateLu
     int y, mo;
     if (!parse_4d(s, y) || !parse_2d(s + 5, mo)) return false;
     int64_t days;
-    if (!lut.lookup(y, mo, dd, days)) return false;
-    out_sec = days * 86400LL + hh * 3600LL + mm * 60LL + ss;
+    if (!lut.lookup(y, mo, int(dd), days)) return false;
+    out_day_sec = days * 86400LL;
+    out_sec = out_day_sec + hms_sec;
     return true;
+}
+
+static inline bool parse_iso19_sec(const char* s, int64_t& out_sec, const DateLut& lut) {
+    int64_t dummy;
+    return parse_iso19_sec_day(s, out_sec, dummy, lut);
+}
+
+// Ultra-fast HH:MM:SS parse when 10-byte YYYY-MM-DD already matched another validated ISO-19 date!
+static inline bool parse_hms_only(const char* s, int64_t day_sec, int64_t& out_sec) {
+#if defined(__SSSE3__)
+    __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s + 4));
+    const __m128i shuf = _mm_setr_epi8(-1, -1, 7, 8, 10, 11, 13, 14, 6, 9, 12, -1, -1, -1, -1, -1);
+    __m128i d = _mm_shuffle_epi8(raw, shuf);
+    const __m128i bias = _mm_setr_epi8(
+        -128, -128, char('0' - 128), char('0' - 128),
+        char('0' - 128), char('0' - 128), char('0' - 128), char('0' - 128),
+        char('T' - 128), char(':' - 128), char(':' - 128), -128, -128, -128, -128, -128);
+    const __m128i maxv = _mm_setr_epi8(
+        -128, -128, -119, -119, -119, -119, -119, -119,
+        -128, -128, -128, -128, -128, -128, -128, -128);
+    int bad_ds = _mm_movemask_epi8(_mm_cmpgt_epi8(_mm_sub_epi8(d, bias), maxv));
+    __m128i dig = _mm_sub_epi8(d, _mm_set1_epi8('0'));
+    __m128i pairs = _mm_maddubs_epi16(dig, _mm_setr_epi8(0, 0, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0));
+    int bad_rng = _mm_movemask_epi8(_mm_cmpgt_epi16(pairs, _mm_setr_epi16(0, 23, 59, 59, 0, 0, 0, 0)));
+    if (__builtin_expect((bad_ds | bad_rng) != 0, 0)) return false;
+    __m128i sec_v = _mm_madd_epi16(pairs, _mm_setr_epi16(0, 3600, 60, 1, 0, 0, 0, 0));
+    uint64_t sp = uint64_t(_mm_cvtsi128_si64(sec_v));
+    out_sec = day_sec + int64_t(uint32_t(sp)) + int64_t(uint32_t(sp >> 32));
+    return true;
+#else
+    uint32_t sep = (uint8_t(s[10]) ^ 'T') | (uint8_t(s[13]) ^ ':') | (uint8_t(s[16]) ^ ':');
+    unsigned h0 = uint8_t(s[11]) - '0', h1 = uint8_t(s[12]) - '0';
+    unsigned m0 = uint8_t(s[14]) - '0', m1 = uint8_t(s[15]) - '0';
+    unsigned s0 = uint8_t(s[17]) - '0', s1 = uint8_t(s[18]) - '0';
+    unsigned hh = h0 * 10 + h1;
+    unsigned mm = m0 * 10 + m1;
+    unsigned sc = s0 * 10 + s1;
+    uint32_t bad = sep | (h0 > 9) | (h1 > 9) | (m0 > 9) | (m1 > 9) | (s0 > 9) | (s1 > 9) |
+                   (hh > 23) | (mm > 59) | (sc > 59);
+    if (__builtin_expect(bad != 0, 0)) return false;
+    out_sec = day_sec + int64_t(hh * 3600U + mm * 60U + sc);
+    return true;
+#endif
 }
 
 static inline bool parse_ts(const char* s, size_t len, int64_t& out_ms, const DateLut& lut) {
@@ -401,16 +507,7 @@ static inline bool parse_ts(const char* s, size_t len, int64_t& out_ms, const Da
     }
 
     if (__builtin_expect(len == 13, 1)) {
-        uint64_t hi8;
-        if (__builtin_expect(!parse_8d_swar(s, hi8), 0)) return false;
-        unsigned d0 = uint8_t(s[8]) - uint8_t('0');
-        unsigned d1 = uint8_t(s[9]) - uint8_t('0');
-        unsigned d2 = uint8_t(s[10]) - uint8_t('0');
-        unsigned d3 = uint8_t(s[11]) - uint8_t('0');
-        unsigned d4 = uint8_t(s[12]) - uint8_t('0');
-        if (__builtin_expect((d0 > 9) | (d1 > 9) | (d2 > 9) | (d3 > 9) | (d4 > 9), 0)) return false;
-        out_ms = int64_t(hi8 * 100000ULL + d0 * 10000U + d1 * 1000U + d2 * 100U + d3 * 10U + d4);
-        return true;
+        return parse_13d_swar(s, out_ms);
     }
 
     if (len == 25 && (s[19] == '+' || s[19] == '-') && s[22] == ':') {
@@ -444,16 +541,6 @@ static inline bool parse_ts(const char* s, size_t len, int64_t& out_ms, const Da
     return true;
 }
 
-static inline bool parse_ingest_sec(const char* s, size_t len, int64_t& out_sec, const DateLut& lut) {
-    if (__builtin_expect(len == 20 && s[19] == 'Z', 1)) {
-        return parse_iso19_sec(s, out_sec, lut);
-    }
-    int64_t ms;
-    if (!parse_ts(s, len, ms, lut)) return false;
-    out_sec = ms / 1000LL;
-    return true;
-}
-
 static inline bool parse_price_cents(const char* s, size_t len, uint32_t& out_price) {
     if (__builtin_expect(len == 0, 0)) return false;
     uint32_t v = 0;
@@ -469,7 +556,7 @@ static inline bool parse_price_cents(const char* s, size_t len, uint32_t& out_pr
 }
 
 // ============================================================================
-// Compile-Time Multi-ISA Single-Pass 64-Byte SIMD CSV Scanner + 3-Cycle Quotes
+// Multi-ISA 64-Byte SIMD Primitives + Branchless Quote-Strip Field Extractor
 // ============================================================================
 struct Slice {
     const char* ptr;
@@ -589,58 +676,61 @@ struct Vec64 {
 };
 #endif
 
-// Ultra-fast field extractor with 3-cycle line-wide quote position validation!
+// Zero-branch 2-chain parallel comma & quote extractor for L in [1, 127].
+// Breaks the serial cm0/cm1 dependency chain into 2 independent ALU chains (0 cmovs, 0 branches!).
 template <int N>
-static inline bool extract_fields_from_masks(
+static inline bool extract_fields_branchless(
     const char* line,
     size_t L,
     uint64_t cm0, uint64_t cm1,
     uint64_t qm0, uint64_t qm1,
     Slice out[N]
 ) {
-    if (__builtin_expect(__builtin_popcountll(cm0) + __builtin_popcountll(cm1) != (N - 1), 0)) {
+    uint32_t k0 = uint32_t(__builtin_popcountll(cm0));
+    uint32_t k1 = uint32_t(__builtin_popcountll(cm1));
+    if (__builtin_expect(k0 + k1 != uint32_t(N - 1), 0)) {
         return false;
     }
-    const bool any_q = (qm0 | qm1) != 0;
-    if (any_q) {
-        // Every quote MUST sit at a field start (bit 0 or cm<<1) or field end (cm>>1 or bit L-1)!
-        uint64_t st0 = 1ULL | (cm0 << 1);
-        uint64_t st1 = (cm0 >> 63) | (cm1 << 1);
-        uint64_t en0 = (cm0 >> 1) | (cm1 << 63) | (L <= 64 ? (1ULL << (L - 1)) : 0ULL);
-        uint64_t en1 = (cm1 >> 1) | (L > 64 ? (1ULL << (L - 65)) : 0ULL);
-        if (__builtin_expect(((qm0 & ~(st0 | en0)) | (qm1 & ~(st1 | en1))) != 0, 0)) {
-            return false;
-        }
+    uint64_t st0 = 1ULL | (cm0 << 1);
+    uint64_t st1 = (cm0 >> 63) | (cm1 << 1);
+    uint64_t en0 = (cm0 >> 1) | (cm1 << 63) | (L <= 64 ? (1ULL << (L - 1)) : 0ULL);
+    uint64_t en1 = (cm1 >> 1) | (L > 64 ? (1ULL << (L - 65)) : 0ULL);
+    uint64_t qbad = (qm0 & ~(st0 | en0)) | (qm1 & ~(st1 | en1)) |
+                    (qm0 & st0 & en0) | (qm1 & st1 & en1);
+    if (__builtin_expect(qbad != 0, 0)) {
+        return false;
     }
 
-    uint32_t fstart = 0;
-    auto finish_field = [&](int f, uint32_t fend) -> bool {
-        uint32_t fs = fstart, fe = fend;
-        if (any_q && fs < fe) {
-            bool qs = (line[fs] == '"');
-            bool qe = (line[fe - 1] == '"');
-            if (__builtin_expect(qs != qe || (qs && (fe - fs) < 2), 0)) return false;
-            fs += uint32_t(qs);
-            fe -= uint32_t(qs);
-        }
-        out[f] = {line + fs, size_t(fe - fs)};
-        return true;
-    };
+    uint32_t ends[2 * N];
+    uint64_t a = cm0;
+    #pragma GCC unroll 8
+    for (int i = 0; i < N - 1; ++i) {
+        ends[i] = a ? uint32_t(__builtin_ctzll(a)) : 0U;
+        a &= a - 1;
+    }
+    uint64_t b = cm1;
+    uint32_t* p1 = ends + k0;
+    #pragma GCC unroll 8
+    for (int i = 0; i < N - 1; ++i) {
+        p1[i] = 64U + (b ? uint32_t(__builtin_ctzll(b)) : 0U);
+        b &= b - 1;
+    }
+    ends[N - 1] = uint32_t(L);
 
-    int f = 0;
-    while (cm0) {
-        uint32_t pos = uint32_t(__builtin_ctzll(cm0));
-        cm0 &= cm0 - 1;
-        if (__builtin_expect(!finish_field(f++, pos), 0)) return false;
-        fstart = pos + 1;
+    uint64_t qe0 = qm0 << 1;
+    uint64_t qe1 = (qm0 >> 63) | (qm1 << 1);
+    uint32_t s = 0;
+    uint32_t mismatch = 0;
+    #pragma GCC unroll 8
+    for (int f = 0; f < N; ++f) {
+        uint32_t e = ends[f];
+        uint32_t qs = uint32_t(((s < 64 ? qm0 : qm1) >> (s & 63)) & 1ULL);
+        uint32_t qe = uint32_t(((e < 64 ? qe0 : qe1) >> (e & 63)) & 1ULL);
+        mismatch |= (qs ^ qe);
+        out[f] = {line + s + qs, size_t((e - s) - (qs << 1))};
+        s = e + 1U;
     }
-    while (cm1) {
-        uint32_t pos = 64U + uint32_t(__builtin_ctzll(cm1));
-        cm1 &= cm1 - 1;
-        if (__builtin_expect(!finish_field(f++, pos), 0)) return false;
-        fstart = pos + 1;
-    }
-    return finish_field(f, uint32_t(L));
+    return __builtin_expect(mismatch == 0, 1);
 }
 
 static inline const char* find_nl_simd(const char* p, const char* end) {
@@ -663,4 +753,31 @@ static inline int32_t ms_to_day(int64_t ms) {
     return int32_t(q);
 }
 
-} // namespace ss
+// 64-byte non-temporal cache-bypassing copy on x86-64 (eliminates RFO DRAM reads on slab flushes!)
+static inline void stream_copy_64b_aligned(void* dst, const void* src, size_t bytes) {
+#if defined(__AVX512F__)
+    const char* s = static_cast<const char*>(src);
+    char* d = static_cast<char*>(dst);
+    for (size_t off = 0; off < bytes; off += 64) {
+        __m512i v = _mm512_loadu_si512(s + off);
+        _mm512_stream_si512(reinterpret_cast<__m512i*>(d + off), v);
+    }
+#elif defined(__AVX2__)
+    const char* s = static_cast<const char*>(src);
+    char* d = static_cast<char*>(dst);
+    for (size_t off = 0; off < bytes; off += 32) {
+        __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + off));
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(d + off), v);
+    }
+#else
+    std::memcpy(dst, src, bytes);
+#endif
+}
+
+static inline void stream_fence() {
+#if defined(__AVX2__) || defined(__AVX512F__)
+    _mm_sfence();
+#endif
+}
+
+} // namespace SS_ENGINE_NS
