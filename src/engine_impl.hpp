@@ -2722,7 +2722,7 @@ struct UserDict {
 
         auto alloc_fast_tables = [&](size_t est_short_users, size_t est_hex_users, size_t est_gen_users) {
             lcap = MIN_ULINES;
-            while (lcap * 6 < est_short_users) lcap <<= 1; // 16 MiB L3-hot with inline d=2!
+            while (lcap * 4 < est_short_users) lcap <<= 1; // 32 MiB: 99.5% d=1 single-line hit (NT stores keep L3 free!)
             lmask = lcap - 1;
             size_t raw_ubytes = lcap * sizeof(Uline);
             bool u_hp = (raw_ubytes >= (2ULL << 20));
@@ -2730,7 +2730,7 @@ struct UserDict {
             ulines = static_cast<Uline*>(alloc_mmap(raw_ubytes, u_hp));
 
             hcap = 4096;
-            while (hcap * 2 < est_hex_users) hcap <<= 1; // 8 MiB L3-hot with inline d=2!
+            while (hcap < est_hex_users) hcap <<= 1; // 16 MiB: 33% load, 99% d=1 single-line hit!
             hmask = hcap - 1;
             bool h_hp = (hcap * sizeof(HexLine) >= (2ULL << 20));
             hlines_bytes = alloc_mmap_actual_size(hcap * sizeof(HexLine), h_hp);
@@ -4518,19 +4518,31 @@ static SS_NOINLINE const char* scan_clicks_direct_buf(
     while (p < fast_limit) {
         const char* const line_start = p;
         {
-        // f0: click_id (short 2..9B; 12.5% 33B hex -> fast extract4_hi64 cold helper)
+        // f0: click_id (short 2..9B OR 33B hex -> skips re-scanning 625K hex click lines!)
         uint32_t q0 = uint32_t(*p == '"');
         const char* f0_ptr = p + q0;
         uint32_t cm0, nm0, qm0;
         eq16_cnq(f0_ptr, cm0, nm0, qm0);
-        if (__builtin_expect(cm0 == 0U, 0)) goto cold_clk;
-        uint32_t pos0 = uint32_t(__builtin_ctz(cm0));
-        uint32_t f0_len = pos0 - q0;
-        if (__builtin_expect((f0_len - 2U) > 7U, 0)) goto cold_clk;
-        if (__builtin_expect(((nm0 & ((1U << pos0) - 1U)) != 0U) |
-                             ((qm0 & ((1U << f0_len) - 1U)) != 0U) |
-                             (q0 & (((qm0 >> f0_len) & 1U) ^ 1U)), 0)) goto cold_clk;
-        p = f0_ptr + pos0 + 1U;
+        uint32_t f0_len;
+        bool f0_is_hex = false;
+        if (__builtin_expect(cm0 != 0U, 1)) {
+            uint32_t pos0 = uint32_t(__builtin_ctz(cm0));
+            f0_len = pos0 - q0;
+            if (__builtin_expect((f0_len - 2U) > 7U, 0)) goto cold_clk;
+            if (__builtin_expect(((nm0 & ((1U << pos0) - 1U)) != 0U) |
+                                 ((qm0 & ((1U << f0_len) - 1U)) != 0U) |
+                                 (q0 & (((qm0 >> f0_len) & 1U) ^ 1U)), 0)) goto cold_clk;
+            p = f0_ptr + pos0 + 1U;
+        } else {
+            if (__builtin_expect((nm0 != 0U) | (qm0 != 0U) |
+                                 (f0_ptr[33U + q0] != ',') | (q0 & (f0_ptr[33U] != '"')), 0)) goto cold_clk;
+            uint32_t cm0b, nm0b, qm0b;
+            eq16_cnq(f0_ptr + 16, cm0b, nm0b, qm0b);
+            if (__builtin_expect((cm0b | nm0b | qm0b) != 0U || f0_ptr[32] == '"' || f0_ptr[32] == ',' || f0_ptr[32] == '\n', 0)) goto cold_clk;
+            f0_len = 33U;
+            f0_is_hex = true;
+            p = f0_ptr + 34U + q0;
+        }
 
         // f1: user_id (short 2..9B OR 33B hex)
         uint32_t q1 = uint32_t(*p == '"');
@@ -4591,7 +4603,12 @@ static SS_NOINLINE const char* scan_clicks_direct_buf(
         if (__builtin_expect(!ts_ok, 0)) goto cold_clk;
 
         uint64_t cid = 0;
-        if (__builtin_expect(!try_encode_key64_2_9(f0_ptr, f0_len, cid), 0)) goto cold_clk;
+        if (__builtin_expect(!f0_is_hex, 1)) {
+            if (__builtin_expect(!try_encode_key64_2_9(f0_ptr, f0_len, cid), 0)) goto cold_clk;
+        } else {
+            if (__builtin_expect(ts < click_start_ms || ts >= win_end_ms, 0)) continue;
+            cid = encode_keyref_long(f0_ptr, 33U, ctx.seg_id, ctx.seg_base, ctx.arenas, ctx.tid);
+        }
 
         if (__builtin_expect(!f1_is_hex, 1)) {
             uint64_t u48 = 0;
@@ -4836,6 +4853,36 @@ static SS_NOINLINE bool emit_ev_short_eid_hex_u(
     return true;
 }
 
+// Out-of-line helper for ~12.5% 33B hex-eid view/cart events: skips re-scanning 2.5M lines via cold_line!
+static SS_NOINLINE bool emit_ev_hex_eid_fast(
+    const char* eptr, const char* uptr, size_t ulen, bool f1_is_hex,
+    int64_t ing_abs_sec, uint32_t ts_rel_ms, EvTaskCtx& __restrict ctx
+) {
+    if (__builtin_expect(!ctx.use_long_ev32, 0)) return false;
+    uint64_t elo = 0, ehi = 0;
+    if (__builtin_expect(!encode_ehex128(eptr, 33U, elo, ehi), 0)) return false;
+    uint64_t eh = hash_uhex128(elo, ehi);
+    uint32_t eb = uint32_t(eh >> (64 - LONG_EV_SHIFT));
+    auto& ebp = ctx.ebatch;
+    if (__builtin_expect(!f1_is_hex, 1)) {
+        uint64_t u48 = 0;
+        if (__builtin_expect(!encode_uid48_padded(uptr, ulen, u48), 0)) return false;
+        uint64_t h48 = mix48(u48);
+        ctx.dict.prefetch_uslot(h48);
+        ebp.extra[ebp.nextra++] = {h48, 0ULL, 0ULL, elo, ehi, ing_abs_sec, ts_rel_ms, eb, 0U, 0U, 0U, 2U};
+        if (__builtin_expect(ebp.nextra == EV_EXTRA_CAP, 0)) flush_ev_extra(ctx);
+        return true;
+    } else {
+        uint64_t lo = 0, hi = 0;
+        if (__builtin_expect(!encode_uhex128(uptr, 33U, lo, hi), 0)) return false;
+        uint64_t hh = hash_uhex128(lo, hi);
+        ctx.dict.prefetch_hline(hh);
+        ebp.extra[ebp.nextra++] = {lo, hi, hh, elo, ehi, ing_abs_sec, ts_rel_ms, eb, 0U, 0U, 0U, 3U};
+        if (__builtin_expect(ebp.nextra == EV_EXTRA_CAP, 0)) flush_ev_extra(ctx);
+        return true;
+    }
+}
+
 static SS_NOINLINE const char* handle_cold_event_line(
     const char* line_start, const char* buf_end, EvTaskCtx& __restrict ctx
 ) {
@@ -4875,15 +4922,23 @@ static SS_NOINLINE const char* scan_events_direct_buf(
     while (p < fast_limit) {
         const char* const line_start = p;
         {
-        // f0: event_id (short 2..9B 'e...'; 12.5% 33B hex -> fast extract7_hi64 cold helper)
+        // f0: event_id (short 2..9B 'e...' OR 33B hex 'e...' -> skips re-scanning 2.5M hex-eid rows!)
         uint32_t q0 = uint32_t(*p == '"');
         const char* f0_ptr = p + q0;
         uint32_t m0 = eq16_mask(f0_ptr, ',');
-        if (__builtin_expect(m0 == 0U, 0)) goto cold_line;
-        uint32_t pos0 = uint32_t(__builtin_ctz(m0));
-        uint32_t f0_len = pos0 - q0;
-        if (__builtin_expect((f0_len - 2U) > 7U || ((f0_ptr[0] != 'e') | (q0 & (f0_ptr[f0_len] != '"'))), 0)) goto cold_line;
-        p = f0_ptr + pos0 + 1U;
+        uint32_t f0_len;
+        bool f0_is_hex = false;
+        if (__builtin_expect(m0 != 0U, 1)) {
+            uint32_t pos0 = uint32_t(__builtin_ctz(m0));
+            f0_len = pos0 - q0;
+            if (__builtin_expect((f0_len - 2U) > 7U || ((f0_ptr[0] != 'e') | (q0 & (f0_ptr[f0_len] != '"'))), 0)) goto cold_line;
+            p = f0_ptr + pos0 + 1U;
+        } else {
+            if (__builtin_expect((f0_ptr[0] != 'e') | (f0_ptr[33U + q0] != ',') | (q0 & (f0_ptr[33U] != '"')), 0)) goto cold_line;
+            f0_len = 33U;
+            f0_is_hex = true;
+            p = f0_ptr + 34U + q0;
+        }
 
         // f1: user_id (short 2..9B OR 33B hex)
         uint32_t q1 = uint32_t(*p == '"');
@@ -4985,22 +5040,29 @@ static SS_NOINLINE const char* scan_events_direct_buf(
         }
         uint32_t ts_rel_ms = uint32_t(ts_rel_sec * 1000LL + int64_t(ms_rem));
 
-        if (__builtin_expect(!f1_is_hex, 1)) {
-            uint64_t eid48 = 0, u48 = 0;
-            if (__builtin_expect(!encode_eid48_padded(f0_ptr, f0_len, eid48) ||
-                                 !encode_uid48_padded(f1_ptr, f1_len, u48), 0)) {
-                goto cold_line;
+        if (__builtin_expect(!f0_is_hex, 1)) {
+            if (__builtin_expect(!f1_is_hex, 1)) {
+                uint64_t eid48 = 0, u48 = 0;
+                if (__builtin_expect(!encode_eid48_padded(f0_ptr, f0_len, eid48) ||
+                                     !encode_uid48_padded(f1_ptr, f1_len, u48), 0)) {
+                    goto cold_line;
+                }
+                uint64_t eh48 = mix48(eid48);
+                uint32_t eb_hi = uint32_t(eh48 >> 40);
+                uint64_t w0 = (1ULL << 62) | (uint64_t(uint32_t(ir)) << 41) | (eh48 & RawEvent16::REM40_MASK);
+                uint64_t uh48 = mix48(u48);
+                __builtin_prefetch(&ulines_p[size_t(uh48) & lmask_v], 0, 3);
+                ebp->fast[ebp->nfast++] = {uh48, w0, ts_rel_ms, eb_hi};
+                if (__builtin_expect(ebp->nfast == EV_FAST_CAP, 0)) flush_ev_fast(ctx);
+            } else {
+                if (__builtin_expect(!emit_ev_short_eid_hex_u(f0_ptr, f0_len, f1_ptr, 33U,
+                                                              uint32_t(ir), ts_rel_ms, ctx), 0)) {
+                    goto cold_line;
+                }
             }
-            uint64_t eh48 = mix48(eid48);
-            uint32_t eb_hi = uint32_t(eh48 >> 40);
-            uint64_t w0 = (1ULL << 62) | (uint64_t(uint32_t(ir)) << 41) | (eh48 & RawEvent16::REM40_MASK);
-            uint64_t uh48 = mix48(u48);
-            __builtin_prefetch(&ulines_p[size_t(uh48) & lmask_v], 0, 3);
-            ebp->fast[ebp->nfast++] = {uh48, w0, ts_rel_ms, eb_hi};
-            if (__builtin_expect(ebp->nfast == EV_FAST_CAP, 0)) flush_ev_fast(ctx);
         } else {
-            if (__builtin_expect(!emit_ev_short_eid_hex_u(f0_ptr, f0_len, f1_ptr, 33U,
-                                                          uint32_t(ir), ts_rel_ms, ctx), 0)) {
+            if (__builtin_expect(!emit_ev_hex_eid_fast(f0_ptr, f1_ptr, f1_len, f1_is_hex,
+                                                       ws_sec + ing_rel_sec, ts_rel_ms, ctx), 0)) {
                 goto cold_line;
             }
         }
@@ -5409,7 +5471,7 @@ static SS_NOINLINE bool run_fast_dict_dedup_sessionize_and_write(
             }
             const uint32_t nblks = uint32_t(blks.size());
 
-            if (__builtin_expect(nb <= 40000 && nblks < 255, 0)) {
+            if (__builtin_expect(nb <= 4096 && nblks < 255, 0)) {
                 // Direct small-bucket path (fixtures, dev_v4): ZERO copy overhead!
                 size_t hcap = 64;
                 while (hcap < nb + (nb >> 1) + 64) hcap <<= 1;
@@ -5632,7 +5694,7 @@ static SS_NOINLINE bool run_fast_dict_dedup_sessionize_and_write(
             }
             const uint32_t nl = uint32_t(lblks.size());
 
-            if (__builtin_expect(nlb <= 12000 && nl < 511, 0)) {
+            if (__builtin_expect(nlb <= 1024 && nl < 511, 0)) {
                 size_t lcap = 64;
                 while (lcap < nlb + (nlb >> 1) + 64) lcap <<= 1;
                 const size_t lmask = lcap - 1;
