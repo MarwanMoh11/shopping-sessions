@@ -35,12 +35,8 @@ static constexpr int64_t DAY_MS          = 24LL * HOUR_MS;
 static constexpr int64_t SESSION_GAP_MS  = 30LL * MINUTE_MS;
 static constexpr int64_t CLICK_WINDOW_MS = 7LL * DAY_MS;
 
-static constexpr uint64_t FALLBACK_BIT       = 1ULL << 63;
-static constexpr uint64_t COMP_BIT           = 1ULL << 55; // reserved
-static constexpr uint64_t MASK42             = (1ULL << 42) - 1ULL;
-static constexpr uint64_t COMP_PK42_BASE     = 7ULL << 39; // 3,848,290,697,216 > 37^8 = 3,512,479,453,921
-static constexpr uint64_t CLICK_CID_SIDE_BIT = 1ULL << 51;
-static constexpr uint64_t CLICK_CID_VAL_MASK = (1ULL << 51) - 1ULL;
+static constexpr uint64_t FALLBACK_BIT = 1ULL << 63;
+static constexpr uint64_t COMP_BIT     = 1ULL << 55; // bits 63..56 == 0, bit 55 == 1 => linked comp_id!
 
 // Anonymous mmap with optional 2MB-aligned MADV_HUGEPAGE (ONLY on actively-used >= 2 MB slabs/tables!)
 static inline void* alloc_mmap(size_t bytes, bool hugepage = false) {
@@ -209,420 +205,86 @@ static SS_ALWAYS_INLINE uint64_t pdep48(uint64_t k) {
 #endif
 }
 
-// ============================================================================
-// Order-Preserving Big-Endian Base-37 id42 Codec + Exact 42-bit Bijection mix42/unmix42
-//   + 128-bit SIMD Single & Dual-Base37 Encoders (AVX-512VL / AVX2 / NEON / scalar, ZERO %zmm!)
-//   - Domain: len in [2, 9], s[0] == PFX, s[1..len-1] in ['0'-'9', 'a'-'z']
-//   - Digits: pad -> 0, '0'..'9' -> 1..10, 'a'..'z' -> 11..36
-//   - id42 = sum_{i=0}^{7} c_i * 37^(7-i)  in [37^7, 37^8 - 1]
-//   - 37^8 = 3,512,479,453,921 < COMP_PK42_BASE = (7ULL << 39) = 3,848,290,697,216 (100% disjoint!)
-// ============================================================================
-static constexpr uint64_t POW37_2 = 1369ULL;
-static constexpr uint64_t POW37_4 = 1874161ULL;
-static constexpr uint64_t POW37_7 = 94931877133ULL;
-static constexpr uint64_t POW37_8 = 3512479453921ULL;
-
-static_assert(POW37_8 < COMP_PK42_BASE, "All short id42 must be strictly < COMP_PK42_BASE");
-static_assert(COMP_PK42_BASE + (1ULL << 24) <= (1ULL << 42), "COMP_PK42_BASE | pid24 must fit in 42 bits");
-static_assert((POW37_7 >> 32) >= 22ULL, "Every valid short id42 has non-zero top 10 bits (bits 41..32)");
-
-static constexpr uint64_t M42     = 0x358476d1ce5ULL;
-static constexpr uint64_t INV_M42 = 0x0b52c8740edULL;
-static_assert(((M42 * INV_M42) & MASK42) == 1ULL, "M42 * INV_M42 must be 1 mod 2^42");
-
-static constexpr SS_ALWAYS_INLINE uint64_t mix42(uint64_t x) {
-    x ^= x >> 21;
-    x = (x * M42) & MASK42;
-    x ^= x >> 21;
+// Exact 48-bit bijection (1-mul + 2 xor-shifts mod 2^48): mix48(a)==mix48(b) <=> a==b!
+static constexpr uint64_t MASK48 = (1ULL << 48) - 1ULL;
+static SS_ALWAYS_INLINE uint64_t mix48(uint64_t x) {
+    x ^= x >> 24;
+    x = (x * 0xbf58476d1ce5ULL) & MASK48;
+    x ^= x >> 24;
+    return x;
+}
+static SS_ALWAYS_INLINE uint64_t unmix48(uint64_t x) {
+    x ^= x >> 24;
+    x = (x * 0x30b52c8740edULL) & MASK48;
+    x ^= x >> 24;
     return x;
 }
 
-static constexpr SS_ALWAYS_INLINE uint64_t unmix42(uint64_t x) {
-    x ^= x >> 21;
-    x = (x * INV_M42) & MASK42;
-    x ^= x >> 21;
-    return x;
-}
-
-static_assert(unmix42(mix42(0ULL)) == 0ULL);
-static_assert(unmix42(mix42(1ULL)) == 1ULL);
-static_assert(unmix42(mix42(POW37_7)) == POW37_7);
-static_assert(unmix42(mix42(POW37_8 - 1ULL)) == POW37_8 - 1ULL);
-static_assert(unmix42(mix42(COMP_PK42_BASE | 1ULL)) == (COMP_PK42_BASE | 1ULL));
-static_assert(unmix42(mix42(COMP_PK42_BASE | 0xFFFFFFULL)) == (COMP_PK42_BASE | 0xFFFFFFULL));
-static_assert(unmix42(mix42(MASK42)) == MASK42);
-
-// Shared 64-bit SWAR validator + 3-multiply pairwise big-endian base-37 encoder (for key64_to_uid42 & cid49)
-static SS_ALWAYS_INLINE bool encode_raw8_to_id42(uint64_t raw8, uint32_t nchars, uint64_t& out_id42) {
-    constexpr uint64_t HI80 = 0x8080808080808080ULL;
-    constexpr uint64_t LO7F = 0x7F7F7F7F7F7F7F7FULL;
-    uint64_t r80  = raw8 | HI80;
-    uint64_t td   = r80 - 0x3030303030303030ULL;
-    uint64_t is_d = td & ~((td & LO7F) + 0x7676767676767676ULL);
-    uint64_t ta   = r80 - 0x6161616161616161ULL;
-    uint64_t is_a = ta & ~((ta & LO7F) + 0x6666666666666666ULL) & HI80;
-    uint64_t bad  = (raw8 | ~(is_d | is_a)) & HI80;
-#if defined(__BMI2__)
-    uint32_t nbits = nchars << 3;
-    if (__builtin_expect(_bzhi_u64(bad, nbits) != 0, 0)) return false;
-    uint64_t sub = 0x2F2F2F2F2F2F2F2FULL + ((is_a >> 7) * 0x27ULL);
-    uint64_t d   = _bzhi_u64(raw8 - sub, nbits);
-#else
-    uint64_t mask = (~0ULL) >> ((8U - nchars) << 3);
-    if (__builtin_expect((bad & mask) != 0, 0)) return false;
-    uint64_t sub = 0x2F2F2F2F2F2F2F2FULL + ((is_a >> 7) * 0x27ULL);
-    uint64_t d   = (raw8 - sub) & mask;
-#endif
-    uint64_t p16 = (d & 0x00FF00FF00FF00FFULL) * 37ULL + ((d >> 8) & 0x00FF00FF00FF00FFULL);
-    uint64_t p32 = (p16 & 0x0000FFFF0000FFFFULL) * POW37_2 + ((p16 >> 16) & 0x0000FFFF0000FFFFULL);
-    out_id42 = uint64_t(uint32_t(p32)) * POW37_4 + (p32 >> 32);
-    return true;
-}
-
-// Single 128-bit SIMD Base-37 encoder (requires >= 8 readable bytes at s+1; 100% bit-exact with encode_raw8_to_id42)
+// Ultra-fast BMI2 bzhi + pext(0x5F5F...) 11-insn validator/encoder for 2..9B IDs ('0'-'9','a'-'z')!
+// Exact 48-bit bijection identical across AVX-512VL / AVX2 / ARM64 / scalar.
 template <char PFX>
-static SS_ALWAYS_INLINE bool encode_id42_padded(const char* s, size_t len, uint64_t& out_id42) {
-    if (__builtin_expect(((len - 2) > 7) | (s[0] != PFX), 0)) return false;
-#if defined(__AVX512BW__) && defined(__AVX512VL__)
-    uint32_t n = uint32_t(len - 1);
+static SS_ALWAYS_INLINE bool encode_id48_padded(const char* s, size_t len, uint64_t& out_id48) {
+    if (__builtin_expect((len - 2) <= 7 && s[0] == PFX, 1)) {
+        uint64_t raw8;
+        std::memcpy(&raw8, s + 1, 8);
 #if defined(__BMI2__)
-    __mmask16 active = __mmask16(_bzhi_u32(0xFFU, n));
-#else
-    __mmask16 active = __mmask16((1U << n) - 1U);
-#endif
-    __m128i v    = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + 1));
-    __m128i d    = _mm_sub_epi8(v, _mm_set1_epi8('0'));
-    __m128i a    = _mm_sub_epi8(v, _mm_set1_epi8('a'));
-    __mmask16 md = _mm_mask_cmple_epu8_mask(active, d, _mm_set1_epi8(9));
-    __mmask16 ma = _mm_mask_cmple_epu8_mask(active, a, _mm_set1_epi8(25));
-    if (__builtin_expect((md | ma) != active, 0)) return false;
-    __m128i c    = _mm_maskz_add_epi8(md, d, _mm_set1_epi8(1));
-    c            = _mm_mask_add_epi8(c, ma, a, _mm_set1_epi8(11));
-    __m128i p16  = _mm_maddubs_epi16(c, _mm_set1_epi16(0x0125));
-    __m128i q32  = _mm_madd_epi16(p16, _mm_set1_epi32(0x00010559));
-    uint64_t r0  = uint64_t(_mm_cvtsi128_si64(q32));
-    out_id42 = uint64_t(uint32_t(r0)) * POW37_4 + (r0 >> 32);
-    return true;
-#elif defined(__SSE4_1__) || defined(__AVX2__)
-    alignas(64) static constexpr uint64_t LEN_MASK64[10] = {
-        0ULL, 0ULL,
-        0x00000000000000FFULL, 0x000000000000FFFFULL,
-        0x0000000000FFFFFFULL, 0x00000000FFFFFFFFULL,
-        0x000000FFFFFFFFFFULL, 0x0000FFFFFFFFFFFFULL,
-        0x00FFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL
-    };
-    __m128i v     = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + 1));
-    __m128i m_act = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(&LEN_MASK64[len]));
-    __m128i d     = _mm_sub_epi8(v, _mm_set1_epi8('0'));
-    __m128i a     = _mm_sub_epi8(v, _mm_set1_epi8('a'));
-    __m128i isd   = _mm_cmpeq_epi8(_mm_subs_epu8(d, _mm_set1_epi8(9)), _mm_setzero_si128());
-    __m128i isa   = _mm_cmpeq_epi8(_mm_subs_epu8(a, _mm_set1_epi8(25)), _mm_setzero_si128());
-    if (__builtin_expect(!_mm_testc_si128(_mm_or_si128(isd, isa), m_act), 0)) return false;
-    __m128i c     = _mm_and_si128(m_act, _mm_blendv_epi8(_mm_add_epi8(a, _mm_set1_epi8(11)),
-                                                         _mm_add_epi8(d, _mm_set1_epi8(1)), isd));
-    __m128i p16   = _mm_maddubs_epi16(c, _mm_set1_epi16(0x0125));
-    __m128i q32   = _mm_madd_epi16(p16, _mm_set1_epi32(0x00010559));
-    uint64_t r0   = uint64_t(_mm_cvtsi128_si64(q32));
-    out_id42 = uint64_t(uint32_t(r0)) * POW37_4 + (r0 >> 32);
-    return true;
-#elif defined(__aarch64__)
-    alignas(64) static constexpr uint64_t LEN_MASK64[10] = {
-        0ULL, 0ULL,
-        0x00000000000000FFULL, 0x000000000000FFFFULL,
-        0x0000000000FFFFFFULL, 0x00000000FFFFFFFFULL,
-        0x000000FFFFFFFFFFULL, 0x0000FFFFFFFFFFFFULL,
-        0x00FFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL
-    };
-    uint8x8_t v     = vld1_u8(reinterpret_cast<const uint8_t*>(s + 1));
-    uint8x8_t m_act = vreinterpret_u8_u64(vdup_n_u64(LEN_MASK64[len]));
-    uint8x8_t d     = vsub_u8(v, vdup_n_u8(uint8_t('0')));
-    uint8x8_t a     = vsub_u8(v, vdup_n_u8(uint8_t('a')));
-    uint8x8_t isd   = vcle_u8(d, vdup_n_u8(9));
-    uint8x8_t isa   = vcle_u8(a, vdup_n_u8(25));
-    uint8x8_t bad   = vbic_u8(m_act, vorr_u8(isd, isa));
-    if (__builtin_expect(vget_lane_u64(vreinterpret_u64_u8(bad), 0) != 0, 0)) return false;
-    uint8x8_t c     = vand_u8(m_act, vbsl_u8(isd, vadd_u8(d, vdup_n_u8(1)), vadd_u8(a, vdup_n_u8(11))));
-    uint8x8_t ce    = vuzp1_u8(c, c);
-    uint8x8_t co    = vuzp2_u8(c, c);
-    uint16x4_t p16  = vget_low_u16(vmlal_u8(vmovl_u8(co), ce, vdup_n_u8(37)));
-    uint16x4_t pe   = vuzp1_u16(p16, p16);
-    uint16x4_t po   = vuzp2_u16(p16, p16);
-    uint32x4_t q32  = vmlal_u16(vmovl_u16(po), pe, vdup_n_u16(1369));
-    out_id42 = uint64_t(vgetq_lane_u32(q32, 0)) * POW37_4 + uint64_t(vgetq_lane_u32(q32, 1));
-    return true;
-#else
-    uint64_t raw8;
-    std::memcpy(&raw8, s + 1, 8);
-    return encode_raw8_to_id42(raw8, uint32_t(len - 1), out_id42);
-#endif
-}
-
-// Dual 128-bit SIMD Base-37 encoder: encodes BOTH (s0, len0) [lo64] and (s1, len1) [hi64] in ~10 uops (ZERO %zmm!)
-template <char PFX0, char PFX1>
-static SS_ALWAYS_INLINE bool encode_dual_id42_padded(
-    const char* s0, size_t len0,
-    const char* s1, size_t len1,
-    uint64_t& out0, uint64_t& out1
-) {
-    if (__builtin_expect(((len0 - 2) > 7) | ((len1 - 2) > 7) |
-                         (s0[0] != PFX0) | (s1[0] != PFX1), 0)) {
-        return false;
-    }
-#if defined(__AVX512BW__) && defined(__AVX512VL__)
-    uint32_t n0 = uint32_t(len0 - 1);
-    uint32_t n1 = uint32_t(len1 - 1);
-#if defined(__BMI2__)
-    __mmask16 active = __mmask16(_bzhi_u32(0xFFU, n0) | (_bzhi_u32(0xFFU, n1) << 8));
-#else
-    __mmask16 active = __mmask16(((1U << n0) - 1U) | (((1U << n1) - 1U) << 8));
-#endif
-    __m128i v    = _mm_unpacklo_epi64(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(s0 + 1)),
-                                      _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s1 + 1)));
-    __m128i d    = _mm_sub_epi8(v, _mm_set1_epi8('0'));
-    __m128i a    = _mm_sub_epi8(v, _mm_set1_epi8('a'));
-    __mmask16 md = _mm_mask_cmple_epu8_mask(active, d, _mm_set1_epi8(9));
-    __mmask16 ma = _mm_mask_cmple_epu8_mask(active, a, _mm_set1_epi8(25));
-    if (__builtin_expect((md | ma) != active, 0)) return false;
-    __m128i c    = _mm_maskz_add_epi8(md, d, _mm_set1_epi8(1));
-    c            = _mm_mask_add_epi8(c, ma, a, _mm_set1_epi8(11));
-    __m128i p16  = _mm_maddubs_epi16(c, _mm_set1_epi16(0x0125));
-    __m128i q32  = _mm_madd_epi16(p16, _mm_set1_epi32(0x00010559));
-    uint64_t r0  = uint64_t(_mm_cvtsi128_si64(q32));
-    uint64_t r1  = uint64_t(_mm_extract_epi64(q32, 1));
-    out0 = uint64_t(uint32_t(r0)) * POW37_4 + (r0 >> 32);
-    out1 = uint64_t(uint32_t(r1)) * POW37_4 + (r1 >> 32);
-    return true;
-#elif defined(__SSE4_1__) || defined(__AVX2__)
-    alignas(64) static constexpr uint64_t LEN_MASK64[10] = {
-        0ULL, 0ULL,
-        0x00000000000000FFULL, 0x000000000000FFFFULL,
-        0x0000000000FFFFFFULL, 0x00000000FFFFFFFFULL,
-        0x000000FFFFFFFFFFULL, 0x0000FFFFFFFFFFFFULL,
-        0x00FFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL
-    };
-    __m128i v     = _mm_unpacklo_epi64(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(s0 + 1)),
-                                       _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s1 + 1)));
-    __m128i m_act = _mm_unpacklo_epi64(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(&LEN_MASK64[len0])),
-                                       _mm_loadl_epi64(reinterpret_cast<const __m128i*>(&LEN_MASK64[len1])));
-    __m128i d     = _mm_sub_epi8(v, _mm_set1_epi8('0'));
-    __m128i a     = _mm_sub_epi8(v, _mm_set1_epi8('a'));
-    __m128i isd   = _mm_cmpeq_epi8(_mm_subs_epu8(d, _mm_set1_epi8(9)), _mm_setzero_si128());
-    __m128i isa   = _mm_cmpeq_epi8(_mm_subs_epu8(a, _mm_set1_epi8(25)), _mm_setzero_si128());
-    if (__builtin_expect(!_mm_testc_si128(_mm_or_si128(isd, isa), m_act), 0)) return false;
-    __m128i c     = _mm_and_si128(m_act, _mm_blendv_epi8(_mm_add_epi8(a, _mm_set1_epi8(11)),
-                                                         _mm_add_epi8(d, _mm_set1_epi8(1)), isd));
-    __m128i p16   = _mm_maddubs_epi16(c, _mm_set1_epi16(0x0125));
-    __m128i q32   = _mm_madd_epi16(p16, _mm_set1_epi32(0x00010559));
-    uint64_t r0   = uint64_t(_mm_cvtsi128_si64(q32));
-    uint64_t r1   = uint64_t(_mm_extract_epi64(q32, 1));
-    out0 = uint64_t(uint32_t(r0)) * POW37_4 + (r0 >> 32);
-    out1 = uint64_t(uint32_t(r1)) * POW37_4 + (r1 >> 32);
-    return true;
-#elif defined(__aarch64__)
-    alignas(64) static constexpr uint64_t LEN_MASK64[10] = {
-        0ULL, 0ULL,
-        0x00000000000000FFULL, 0x000000000000FFFFULL,
-        0x0000000000FFFFFFULL, 0x00000000FFFFFFFFULL,
-        0x000000FFFFFFFFFFULL, 0x0000FFFFFFFFFFFFULL,
-        0x00FFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL
-    };
-    uint8x16_t v     = vcombine_u8(vld1_u8(reinterpret_cast<const uint8_t*>(s0 + 1)),
-                                   vld1_u8(reinterpret_cast<const uint8_t*>(s1 + 1)));
-    uint8x16_t m_act = vreinterpretq_u8_u64(vcombine_u64(vdup_n_u64(LEN_MASK64[len0]),
-                                                         vdup_n_u64(LEN_MASK64[len1])));
-    uint8x16_t d     = vsubq_u8(v, vdupq_n_u8(uint8_t('0')));
-    uint8x16_t a     = vsubq_u8(v, vdupq_n_u8(uint8_t('a')));
-    uint8x16_t isd   = vcleq_u8(d, vdupq_n_u8(9));
-    uint8x16_t isa   = vcleq_u8(a, vdupq_n_u8(25));
-    uint8x16_t bad   = vbicq_u8(m_act, vorrq_u8(isd, isa));
-    if (__builtin_expect(vmaxvq_u32(vreinterpretq_u32_u8(bad)) != 0, 0)) return false;
-    uint8x16_t c     = vandq_u8(m_act, vbslq_u8(isd, vaddq_u8(d, vdupq_n_u8(1)),
-                                                     vaddq_u8(a, vdupq_n_u8(11))));
-    uint8x16_t ce    = vuzp1q_u8(c, c);
-    uint8x16_t co    = vuzp2q_u8(c, c);
-    uint16x8_t p16   = vmlal_u8(vmovl_u8(vget_low_u8(co)), vget_low_u8(ce), vdup_n_u8(37));
-    uint16x4_t pe    = vuzp1_u16(vget_low_u16(p16), vget_high_u16(p16));
-    uint16x4_t po    = vuzp2_u16(vget_low_u16(p16), vget_high_u16(p16));
-    uint32x4_t q32   = vmlal_u16(vmovl_u16(po), pe, vdup_n_u16(1369));
-    out0 = uint64_t(vgetq_lane_u32(q32, 0)) * POW37_4 + uint64_t(vgetq_lane_u32(q32, 1));
-    out1 = uint64_t(vgetq_lane_u32(q32, 2)) * POW37_4 + uint64_t(vgetq_lane_u32(q32, 3));
-    return true;
-#else
-    return encode_id42_padded<PFX0>(s0, len0, out0) && encode_id42_padded<PFX1>(s1, len1, out1);
-#endif
-}
-
-static SS_ALWAYS_INLINE bool encode_eid42_padded(const char* s, size_t len, uint64_t& out_eid42) {
-    return encode_id42_padded<'e'>(s, len, out_eid42);
-}
-
-static SS_ALWAYS_INLINE bool encode_uid42_padded(const char* s, size_t len, uint64_t& out_uid42) {
-    return encode_id42_padded<'u'>(s, len, out_uid42);
-}
-
-// Register-only Key64 -> uid42 converter for links Pass 3 (100% bit-for-bit identical domain to encode_uid42_padded!)
-static SS_ALWAYS_INLINE bool key64_to_uid42(uint64_t k, uint64_t& out_u42) {
-    if (__builtin_expect((k >> 56) != uint8_t('u') || (k & 0x00FFFFFFFFFFFFFFULL) == 0, 0)) return false;
-    uint64_t be   = pdep56(k);
-    uint64_t raw8 = __builtin_bswap64(be);
-    uint32_t nchars = 8U - (uint32_t(__builtin_ctzll(be)) >> 3);
-    return encode_raw8_to_id42(raw8, nchars, out_u42);
-}
-
-// 2.67 KB L1D-hot Base-37 pair decode LUT (37*37 = 1369 entries x 2 bytes!)
-struct DecodePairLut {
-    alignas(64) uint16_t pair[1369];
-    constexpr DecodePairLut() : pair{} {
-        constexpr char ALPHA[37] = {
-            '\0',
-            '0','1','2','3','4','5','6','7','8','9',
-            'a','b','c','d','e','f','g','h','i','j','k','l','m',
-            'n','o','p','q','r','s','t','u','v','w','x','y','z'
-        };
-        for (uint32_t a = 0; a < 37U; ++a) {
-            for (uint32_t b = 0; b < 37U; ++b) {
-                pair[a * 37U + b] = uint16_t(uint8_t(ALPHA[a])) | (uint16_t(uint8_t(ALPHA[b])) << 8);
-            }
-        }
-    }
-};
-static constexpr DecodePairLut DECODE_PAIR_LUT{};
-
-// Decodes big-endian base-37 id42 directly into PFX + 1..8 ASCII bytes (writes 9 bytes, returns length 2..9; 1 if id42==0).
-template <char PFX>
-static SS_ALWAYS_INLINE size_t decode_id42_inline(uint64_t id42, char* dst) {
-    dst[0] = PFX;
-    uint32_t hi4 = uint32_t(id42 / POW37_4);
-    uint32_t lo4 = uint32_t(id42 - uint64_t(hi4) * POW37_4);
-    uint32_t p0  = hi4 / uint32_t(POW37_2);
-    uint32_t p1  = hi4 - p0 * uint32_t(POW37_2);
-    uint32_t p2  = lo4 / uint32_t(POW37_2);
-    uint32_t p3  = lo4 - p2 * uint32_t(POW37_2);
-    uint64_t le  = uint64_t(DECODE_PAIR_LUT.pair[p0])
-                 | (uint64_t(DECODE_PAIR_LUT.pair[p1]) << 16)
-                 | (uint64_t(DECODE_PAIR_LUT.pair[p2]) << 32)
-                 | (uint64_t(DECODE_PAIR_LUT.pair[p3]) << 48);
-    std::memcpy(dst + 1, &le, 8);
-    return le ? (9U - (uint32_t(__builtin_clzll(le)) >> 3)) : 1U;
-}
-
-// Prefix-agnostic 49-bit order-preserving click_id codec: [s[0]:7 (ASCII 1..127)][id42:42]!
-static SS_ALWAYS_INLINE bool encode_cid49_padded(const char* s, size_t len, uint64_t& out_cid49) {
-    if (__builtin_expect((len - 2) <= 7, 1)) {
-        uint8_t b0 = uint8_t(s[0]);
-        if (__builtin_expect(uint8_t(b0 - 1) < 127U, 1)) {
-            uint64_t raw8;
-            std::memcpy(&raw8, s + 1, 8);
-            uint64_t id42 = 0;
-            if (__builtin_expect(encode_raw8_to_id42(raw8, uint32_t(len - 1), id42), 1)) {
-                out_cid49 = (uint64_t(b0) << 42) | id42;
-                return true;
-            }
-        }
-    } else if (__builtin_expect(len == 1, 0)) {
-        uint8_t b0 = uint8_t(s[0]);
-        if (uint8_t(b0 - 1) < 127U) {
-            out_cid49 = uint64_t(b0) << 42;
+        uint32_t nbits = uint32_t(len - 1) << 3;
+        uint64_t bad = ((raw8 ^ 0x2020202020202020ULL) & 0xA0A0A0A0A0A0A0A0ULL)
+                     | (~(raw8 | (raw8 >> 2)) & 0x1010101010101010ULL);
+        if (__builtin_expect(_bzhi_u64(bad, nbits) == 0, 1)) {
+            out_id48 = _pext_u64(_bzhi_u64(raw8, nbits), 0x5F5F5F5F5F5F5F5FULL);
             return true;
         }
+#else
+        uint64_t mask = (~0ULL) >> ((9 - len) << 3);
+        raw8 &= mask;
+        uint64_t check = raw8 | (~mask & 0x3030303030303030ULL);
+        uint64_t bad = ((check ^ 0x2020202020202020ULL) & 0xA0A0A0A0A0A0A0A0ULL)
+                     | (~(check | (check >> 2)) & 0x1010101010101010ULL);
+        if (__builtin_expect(bad == 0, 1)) {
+            uint64_t x = ((raw8 & 0x4040404040404040ULL) >> 1) | (raw8 & 0x1F1F1F1F1F1F1F1FULL);
+            out_id48 = pext48(x);
+            return true;
+        }
+#endif
     }
     return false;
 }
 
-static SS_ALWAYS_INLINE size_t decode_cid49_inline(uint64_t cid49, char* dst) {
-    dst[0] = char(cid49 >> 42);
-    uint64_t id42 = cid49 & MASK42;
-    uint32_t hi4  = uint32_t(id42 / POW37_4);
-    uint32_t lo4  = uint32_t(id42 - uint64_t(hi4) * POW37_4);
-    uint32_t p0   = hi4 / uint32_t(POW37_2);
-    uint32_t p1   = hi4 - p0 * uint32_t(POW37_2);
-    uint32_t p2   = lo4 / uint32_t(POW37_2);
-    uint32_t p3   = lo4 - p2 * uint32_t(POW37_2);
-    uint64_t le   = uint64_t(DECODE_PAIR_LUT.pair[p0])
-                  | (uint64_t(DECODE_PAIR_LUT.pair[p1]) << 16)
-                  | (uint64_t(DECODE_PAIR_LUT.pair[p2]) << 32)
-                  | (uint64_t(DECODE_PAIR_LUT.pair[p3]) << 48);
-    std::memcpy(dst + 1, &le, 8);
-    return le ? (9U - (uint32_t(__builtin_clzll(le)) >> 3)) : 1U;
+static SS_ALWAYS_INLINE bool encode_eid48_padded(const char* s, size_t len, uint64_t& out_eid48) {
+    return encode_id48_padded<'e'>(s, len, out_eid48);
 }
 
-// 51-bit StringArena descriptor for side click_ids (fits bits 50..0 of CompactClick::w0!)
-static SS_NOINLINE uint64_t store_cid_side(StringArenaPool& arenas, int tid, const char* s, size_t len) {
-    size_t off = arenas.pos[tid];
-    if (__builtin_expect(off + len > StringArenaPool::RESERVATION, 0)) {
-        std::fprintf(stderr, "StringArena overflow in store_cid_side on thread %d\n", tid);
-        std::abort();
-    }
-    if (len) std::memcpy(arenas.base[tid] + off, s, len);
-    arenas.pos[tid] = off + len;
-    if (__builtin_expect(len >= 1 && len <= 16383U && off < (1ULL << 31), 1)) {
-        return (uint64_t(uint32_t(tid)) << 45) | (uint64_t(off) << 14) | uint64_t(len);
-    }
-    uint64_t fk = arenas.store_huge(arenas.base[tid] + off, len);
-    return ((fk >> 16) & 0x7FFFFFFFULL) << 14;
+static SS_ALWAYS_INLINE bool encode_uid48_padded(const char* s, size_t len, uint64_t& out_uid48) {
+    return encode_id48_padded<'u'>(s, len, out_uid48);
 }
 
-static SS_ALWAYS_INLINE std::string_view get_cid_side(uint64_t desc51, const StringArenaPool& arenas) {
-    uint32_t len = uint32_t(desc51 & 0x3FFFU);
-    if (__builtin_expect(len != 0, 1)) {
-        uint32_t tid = uint32_t((desc51 >> 45) & 0x3FU);
-        size_t   off = size_t((desc51 >> 14) & 0x7FFFFFFFULL);
-        return {arenas.base[tid] + off, len};
-    }
-    uint32_t idx1 = uint32_t((desc51 >> 14) & 0x7FFFFFFFULL);
-    std::lock_guard<std::mutex> lk(arenas.huge_mu);
-    const auto& hs = arenas.huge_strs[idx1 - 1];
-    return {hs.ptr, hs.len};
-}
-
-static SS_NOINLINE bool click_cid_less_slow(uint64_t w0_a, uint64_t w0_b, const StringArenaPool& arenas) {
-    char ba[16], bb[16];
-    std::string_view sa, sb;
-    if ((w0_a & CLICK_CID_SIDE_BIT) == 0) {
-        sa = {ba, decode_cid49_inline(w0_a & CLICK_CID_VAL_MASK, ba)};
-    } else {
-        sa = get_cid_side(w0_a & CLICK_CID_VAL_MASK, arenas);
-    }
-    if ((w0_b & CLICK_CID_SIDE_BIT) == 0) {
-        sb = {bb, decode_cid49_inline(w0_b & CLICK_CID_VAL_MASK, bb)};
-    } else {
-        sb = get_cid_side(w0_b & CLICK_CID_VAL_MASK, arenas);
-    }
-    size_t m = sa.size() < sb.size() ? sa.size() : sb.size();
-    int cmp = m ? std::memcmp(sa.data(), sb.data(), m) : 0;
-    if (cmp != 0) return cmp < 0;
-    return sa.size() < sb.size();
-}
-
-static SS_ALWAYS_INLINE bool click_cid_less(uint64_t w0_a, uint64_t w0_b, const StringArenaPool& arenas) {
-    if (__builtin_expect(((w0_a | w0_b) & CLICK_CID_SIDE_BIT) == 0, 1)) {
-        return (w0_a & CLICK_CID_VAL_MASK) < (w0_b & CLICK_CID_VAL_MASK);
-    }
-    return click_cid_less_slow(w0_a, w0_b, arenas);
-}
-
-static constexpr bool verify_id42_codec_constexpr() {
-    auto enc = [](const char* s, size_t len) -> uint64_t {
-        uint64_t v = 0;
-        for (size_t i = 0; i < 8; ++i) {
-            uint64_t d = 0;
-            if (i + 1 < len) {
-                char c = s[i + 1];
-                d = (c >= '0' && c <= '9') ? uint64_t(c - '0' + 1) : uint64_t(c - 'a' + 11);
-            }
-            v = v * 37ULL + d;
-        }
-        return v;
-    };
-    uint64_t a = enc("u0", 2), b = enc("u00", 3), c = enc("u1", 2), d = enc("u10", 3);
-    uint64_t e = enc("u9", 2), f = enc("ua", 2), g = enc("uzzzzzzzz", 9);
-    if (!(a == POW37_7 && a < b && b < c && c < d && d < e && e < f && f < g && g == POW37_8 - 1ULL)) return false;
-    uint32_t hi4 = uint32_t(d / POW37_4), lo4 = uint32_t(d % POW37_4);
-    uint16_t p0 = DECODE_PAIR_LUT.pair[hi4 / 1369U];
-    if ((p0 & 0xFFU) != uint8_t('1') || (p0 >> 8) != uint8_t('0') || lo4 != 0) return false;
+// Register-only Key64 -> uid48 converter for links Pass 3 (bit-for-bit identical domain to encode_uid48_padded!)
+static SS_ALWAYS_INLINE bool key64_to_uid48(uint64_t k, uint64_t& out_u48) {
+    if (__builtin_expect((k >> 56) != uint8_t('u') || (k & 0x00FFFFFFFFFFFFFFULL) == 0, 0)) return false;
+    uint64_t be   = pdep56(k);
+    uint64_t raw8 = __builtin_bswap64(be);
+    uint64_t nz   = (be + 0x7F7F7F7F7F7F7F7FULL) & 0x8080808080808080ULL;
+    uint64_t bad  = nz & ((~be << 2) | (~(be | (be << 2)) << 1));
+    if (__builtin_expect(bad != 0, 0)) return false;
+#if defined(__BMI2__)
+    out_u48 = _pext_u64(raw8, 0x5F5F5F5F5F5F5F5FULL);
+#else
+    uint64_t x = ((raw8 & 0x4040404040404040ULL) >> 1) | (raw8 & 0x1F1F1F1F1F1F1F1FULL);
+    out_u48 = pext48(x);
+#endif
     return true;
 }
-static_assert(verify_id42_codec_constexpr(), "Base-37 id42 codec self-test failed");
+
+// Decode little-endian uid48 directly into ASCII bytes ('u' + 1..8 chars), returns exact length in 2..9!
+static SS_ALWAYS_INLINE size_t decode_uid48_inline(uint64_t uid48, char* out) {
+    out[0] = 'u';
+    uint64_t u = pdep48(uid48);
+    uint64_t b5 = u & 0x2020202020202020ULL;
+    uint64_t le = u | (b5 << 1) | ((~b5) & ((u & 0x1010101010101010ULL) << 1));
+    std::memcpy(out + 1, &le, 8);
+    return le ? (9U - (uint32_t(__builtin_clzll(le)) >> 3)) : 1U;
+}
 
 // Exact injective 128-bit encoder for PFX ('u' or 'e') + 32 lowercase hex chars (256-bit AVX-512VL 10 uops / AVX2 16 uops / scalar!).
 // Domain predicate depends ONLY on decoded bytes (disjoint from 2..9B inline codecs by length 33).

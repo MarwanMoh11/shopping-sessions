@@ -99,7 +99,8 @@ int main(int argc, char** argv) {
         static const char* CHS[4] = {"search","social","email","display"};
         FILE* f = std::fopen((dir + "/campaigns.csv").c_str(), "wb");
         std::fputs("campaign_id,channel\n", f);
-        for (int i = 1; i <= 40; ++i) std::fprintf(f, "c%03d,%s\n", i, CHS[i & 3]);
+        // Match real v4: c_1..c_2000 (trains BOTH try_lookup_fast_c AND Stage 3 !small_camps path!)
+        for (int i = 1; i <= 2000; ++i) std::fprintf(f, "c_%d,%s\n", i, CHS[i & 3]);
         std::fclose(f);
     }
 
@@ -142,7 +143,8 @@ int main(int argc, char** argv) {
             // Click users: biased to [0..50000) so [50000..80000) train organic cn==0!
             uint32_t u = (r % 25 == 0) ? uint32_t(rng() % 480) : uint32_t(rng() % 50000);
             mk_uid(u, uid);
-            std::snprintf(cmp, sizeof(cmp), "c%03u", uint32_t((rng() % 40) + 1));
+            uint32_t cid_num = ((rng() % 10) < 3) ? uint32_t((rng() % 4) + 1) : uint32_t((rng() % 2000) + 1);
+            std::snprintf(cmp, sizeof(cmp), "c_%u", cid_num);
             int64_t sec = W0 - 7LL * 86400LL + int64_t(rng() % (W_DUR + 7LL * 86400LL));
             uint32_t fmt = uint32_t(rng() % 100);
             if (fmt < 57) fmt_f1(sec, ts);
