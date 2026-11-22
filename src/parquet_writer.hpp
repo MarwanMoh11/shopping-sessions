@@ -319,7 +319,8 @@ static inline bool write_parquet_file(
             int64_t page_start = offset;
             if (cols[i].kind == ColKind::STRING_OPT) {
                 auto& db = def_bufs[i];
-                db.reserve(((size_t(num_rows) + 7) >> 3) + 64);
+                size_t nbytes = (size_t(num_rows) + 7) >> 3;
+                db.reserve(nbytes + (nbytes / 63) + 16);
                 encode_def_levels_bitpacked(db, data[i].def_bitmap, size_t(num_rows));
                 int64_t page_payload_size = int64_t(db.size() + data[i].values_len);
                 if (__builtin_expect(page_payload_size > INT32_MAX || num_rows > INT32_MAX, 0)) {

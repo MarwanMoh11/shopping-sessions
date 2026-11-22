@@ -6,10 +6,10 @@ namespace ss_avx512 { __attribute__((visibility("default"))) int run_engine(int 
 
 int main(int argc, char** argv) {
 #if defined(__x86_64__)
-    if (__builtin_cpu_supports("x86-64-v4")) {
+    if (__builtin_cpu_supports("x86-64-v4") && __builtin_cpu_supports("pclmul")) {
         return ss_avx512::run_engine(argc, argv);
     }
-    if (__builtin_cpu_supports("x86-64-v3")) {
+    if (__builtin_cpu_supports("x86-64-v3") && __builtin_cpu_supports("pclmul")) {
         return ss_avx2::run_engine(argc, argv);
     }
 #endif

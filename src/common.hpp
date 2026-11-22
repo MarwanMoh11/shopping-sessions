@@ -23,6 +23,7 @@
 #define SS_ALWAYS_INLINE __attribute__((always_inline)) inline
 #define SS_LAMBDA_INLINE __attribute__((always_inline))
 #define SS_COLD_NOINLINE __attribute__((noinline, cold))
+#define SS_NOINLINE      __attribute__((noinline))
 
 namespace SS_ENGINE_NS {
 
@@ -34,23 +35,53 @@ static constexpr int64_t SESSION_GAP_MS  = 30LL * MINUTE_MS;
 static constexpr int64_t CLICK_WINDOW_MS = 7LL * DAY_MS;
 
 static constexpr uint64_t FALLBACK_BIT = 1ULL << 63;
+static constexpr uint64_t COMP_BIT     = 1ULL << 55; // bits 63..56 == 0, bit 55 == 1 => linked comp_id!
 
-// Anonymous mmap with optional MADV_HUGEPAGE (ONLY on actively-used >= 2 MB slabs/tables!)
+// Anonymous mmap with optional 2MB-aligned MADV_HUGEPAGE (ONLY on actively-used >= 2 MB slabs/tables!)
 static inline void* alloc_mmap(size_t bytes, bool hugepage = false) {
     if (bytes == 0) bytes = 4096;
+#ifdef MADV_HUGEPAGE
+    if (hugepage && bytes >= (2ULL << 20)) {
+        constexpr size_t HP = 2ULL << 20;
+        size_t aligned_bytes = (bytes + HP - 1) & ~(HP - 1);
+        size_t req = aligned_bytes + HP;
+        void* raw = ::mmap(nullptr, req, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (raw == MAP_FAILED) {
+            std::fprintf(stderr, "mmap failed for %zu bytes\n", req);
+            std::abort();
+        }
+        uintptr_t addr = reinterpret_cast<uintptr_t>(raw);
+        uintptr_t aligned = (addr + HP - 1) & ~(HP - 1);
+        size_t head = size_t(aligned - addr);
+        size_t tail = req - head - aligned_bytes;
+        if (head > 0) ::munmap(raw, head);
+        if (tail > 0) ::munmap(reinterpret_cast<void*>(aligned + aligned_bytes), tail);
+        void* p = reinterpret_cast<void*>(aligned);
+        ::madvise(p, aligned_bytes, MADV_HUGEPAGE);
+        return p;
+    }
+#else
+    (void)hugepage;
+#endif
     void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) {
         std::fprintf(stderr, "mmap failed for %zu bytes\n", bytes);
         std::abort();
     }
+    return p;
+}
+
+static inline size_t alloc_mmap_actual_size(size_t bytes, bool hugepage) {
+    if (bytes == 0) return 4096;
 #ifdef MADV_HUGEPAGE
     if (hugepage && bytes >= (2ULL << 20)) {
-        ::madvise(p, bytes, MADV_HUGEPAGE);
+        constexpr size_t HP = 2ULL << 20;
+        return (bytes + HP - 1) & ~(HP - 1);
     }
 #else
     (void)hugepage;
 #endif
-    return p;
+    return (bytes + 4095) & ~size_t(4095);
 }
 
 struct StringArenaPool {
@@ -128,32 +159,28 @@ static SS_ALWAYS_INLINE uint64_t pdep48(uint64_t k) {
 #endif
 }
 
-// Exact 48-bit bijection (odd multipliers mod 2^48 + xor-shifts): mix48(a)==mix48(b) <=> a==b!
+// Exact 48-bit bijection (1-mul + 2 xor-shifts mod 2^48): mix48(a)==mix48(b) <=> a==b!
 static constexpr uint64_t MASK48 = (1ULL << 48) - 1ULL;
 static SS_ALWAYS_INLINE uint64_t mix48(uint64_t x) {
     x ^= x >> 24;
     x = (x * 0xbf58476d1ce5ULL) & MASK48;
-    x ^= x >> 23;
-    x = (x * 0x94d049bb1331ULL) & MASK48;
     x ^= x >> 24;
     return x;
 }
 
-// 100% lossless, branchless 6-bit codec for s[0]==prefix, 2<=len<=9, padded >=8B after s+1.
-// Bijectively maps S = {0x00..0x0F} U {0x30..0x3F} U {0x60..0x7F} -> [0..63] preserving order!
-// Any byte outside S (e.g. uppercase 'A'-'Z', UTF-8) or active 0x00 fails rt==raw8 -> SideEvent!
+// Ultra-fast 4-instruction validator for 2..9 byte IDs starting with `pfx` whose active bytes
+// lie in [0x30..0x3F] U [0x60..0x7F] (covers 100% of base36 '0'-'9','a'-'z'; rejects \0, 'A'-'Z', UTF-8!).
 static SS_ALWAYS_INLINE bool encode_eid48_padded(const char* s, size_t len, uint64_t& out_eid48) {
     if (__builtin_expect((len - 2) <= 7 && s[0] == 'e', 1)) {
         uint64_t raw8;
         std::memcpy(&raw8, s + 1, 8);
         uint64_t mask = (~0ULL) >> ((9 - len) << 3);
         raw8 &= mask;
-        uint64_t x = ((raw8 & 0x4040404040404040ULL) >> 1) | (raw8 & 0x1F1F1F1F1F1F1F1FULL);
-        uint64_t b5 = x & 0x2020202020202020ULL;
-        uint64_t rt = x | (b5 << 1) | ((~b5) & ((x & 0x1010101010101010ULL) << 1));
-        uint64_t check = raw8 | (~mask & 0x0101010101010101ULL);
-        uint64_t has_zero = (check - 0x0101010101010101ULL) & ~check & 0x8080808080808080ULL;
-        if (__builtin_expect((rt == raw8) & (has_zero == 0), 1)) {
+        uint64_t check = raw8 | (~mask & 0x3030303030303030ULL);
+        uint64_t bad = ((check ^ 0x2020202020202020ULL) & 0xA0A0A0A0A0A0A0A0ULL)
+                     | (~(check | (check >> 2)) & 0x1010101010101010ULL);
+        if (__builtin_expect(bad == 0, 1)) {
+            uint64_t x = ((raw8 & 0x4040404040404040ULL) >> 1) | (raw8 & 0x1F1F1F1F1F1F1F1FULL);
             out_eid48 = pext48(x);
             return true;
         }
@@ -167,12 +194,11 @@ static SS_ALWAYS_INLINE bool encode_uid48_padded(const char* s, size_t len, uint
         std::memcpy(&raw8, s + 1, 8);
         uint64_t mask = (~0ULL) >> ((9 - len) << 3);
         raw8 &= mask;
-        uint64_t x = ((raw8 & 0x4040404040404040ULL) >> 1) | (raw8 & 0x1F1F1F1F1F1F1F1FULL);
-        uint64_t b5 = x & 0x2020202020202020ULL;
-        uint64_t rt = x | (b5 << 1) | ((~b5) & ((x & 0x1010101010101010ULL) << 1));
-        uint64_t check = raw8 | (~mask & 0x0101010101010101ULL);
-        uint64_t has_zero = (check - 0x0101010101010101ULL) & ~check & 0x8080808080808080ULL;
-        if (__builtin_expect((rt == raw8) & (has_zero == 0), 1)) {
+        uint64_t check = raw8 | (~mask & 0x3030303030303030ULL);
+        uint64_t bad = ((check ^ 0x2020202020202020ULL) & 0xA0A0A0A0A0A0A0A0ULL)
+                     | (~(check | (check >> 2)) & 0x1010101010101010ULL);
+        if (__builtin_expect(bad == 0, 1)) {
+            uint64_t x = ((raw8 & 0x4040404040404040ULL) >> 1) | (raw8 & 0x1F1F1F1F1F1F1F1FULL);
             out_uid48 = pext48(__builtin_bswap64(x));
             return true;
         }
@@ -180,11 +206,15 @@ static SS_ALWAYS_INLINE bool encode_uid48_padded(const char* s, size_t len, uint
     return false;
 }
 
-static SS_ALWAYS_INLINE uint64_t decode_uid48_to_key64(uint64_t uid48) {
+// Decode uid48 directly into ASCII bytes ('u' + 1..8 chars), returns exact length in 2..9!
+static SS_ALWAYS_INLINE size_t decode_uid48_inline(uint64_t uid48, char* out) {
+    out[0] = 'u';
     uint64_t u = pdep48(uid48);
     uint64_t b5 = u & 0x2020202020202020ULL;
-    uint64_t ascii_be = u | (b5 << 1) | ((~b5) & ((u & 0x1010101010101010ULL) << 1));
-    return (uint64_t('u') << 56) | pext56(ascii_be);
+    uint64_t be = u | (b5 << 1) | ((~b5) & ((u & 0x1010101010101010ULL) << 1));
+    uint64_t le = __builtin_bswap64(be);
+    std::memcpy(out + 1, &le, 8);
+    return be ? (9U - (uint32_t(__builtin_ctzll(be)) >> 3)) : 1U;
 }
 
 static SS_COLD_NOINLINE uint64_t encode_key64_slow(const char* s, size_t len, StringArenaPool& arenas, int tid) {
@@ -223,20 +253,6 @@ static SS_ALWAYS_INLINE uint64_t encode_key64_padded(const char* s, size_t len, 
         uint64_t check = raw8 | (~mask & 0x0101010101010101ULL);
         uint64_t bad = (check & 0x8080808080808080ULL) |
                        ((check - 0x0101010101010101ULL) & ~check & 0x8080808080808080ULL);
-        if (__builtin_expect((bad == 0) & (uint8_t(b0 - 1) < 127), 1)) {
-            return (uint64_t(b0) << 56) | pext56(__builtin_bswap64(raw8));
-        }
-    }
-    return encode_key64_slow(s, len, arenas, tid);
-}
-
-static SS_ALWAYS_INLINE uint64_t encode_key64(const char* s, size_t len, StringArenaPool& arenas, int tid) {
-    if (__builtin_expect(len == 9, 1)) {
-        uint8_t b0 = uint8_t(s[0]);
-        uint64_t raw8;
-        std::memcpy(&raw8, s + 1, 8);
-        uint64_t bad = (raw8 & 0x8080808080808080ULL) |
-                       ((raw8 - 0x0101010101010101ULL) & ~raw8 & 0x8080808080808080ULL);
         if (__builtin_expect((bad == 0) & (uint8_t(b0 - 1) < 127), 1)) {
             return (uint64_t(b0) << 56) | pext56(__builtin_bswap64(raw8));
         }
@@ -292,6 +308,15 @@ static SS_ALWAYS_INLINE uint64_t hash_key64(uint64_t k, const StringArenaPool& a
     return hash_bytes(sv.data(), sv.size());
 }
 
+// Ultra-fast 1-multiply hash for Stage 3 local person hash table (`pht`, 4K-16K slots!)
+static SS_ALWAYS_INLINE size_t hash_pkey_local(uint64_t pk, const StringArenaPool& arenas) {
+    if (__builtin_expect((pk & FALLBACK_BIT) == 0, 1)) {
+        return size_t(((pk ^ (pk >> 9)) * 0x9e3779b97f4a7c15ULL) >> 40);
+    }
+    auto sv = arenas.get_fallback(pk);
+    return size_t(hash_bytes(sv.data(), sv.size()));
+}
+
 static SS_COLD_NOINLINE bool key_eq_fallback(uint64_t a, uint64_t b, const StringArenaPool& arenas) {
     if (((a ^ b) & FALLBACK_BIT) != 0) return false;
     auto sa = arenas.get_fallback(a);
@@ -324,7 +349,7 @@ static SS_ALWAYS_INLINE bool key_less(uint64_t a, uint64_t b, const StringArenaP
 }
 
 // ============================================================================
-// Calendar + 4 KB L1D FastDay[256] LUT + 64-bit SWAR Timestamp Parsers (F1, F2, F3)
+// Calendar + 4 KB L1D FastDay[256] LUT + 64-bit SWAR Timestamp Parsers
 // ============================================================================
 static inline bool is_leap_year(int64_t y) {
     return (y % 4 == 0) && ((y % 100 != 0) || (y % 400 == 0));
@@ -372,13 +397,11 @@ static SS_ALWAYS_INLINE bool parse_4d(const char* p, int& out) {
     return true;
 }
 
-// 16-byte L1D-hot calendar entry: maps unique (month%4, D0, D1) -> exact day_rel_sec!
-// Covers up to 4 consecutive months (~120 days) with ZERO month-boundary branch mispredicts!
 struct FastDay {
-    uint64_t ym;       // "YYYY-MM-" (0 = empty, ~0ULL = collided -> fallback)
-    uint16_t dd16;     // "DD"
+    uint64_t ym;
+    uint16_t dd16;
     uint16_t _pad;
-    int32_t  rel_sec;  // day_sec - win_start_sec
+    int32_t  rel_sec;
 };
 
 struct DateLut {
@@ -408,7 +431,6 @@ struct DateLut {
             }
         }
         for (auto& e : days) { e.ym = 0; e.dd16 = 0; e._pad = 0; e.rel_sec = INT32_MIN; }
-        // Only populate fast_days if the span fits inside int32_t relative seconds (<= 110 days)
         if (d_end - d_start <= 110) {
             for (int64_t d = d_start; d <= d_end; ++d) {
                 int y, m, dy;
@@ -434,7 +456,7 @@ struct DateLut {
                 if (days[idx].ym == 0) {
                     days[idx] = {ym, dd16, 0, int32_t(rel)};
                 } else {
-                    days[idx].ym = ~0ULL; // mark collision -> always fall back safely!
+                    days[idx].ym = ~0ULL;
                 }
             }
         }
@@ -464,7 +486,6 @@ struct DateLut {
         return true;
     }
 
-    // 100% strictly validated 64-bit SWAR THH:MM:SS parser (ZERO SIMD cross-domain penalty!)
     static SS_ALWAYS_INLINE bool parse_hms_swar(const char* s, uint32_t& out_hms) {
         if (__builtin_expect(s[10] != 'T', 0)) return false;
         uint64_t w;
@@ -480,6 +501,32 @@ struct DateLut {
         uint32_t mm = uint32_t((p >> 24) & 0xFFU);
         uint32_t ss = uint32_t((p >> 48) & 0xFFU);
         out_hms = hh * 3600U + mm * 60U + ss;
+        return true;
+    }
+
+    // Trusted F1 parser for ingest_ts (rules.md: "ingest_ts is always valid F1") - 8 insns!
+    SS_ALWAYS_INLINE bool parse_ingest_f1_rel_sec_day(
+        const char* s, int64_t& out_rel_sec, uint64_t& out_ym, uint16_t& out_dd16, int64_t& out_day_rel
+    ) const {
+        uint64_t w;
+        std::memcpy(&w, s + 11, 8);
+        uint64_t d = w - 0x30303A30303A3030ULL;
+        uint64_t p = d * 10ULL + (d >> 8);
+        uint32_t hms = uint32_t(p & 0xFFU) * 3600U + uint32_t((p >> 24) & 0xFFU) * 60U + uint32_t((p >> 48) & 0xFFU);
+        uint64_t ym; uint16_t dd16;
+        std::memcpy(&ym, s, 8);
+        std::memcpy(&dd16, s + 8, 2);
+        out_ym = ym;
+        out_dd16 = dd16;
+        uint32_t idx = (((uint32_t(ym >> 48)) & 3U) << 6) | ((uint32_t(dd16) & 3U) << 4) | ((uint32_t(dd16 >> 8)) & 15U);
+        const FastDay& fd = days[idx];
+        if (__builtin_expect((fd.ym == ym) & (fd.dd16 == dd16), 1)) {
+            out_day_rel = int64_t(fd.rel_sec);
+            out_rel_sec = out_day_rel + int64_t(hms);
+            return true;
+        }
+        if (!parse_date_rel_slow(s, out_day_rel)) return false;
+        out_rel_sec = out_day_rel + int64_t(hms);
         return true;
     }
 
@@ -501,7 +548,30 @@ struct DateLut {
         return true;
     }
 
-    // Parse 25-byte F2 ("YYYY-MM-DDTHH:MM:SS±HH:MM") relative to win_start_sec
+    SS_ALWAYS_INLINE bool parse_iso19_rel_sec_reuse(
+        const char* s, uint64_t cached_ym, uint16_t cached_dd16, int64_t cached_day_rel, int64_t& out_rel_sec
+    ) const {
+        uint32_t hms;
+        if (__builtin_expect(!parse_hms_swar(s, hms), 0)) return false;
+        uint64_t ym; uint16_t dd16;
+        std::memcpy(&ym, s, 8);
+        std::memcpy(&dd16, s + 8, 2);
+        if (__builtin_expect((ym == cached_ym) & (dd16 == cached_dd16), 1)) {
+            out_rel_sec = cached_day_rel + int64_t(hms);
+            return true;
+        }
+        uint32_t idx = (((uint32_t(ym >> 48)) & 3U) << 6) | ((uint32_t(dd16) & 3U) << 4) | ((uint32_t(dd16 >> 8)) & 15U);
+        const FastDay& fd = days[idx];
+        if (__builtin_expect((fd.ym == ym) & (fd.dd16 == dd16), 1)) {
+            out_rel_sec = int64_t(fd.rel_sec) + int64_t(hms);
+            return true;
+        }
+        int64_t day_rel;
+        if (!parse_date_rel_slow(s, day_rel)) return false;
+        out_rel_sec = day_rel + int64_t(hms);
+        return true;
+    }
+
     SS_ALWAYS_INLINE bool parse_f2_rel_sec(const char* s, int64_t& out_rel_sec) const {
         if (__builtin_expect(((s[19] != '+') & (s[19] != '-')) | (s[22] != ':'), 0)) return false;
         int64_t rel_s;
@@ -514,26 +584,23 @@ struct DateLut {
     }
 };
 
-// Branchless 13-digit SWAR parser (2 unaligned 64-bit loads strictly inside 13B!)
-static SS_ALWAYS_INLINE bool parse_13d_swar(const char* s, int64_t& out_ms) {
+// Zero-division 13-digit SWAR parser returning (sec, ms_rem) directly!
+static SS_ALWAYS_INLINE bool parse_13d_sec_ms(const char* s, int64_t& out_sec, uint32_t& out_ms_rem) {
     uint64_t v0, w;
     std::memcpy(&v0, s, 8);
     std::memcpy(&w, s + 5, 8);
-    uint64_t bad0 = ((v0 & 0xF0F0F0F0F0F0F0F0ULL) ^ 0x3030303030303030ULL) |
-                    (((v0 + 0x0606060606060606ULL) & 0xF0F0F0F0F0F0F0F0ULL) ^ 0x3030303030303030ULL);
-    uint64_t bad1 = ((w & 0xF0F0F0F0F0F0F0F0ULL) ^ 0x3030303030303030ULL) |
-                    (((w + 0x0606060606060606ULL) & 0xF0F0F0F0F0F0F0F0ULL) ^ 0x3030303030303030ULL);
-    if (__builtin_expect((bad0 | bad1) != 0, 0)) return false;
+    uint64_t bad = ((v0 & 0xF0F0F0F0F0F0F0F0ULL) ^ 0x3030303030303030ULL) |
+                   (((v0 + 0x0606060606060606ULL) & 0xF0F0F0F0F0F0F0F0ULL) ^ 0x3030303030303030ULL) |
+                   ((w & 0xF0F0F0F0F0F0F0F0ULL) ^ 0x3030303030303030ULL) |
+                   (((w + 0x0606060606060606ULL) & 0xF0F0F0F0F0F0F0F0ULL) ^ 0x3030303030303030ULL);
+    if (__builtin_expect(bad != 0, 0)) return false;
     v0 &= 0x0F0F0F0F0F0F0F0FULL;
     v0 = (v0 * 10 + (v0 >> 8)) & 0x00FF00FF00FF00FFULL;
     v0 = (v0 * 100 + (v0 >> 16)) & 0x0000FFFF0000FFFFULL;
     uint64_t hi8 = (v0 * 10000 + (v0 >> 32)) & 0xFFFFFFFFULL;
-
-    uint64_t lo = w & 0x0F0F0F0F0F000000ULL;
-    lo = (lo * 10 + (lo >> 8)) & 0x00FF00FF00FF00FFULL;
-    lo = (lo * 100 + (lo >> 16)) & 0x0000FFFF0000FFFFULL;
-    uint64_t lo5 = (lo * 10000 + (lo >> 32)) & 0xFFFFFFFFULL;
-    out_ms = int64_t(hi8 * 100000ULL + lo5);
+    uint64_t lo = (w >> 24) & 0x0F0F0F0F0FULL;
+    out_sec = int64_t(hi8 * 100ULL + uint32_t(lo & 0xFU) * 10U + uint32_t((lo >> 8) & 0xFU));
+    out_ms_rem = uint32_t((lo >> 16) & 0xFU) * 100U + uint32_t((lo >> 24) & 0xFU) * 10U + uint32_t(lo >> 32);
     return true;
 }
 
@@ -544,7 +611,7 @@ static SS_COLD_NOINLINE bool parse_ts_slow(const char* s, size_t len, int64_t& o
         out_ms = (lut.win_start_sec + rel_s) * 1000LL;
         return true;
     }
-    if (len == 25) {
+    if (len == 25 && (s[19] == '+' || s[19] == '-')) {
         int64_t rel_s;
         if (!lut.parse_f2_rel_sec(s, rel_s)) return false;
         out_ms = (lut.win_start_sec + rel_s) * 1000LL;
@@ -574,9 +641,12 @@ static SS_ALWAYS_INLINE bool parse_ts(const char* s, size_t len, int64_t& out_ms
         return true;
     }
     if (__builtin_expect(len == 13, 1)) {
-        return parse_13d_swar(s, out_ms);
+        int64_t sec; uint32_t msr;
+        if (__builtin_expect(!parse_13d_sec_ms(s, sec, msr), 0)) return false;
+        out_ms = sec * 1000LL + int64_t(msr);
+        return true;
     }
-    if (__builtin_expect(len == 25, 1)) {
+    if (__builtin_expect(len == 25 && (s[19] == '+' || s[19] == '-'), 1)) {
         int64_t rel_s;
         if (__builtin_expect(!lut.parse_f2_rel_sec(s, rel_s), 0)) return false;
         out_ms = (lut.win_start_sec + rel_s) * 1000LL;
@@ -600,7 +670,7 @@ static SS_ALWAYS_INLINE bool parse_price_cents(const char* s, size_t len, uint32
 }
 
 // ============================================================================
-// Multi-ISA 64-Byte SIMD Primitives + Shifted-Remainder 6-tzcnt CSV Extractors
+// Multi-ISA 256-bit AVX-512VL / AVX2 / NEON Vec64 + CLMUL Zero-Load CSV Extractors
 // ============================================================================
 struct Slice {
     const char* ptr;
@@ -647,12 +717,32 @@ static SS_COLD_NOINLINE bool parse_csv_line_scalar(const char* line, const char*
     return true;
 }
 
-#if defined(__AVX512BW__)
+static SS_ALWAYS_INLINE uint64_t prefix_xor(uint64_t q) {
+#if defined(__PCLMUL__)
+    return uint64_t(_mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_set_epi64x(0, q), _mm_set1_epi8(-1), 0)));
+#elif defined(__aarch64__) && defined(__ARM_FEATURE_CRYPTO)
+    return uint64_t(vmull_p64(q, ~0ULL));
+#else
+    q ^= q << 1; q ^= q << 2; q ^= q << 4; q ^= q << 8; q ^= q << 16; q ^= q << 32;
+    return q;
+#endif
+}
+
+// 256-bit AVX-512VL Vec64: uses 1-cycle %k opmask compares with ZERO 512-bit ZMM downclocking on Cascade Lake!
+#if defined(__AVX512BW__) && defined(__AVX512VL__)
 struct Vec64 {
-    __m512i v;
-    static SS_ALWAYS_INLINE Vec64 load(const char* p) { return {_mm512_loadu_si512(p)}; }
+    __m256i v0, v1;
+    static SS_ALWAYS_INLINE Vec64 load(const char* p) {
+        return {
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32))
+        };
+    }
     SS_ALWAYS_INLINE uint64_t eq(char ch) const {
-        return uint64_t(_mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(ch)));
+        __m256i vc = _mm256_set1_epi8(ch);
+        uint64_t m0 = uint32_t(_mm256_cmpeq_epi8_mask(v0, vc));
+        uint64_t m1 = uint32_t(_mm256_cmpeq_epi8_mask(v1, vc));
+        return m0 | (m1 << 32);
     }
 };
 #elif defined(__AVX2__)
@@ -715,8 +805,8 @@ struct Vec64 {
 };
 #endif
 
-// Ultra-fast 6-tzcnt shifted-remainder extractor for 7-field events with L in [64, 127].
-// Zero 12-iter loop, zero ends[] array, zero s<64/e<64 ternaries, zero lm128!
+// CLMUL-validated 6-tzcnt zero-load extractor for 7-field events with L in [65, 127].
+// ZERO byte loads for quote checking (100% in registers via PCLMULQDQ + bit shifts)!
 static SS_ALWAYS_INLINE bool extract7_hi64(
     const char* line, uint32_t L,
     uint64_t cm0, uint64_t cm1,
@@ -736,6 +826,9 @@ static SS_ALWAYS_INLINE bool extract7_hi64(
     uint64_t en1 = (cm1 >> 1) | (1ULL << (L - 65U));
     uint64_t qbad = (qm0 & ~(st0 | en0)) | (qm1 & ~(st1 | en1)) |
                     (qm0 & st0 & en0) | (qm1 & st1 & en1);
+    uint64_t iq0 = prefix_xor(qm0);
+    uint64_t iq1 = prefix_xor(qm1) ^ uint64_t(-int64_t(iq0 >> 63));
+    qbad |= (iq0 & cm0) | (iq1 & cm1) | (iq1 >> 63);
     if (__builtin_expect(qbad != 0, 0)) return false;
 
     if (__builtin_expect(k0 < 3U, 0)) return parse_csv_line_scalar<7>(line, line + L, out);
@@ -748,35 +841,34 @@ static SS_ALWAYS_INLINE bool extract7_hi64(
     if (__builtin_expect((s3 >= 64U) | (L - s3 >= 64U), 0)) {
         return parse_csv_line_scalar<7>(line, line + L, out);
     }
-    // Single 64-bit register holds ALL remaining 3 commas (e3, e4, e5)!
-    uint64_t crem = (a >> s3) | (cm1 << (64U - s3));
-    uint32_t e3 = s3 + uint32_t(__builtin_ctzll(crem)); crem &= crem - 1;
-    uint32_t e4 = s3 + uint32_t(__builtin_ctzll(crem)); crem &= crem - 1;
-    uint32_t e5 = s3 + uint32_t(__builtin_ctzll(crem));
+    if (__builtin_expect(e0 == 0, 0)) return false;
 
-    if (__builtin_expect(e0 == 0, 0)) return false; // empty event_id -> dropped!
-    uint32_t qs0 = (line[0] == '"'),       qe0 = (line[e0 - 1] == '"');
-    uint32_t qs1 = (line[e0 + 1] == '"'),  qe1 = (line[e1 - 1] == '"');
-    uint32_t qs2 = (line[e1 + 1] == '"'),  qe2 = (line[e2 - 1] == '"');
-    uint32_t qs3 = (line[s3] == '"'),      qe3 = (line[e3 - 1] == '"');
-    uint32_t qs4 = (line[e3 + 1] == '"'),  qe4 = (line[e4 - 1] == '"');
-    uint32_t qs5 = (line[e4 + 1] == '"'),  qe5 = (line[e5 - 1] == '"');
-    uint32_t qs6 = (line[e5 + 1] == '"'),  qe6 = (line[L - 1] == '"');
-    uint32_t mis = (qs0 ^ qe0) | (qs1 ^ qe1) | (qs2 ^ qe2) | (qs3 ^ qe3) |
-                   (qs4 ^ qe4) | (qs5 ^ qe5) | (qs6 ^ qe6);
-    if (__builtin_expect(mis != 0, 0)) return false;
+    uint32_t rsh3 = 64U - s3;
+    uint64_t crem = (a >> s3) | (cm1 << rsh3);
+    uint64_t qrem = (qm0 >> s3) | (qm1 << rsh3);
+    uint32_t r3 = uint32_t(__builtin_ctzll(crem)); crem &= crem - 1;
+    uint32_t r4 = uint32_t(__builtin_ctzll(crem)); crem &= crem - 1;
+    uint32_t r5 = uint32_t(__builtin_ctzll(crem));
 
-    out[0] = {line + qs0,          size_t(e0 - (qs0 << 1))};
-    out[1] = {line + e0 + 1 + qs1, size_t((e1 - e0 - 1) - (qs1 << 1))};
-    out[2] = {line + e1 + 1 + qs2, size_t((e2 - e1 - 1) - (qs2 << 1))};
-    out[3] = {line + s3 + qs3,     size_t((e3 - s3) - (qs3 << 1))};
-    out[4] = {line + e3 + 1 + qs4, size_t((e4 - e3 - 1) - (qs4 << 1))};
-    out[5] = {line + e4 + 1 + qs5, size_t((e5 - e4 - 1) - (qs5 << 1))};
-    out[6] = {line + e5 + 1 + qs6, size_t((L - e5 - 1) - (qs6 << 1))};
+    uint32_t qs0 = uint32_t(qm0 & 1ULL);
+    uint32_t qs1 = uint32_t((qm0 >> (e0 + 1U)) & 1ULL);
+    uint32_t qs2 = uint32_t((qm0 >> (e1 + 1U)) & 1ULL);
+    uint32_t qs3 = uint32_t(qrem & 1ULL);
+    uint32_t qs4 = uint32_t((qrem >> (r3 + 1U)) & 1ULL);
+    uint32_t qs5 = uint32_t((qrem >> (r4 + 1U)) & 1ULL);
+    uint32_t qs6 = uint32_t((qrem >> (r5 + 1U)) & 1ULL);
+
+    out[0] = {line + qs0,                size_t(e0 - (qs0 << 1))};
+    out[1] = {line + e0 + 1 + qs1,       size_t((e1 - e0 - 1) - (qs1 << 1))};
+    out[2] = {line + e1 + 1 + qs2,       size_t((e2 - e1 - 1) - (qs2 << 1))};
+    out[3] = {line + s3 + qs3,           size_t(r3 - (qs3 << 1))};
+    out[4] = {line + s3 + r3 + 1 + qs4,  size_t((r4 - r3 - 1) - (qs4 << 1))};
+    out[5] = {line + s3 + r4 + 1 + qs5,  size_t((r5 - r4 - 1) - (qs5 << 1))};
+    out[6] = {line + s3 + r5 + 1 + qs6,  size_t((L - s3 - r5 - 1) - (qs6 << 1))};
     return true;
 }
 
-// Single-word 64-bit extractor for clicks (N=4) and links (N=2) when L in [1, 63]!
+// CLMUL-validated single-word 64-bit extractor for clicks (N=4) and links (N=2) when L in [1, 63]!
 template <int N>
 static SS_ALWAYS_INLINE bool extract_short64(
     const char* line, uint32_t L,
@@ -789,14 +881,15 @@ static SS_ALWAYS_INLINE bool extract_short64(
     if (__builtin_expect(uint32_t(__builtin_popcountll(cm0)) != uint32_t(N - 1), 0)) return false;
     uint64_t st0 = 1ULL | (cm0 << 1);
     uint64_t en0 = (cm0 >> 1) | (1ULL << (L - 1U));
-    if (__builtin_expect(((qm0 & ~(st0 | en0)) | (qm0 & st0 & en0)) != 0, 0)) return false;
+    uint64_t iq0 = prefix_xor(qm0);
+    uint64_t qbad = (qm0 & ~(st0 | en0)) | (qm0 & st0 & en0) | (iq0 & cm0) | (iq0 >> 63);
+    if (__builtin_expect(qbad != 0, 0)) return false;
 
     if constexpr (N == 2) {
         uint32_t e0 = uint32_t(__builtin_ctzll(cm0));
         if (__builtin_expect(e0 == 0 || e0 + 1 == L, 0)) return false;
-        uint32_t qs0 = (line[0] == '"'),      qe0 = (line[e0 - 1] == '"');
-        uint32_t qs1 = (line[e0 + 1] == '"'), qe1 = (line[L - 1] == '"');
-        if (__builtin_expect(((qs0 ^ qe0) | (qs1 ^ qe1)) != 0, 0)) return false;
+        uint32_t qs0 = uint32_t(qm0 & 1ULL);
+        uint32_t qs1 = uint32_t((qm0 >> (e0 + 1U)) & 1ULL);
         out[0] = {line + qs0,          size_t(e0 - (qs0 << 1))};
         out[1] = {line + e0 + 1 + qs1, size_t((L - e0 - 1) - (qs1 << 1))};
         return true;
@@ -806,12 +899,10 @@ static SS_ALWAYS_INLINE bool extract_short64(
         uint32_t e1 = uint32_t(__builtin_ctzll(a)); a &= a - 1;
         uint32_t e2 = uint32_t(__builtin_ctzll(a));
         if (__builtin_expect(e0 == 0, 0)) return false;
-        uint32_t qs0 = (line[0] == '"'),      qe0 = (line[e0 - 1] == '"');
-        uint32_t qs1 = (line[e0 + 1] == '"'), qe1 = (line[e1 - 1] == '"');
-        uint32_t qs2 = (line[e1 + 1] == '"'), qe2 = (line[e2 - 1] == '"');
-        uint32_t qs3 = (line[e2 + 1] == '"'), qe3 = (line[L - 1] == '"');
-        uint32_t mis = (qs0 ^ qe0) | (qs1 ^ qe1) | (qs2 ^ qe2) | (qs3 ^ qe3);
-        if (__builtin_expect(mis != 0, 0)) return false;
+        uint32_t qs0 = uint32_t(qm0 & 1ULL);
+        uint32_t qs1 = uint32_t((qm0 >> (e0 + 1U)) & 1ULL);
+        uint32_t qs2 = uint32_t((qm0 >> (e1 + 1U)) & 1ULL);
+        uint32_t qs3 = uint32_t((qm0 >> (e2 + 1U)) & 1ULL);
         out[0] = {line + qs0,          size_t(e0 - (qs0 << 1))};
         out[1] = {line + e0 + 1 + qs1, size_t((e1 - e0 - 1) - (qs1 << 1))};
         out[2] = {line + e1 + 1 + qs2, size_t((e2 - e1 - 1) - (qs2 << 1))};
@@ -823,7 +914,7 @@ static SS_ALWAYS_INLINE bool extract_short64(
 }
 
 static SS_ALWAYS_INLINE const char* find_nl_simd(const char* p, const char* end) {
-    while (p + 64 <= end) {
+    while (size_t(end - p) >= 64) {
         uint64_t m = Vec64::load(p).eq('\n');
         if (m) return p + __builtin_ctzll(m);
         p += 64;
@@ -840,26 +931,6 @@ static SS_ALWAYS_INLINE int32_t ms_to_day(int64_t ms) {
     int64_t r = ms % DAY_MS;
     if (r < 0) --q;
     return int32_t(q);
-}
-
-// Fast 64-byte AVX2 non-temporal copy (no ZMM turbo throttle!)
-static SS_ALWAYS_INLINE void stream_copy_64b_aligned(void* dst, const void* src, size_t bytes) {
-#if defined(__AVX2__)
-    const char* s = static_cast<const char*>(src);
-    char* d = static_cast<char*>(dst);
-    for (size_t off = 0; off < bytes; off += 32) {
-        __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + off));
-        _mm256_stream_si256(reinterpret_cast<__m256i*>(d + off), v);
-    }
-#else
-    std::memcpy(dst, src, bytes);
-#endif
-}
-
-static SS_ALWAYS_INLINE void stream_fence() {
-#if defined(__AVX2__)
-    _mm_sfence();
-#endif
 }
 
 } // namespace SS_ENGINE_NS
