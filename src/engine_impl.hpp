@@ -466,7 +466,7 @@ static void build_csv_tasks(
 }
 
 struct ReadBuf {
-    static constexpr size_t READ_CHUNK = 262144;
+    static constexpr size_t READ_CHUNK = 131072; // 128 KiB: stays 100% L2-hot per HT on Cascade Lake!
     char* data = nullptr;
     size_t cap = 0;
 
@@ -984,8 +984,9 @@ static SS_NOINLINE void scan_pread_csv_rows(const CsvTask& task, ReadBuf& rbuf, 
     while (true) {
         if (file_pos >= fsz) break;
         size_t bound = hit_limit ? fsz : std::min<size_t>(fsz, limit + 4096);
+        size_t chunk_sz = (first_read && task.start > 0) ? (ReadBuf::READ_CHUNK + 1) : ReadBuf::READ_CHUNK;
         size_t to_read = hit_limit ? std::min<size_t>(4096, fsz - file_pos)
-                                   : std::min<size_t>(ReadBuf::READ_CHUNK, bound > file_pos ? (bound - file_pos) : std::min<size_t>(4096, fsz - file_pos));
+                                   : std::min<size_t>(chunk_sz, bound > file_pos ? (bound - file_pos) : std::min<size_t>(4096, fsz - file_pos));
         if (__builtin_expect(carry + to_read + 128 > rbuf.cap, 0)) {
             rbuf.ensure(carry + to_read + 128);
         }
@@ -2989,74 +2990,88 @@ static SS_COLD_NOINLINE void emit_clk_direct_gen_cold(
     clk_out.push(pb, CompactClick{cid, (uint64_t(pid >> PERSON_SHIFT) << 44) | ts_camp44});
 }
 
-static SS_COLD_NOINLINE bool parse_purchase_cold(
+struct PurRes {
+    uint32_t price;
+    uint32_t cat_id;
+    bool ok;
+};
+
+static SS_COLD_NOINLINE PurRes parse_purchase_cold(
     const char* price_ptr, size_t price_len,
     const char* prod_ptr, size_t prod_len,
-    const Products& products,
-    uint32_t& out_price, uint32_t& out_cat_id
+    const Products& products
 ) {
-    if (!parse_price_cents(price_ptr, price_len, out_price)) return false;
-    out_cat_id = products.lookup(prod_ptr, prod_len);
-    return true;
+    uint32_t pr = 0;
+    if (!parse_price_cents(price_ptr, price_len, pr)) return {0U, 0U, false};
+    return {pr, products.lookup(prod_ptr, prod_len), true};
 }
 
-static SS_NOINLINE void encode_long_eid_slow(
+struct LongEidRes {
+    uint64_t elo;
+    uint64_t ehi;
+    uint64_t k64;
+    uint64_t rem39;
+    uint32_t eb;
+    bool is_long32;
+};
+
+static SS_NOINLINE LongEidRes encode_long_eid_slow(
     const char* s, size_t len, bool use_long_ev32, bool ing_whole_sec,
     uint32_t seg_id, const char* seg_base,
-    StringArenaPool& arenas, int tid, UserDict& dict,
-    bool& out_is_long32, uint64_t& out_elo, uint64_t& out_ehi,
-    uint64_t& out_k64, uint32_t& out_eb, uint64_t& out_rem39
+    StringArenaPool& arenas, int tid, UserDict& dict
 ) {
     uint64_t elo = 0, ehi = 0;
     if (__builtin_expect(use_long_ev32 && encode_ehex128(s, len, elo, ehi), 1)) {
         if (__builtin_expect(!ing_whole_sec, 0)) {
             dict.dict_overflow.store(true, std::memory_order_relaxed);
-            out_is_long32 = false;
-            out_k64 = 0; out_eb = 0; out_rem39 = 0;
-            return;
+            return {0ULL, 0ULL, 0ULL, 0ULL, 0U, false};
         }
         uint64_t h = hash_uhex128(elo, ehi);
-        out_is_long32 = true;
-        out_elo = elo;
-        out_ehi = ehi;
-        out_eb = uint32_t(h >> (64 - EV_SHIFT));
-        return;
+        return {elo, ehi, 0ULL, 0ULL, uint32_t(h >> (64 - EV_SHIFT)), true};
     }
-    out_is_long32 = false;
     uint64_t k64 = encode_keyref_padded(s, len, seg_id, seg_base, arenas, tid);
     uint64_t h64 = ((k64 & FALLBACK_BIT) == 0) ? mix64(k64) : hash_bytes(s, len);
-    out_k64 = k64;
-    out_eb = uint32_t(h64 >> 55);
-    out_rem39 = h64 & RawEvent16::REM39_MASK;
+    return {0ULL, 0ULL, k64, h64 & RawEvent16::REM39_MASK, uint32_t(h64 >> 55), false};
 }
 
-static SS_COLD_NOINLINE bool parse_ingest_slow_ev(
-    const char* s, size_t len, const DateLut& lut, int64_t win_start_sec,
-    int64_t& ing_ms, bool& ing_whole_sec, int64_t& ing_rel_sec
+struct IngSlowRes {
+    int64_t ing_ms;
+    int64_t ing_rel_sec;
+    bool ok;
+    bool whole_sec;
+};
+
+static SS_COLD_NOINLINE IngSlowRes parse_ingest_slow_ev(
+    const char* s, size_t len, const DateLut& lut, int64_t win_start_sec
 ) {
-    if (!parse_ts(s, len, ing_ms, lut)) return false;
-    ing_whole_sec = (ing_ms % 1000LL == 0);
-    ing_rel_sec = ing_ms / 1000LL - win_start_sec;
-    return true;
+    int64_t ims = 0;
+    if (!parse_ts(s, len, ims, lut)) return {0LL, 0LL, false, false};
+    return {ims, ims / 1000LL - win_start_sec, true, (ims % 1000LL == 0)};
 }
 
-static SS_COLD_NOINLINE bool check_ts_slow_ev(
+struct TsCheckSlowRes {
+    int64_t ing_ms;
+    int64_t ts_ms;
+    bool ok;
+    bool from_sec;
+};
+
+static SS_COLD_NOINLINE TsCheckSlowRes check_ts_slow_ev(
     const char* s, size_t len, const DateLut& lut,
     bool ts_ok, bool ts_from_sec, bool ing_whole_sec,
     int64_t win_start_sec, int64_t win_start_ms, int64_t win_dur_ms,
     int64_t ts_rel_sec, uint32_t ts_ms_rem, int64_t ing_rel_sec,
-    int64_t& ing_ms, int64_t& ts_ms, bool& out_ts_from_sec
+    int64_t ing_ms, int64_t ts_ms
 ) {
     if (!ts_ok) {
         ts_ok = parse_ts_slow(s, len, ts_ms, lut);
         ts_from_sec = false;
     }
-    out_ts_from_sec = ts_from_sec;
-    if (!ts_ok) return false;
+    if (!ts_ok) return {ing_ms, ts_ms, false, ts_from_sec};
     if (ts_from_sec) ts_ms = (win_start_sec + ts_rel_sec) * 1000LL + int64_t(ts_ms_rem);
     if (ing_whole_sec) ing_ms = (win_start_sec + ing_rel_sec) * 1000LL;
-    if (uint64_t(ts_ms - win_start_ms) >= uint64_t(win_dur_ms) || ing_ms - ts_ms > DAY_MS) return false;
-    return true;
+    bool ok = !(uint64_t(ts_ms - win_start_ms) >= uint64_t(win_dur_ms) || ing_ms - ts_ms > DAY_MS);
+    return {ing_ms, ts_ms, ok, ts_from_sec};
 }
 
 static SS_COLD_NOINLINE void push_invalid_ev_cold(
@@ -3237,11 +3252,9 @@ static SS_NOINLINE void process_event_task_fast(
     uint32_t& tl_cur, uint32_t& tl_end,
     uint32_t& g_cur,  uint32_t& g_end
 ) {
-    uint32_t view_u32, cart_u32;
-    uint64_t pur_u64;
-    std::memcpy(&view_u32, "view", 4);
-    std::memcpy(&cart_u32, "cart", 4);
-    std::memcpy(&pur_u64, "purchase", 8);
+    static constexpr uint32_t VIEW_U32 = 0x77656976U; // "view" LE
+    static constexpr uint32_t CART_U32 = 0x74726163U; // "cart" LE
+    static constexpr uint64_t PUR_U64  = 0x6573616863727570ULL; // "purchase" LE
 
     const uint32_t seg_id = task.file->seg_id;
     const char* seg_base = task.file->map_base;
@@ -3251,7 +3264,7 @@ static SS_NOINLINE void process_event_task_fast(
         Slice f0 = row.template get<0>();
         if (__builtin_expect(f0.len == 0, 0)) return;
 
-        // 1. Parse ingest_ts lazily + cache 10-byte YYYY-MM-DD for same-day F1 ts reuse!
+        // 1. Parse ingest_ts lazily (zero stack-escaping out-params!)
         Slice f3 = row.template get<3>();
         int64_t ing_rel_sec = 0;
         int64_t ing_ms = 0;
@@ -3262,10 +3275,14 @@ static SS_NOINLINE void process_event_task_fast(
         if (__builtin_expect(f3.len == 20 && f3.ptr[19] == 'Z', 1)) {
             if (__builtin_expect(!lut.parse_ingest_f1_rel_sec_day(f3.ptr, ing_rel_sec, ing_ym, ing_dd16, ing_day_rel), 0)) return;
         } else {
-            if (!parse_ingest_slow_ev(f3.ptr, f3.len, lut, win_start_sec, ing_ms, ing_whole_sec, ing_rel_sec)) return;
+            auto ir = parse_ingest_slow_ev(f3.ptr, f3.len, lut, win_start_sec);
+            if (!ir.ok) return;
+            ing_ms = ir.ing_ms;
+            ing_rel_sec = ir.ing_rel_sec;
+            ing_whole_sec = ir.whole_sec;
         }
 
-        // 2. Encode event_id -> 48b bijection (short) OR direct 128b LongEv32 / general fallback!
+        // 2. Encode event_id -> 48b bijection (short) OR direct 128b LongEv32 / general fallback (by-value return!)
         uint64_t eid48 = 0, eid_k64 = 0, rem39 = 0, elo = 0, ehi = 0;
         uint32_t eb = 0;
         bool is_long32 = false;
@@ -3275,8 +3292,10 @@ static SS_NOINLINE void process_event_task_fast(
             eb = uint32_t(h48 >> 39);
             rem39 = h48 & RawEvent16::REM39_MASK;
         } else {
-            encode_long_eid_slow(f0.ptr, f0.len, use_long_ev32, ing_whole_sec, seg_id, seg_base,
-                                 arenas, tid, dict, is_long32, elo, ehi, eid_k64, eb, rem39);
+            auto lr = encode_long_eid_slow(f0.ptr, f0.len, use_long_ev32, ing_whole_sec, seg_id, seg_base,
+                                           arenas, tid, dict);
+            is_long32 = lr.is_long32;
+            elo = lr.elo; ehi = lr.ehi; eid_k64 = lr.k64; eb = lr.eb; rem39 = lr.rem39;
             eid_in_side = !is_long32;
         }
 
@@ -3286,16 +3305,16 @@ static SS_NOINLINE void process_event_task_fast(
             if (__builtin_expect(ir > 0 && ir <= RawEvent16::ING_MAX, 1)) irel21 = uint32_t(ir);
         }
 
-        // 3. Lazy event_type (single 8B load!) + zero-unpack non-empty user_id/product_id check
+        // 3. Lazy event_type (immediate constants, zero stack loads!) + zero-unpack non-empty check
         Slice f4 = row.template get<4>();
         uint64_t v8 = 0;
         std::memcpy(&v8, f4.ptr, 8);
         uint32_t v4 = uint32_t(v8);
-        bool is_vc = (f4.len == 4) & ((v4 == view_u32) | (v4 == cart_u32));
-        bool is_pur = (f4.len == 8) & (v8 == pur_u64);
+        bool is_vc = (f4.len == 4) & ((v4 == VIEW_U32) | (v4 == CART_U32));
+        bool is_pur = (f4.len == 8) & (v8 == PUR_U64);
         bool ok = row.template nonempty<1>() & row.template nonempty<5>() & (is_vc | is_pur);
 
-        // 4. Format-selected fast F1 (58%, same-day reuse!) / F3 (32%, 13d SWAR!) / out-of-line F2 (10%)!
+        // 4. Format-selected fast F1 / F3 + by-value out-of-line F2 (zero stack-escaping out-params!)
         int64_t ts_rel_sec = 0;
         int64_t ts_ms = 0;
         uint32_t ts_ms_rem = 0;
@@ -3310,7 +3329,11 @@ static SS_NOINLINE void process_event_task_fast(
                 ts_ok = parse_13d_sec_ms(f2.ptr, f3_sec, ts_ms_rem);
                 ts_rel_sec = f3_sec - win_start_sec;
             } else {
-                ts_ok = parse_ts_f2_or_slow_rel(f2.ptr, f2.len, lut, ts_rel_sec, ts_ms, ts_from_sec);
+                auto fr = parse_ts_f2_or_slow_rel(f2.ptr, f2.len, lut);
+                ts_ok = fr.ok;
+                ts_rel_sec = fr.rel_sec;
+                ts_ms = fr.ms;
+                ts_from_sec = fr.from_sec;
             }
             if (__builtin_expect(ts_ok & ts_from_sec & ing_whole_sec, 1)) {
                 if (__builtin_expect(uint64_t(ts_rel_sec) >= uint64_t(win_dur_sec) ||
@@ -3318,20 +3341,27 @@ static SS_NOINLINE void process_event_task_fast(
                     ok = false;
                 }
             } else {
-                ok = check_ts_slow_ev(f2.ptr, f2.len, lut, ts_ok, ts_from_sec, ing_whole_sec,
-                                      win_start_sec, win_start_ms, win_dur_ms,
-                                      ts_rel_sec, ts_ms_rem, ing_rel_sec,
-                                      ing_ms, ts_ms, ts_from_sec);
+                auto cr = check_ts_slow_ev(f2.ptr, f2.len, lut, ts_ok, ts_from_sec, ing_whole_sec,
+                                           win_start_sec, win_start_ms, win_dur_ms,
+                                           ts_rel_sec, ts_ms_rem, ing_rel_sec, ing_ms, ts_ms);
+                ing_ms = cr.ing_ms;
+                ts_ms = cr.ts_ms;
+                ok = cr.ok;
+                ts_from_sec = cr.from_sec;
             }
         }
 
-        // 5. Cold out-of-line purchase validation (price/product fields unpacked ONLY on 3% purchase rows!)
+        // 5. Cold out-of-line purchase validation (by-value return, zero stack-escaping out-params!)
         uint32_t price = 0, cat_id = 0;
         if (__builtin_expect(ok & is_pur, 0)) {
             Slice f6 = row.template get<6>();
             Slice f5 = row.template get<5>();
-            if (!parse_purchase_cold(f6.ptr, f6.len, f5.ptr, f5.len, products, price, cat_id)) {
+            auto pr = parse_purchase_cold(f6.ptr, f6.len, f5.ptr, f5.len, products);
+            if (!pr.ok) {
                 ok = false;
+            } else {
+                price = pr.price;
+                cat_id = pr.cat_id;
             }
         }
 
@@ -4855,7 +4885,11 @@ int run_engine(int argc, char** argv) {
     };
     double t0 = now_ms();
     bool prof = std::getenv("PROFILE") != nullptr;
-    bool use_pread = std::getenv("USE_PREAD") != nullptr;
+    bool force_all_pread = std::getenv("USE_PREAD") != nullptr;
+    bool force_all_mmap = std::getenv("USE_MMAP") != nullptr;
+    // Mixed I/O default: mmap small 24 MB links (zero-copy KeyRef) + L2-hot 128 KB pread for 2.06 GB events+clicks!
+    // Eliminates 503K file PTE faults, 1,403 MADV_POPULATE_READ calls, and 503K serial exit_mmap PTE zaps!
+    bool pread_events_clicks = force_all_pread || !force_all_mmap;
     bool force_wide = std::getenv("FORCE_WIDE") != nullptr;
 
     // Launch products + campaigns loader BEFORE ThreadPool pins main to CPU 0 (inherits full affinity mask!)
@@ -4907,7 +4941,7 @@ int run_engine(int argc, char** argv) {
     StringArenaPool arenas;
     arenas.init(ncpu);
     std::vector<ReadBuf> rbufs(static_cast<size_t>(ncpu));
-    if (use_pread) {
+    if (pread_events_clicks) {
         for (int t = 0; t < ncpu; ++t) rbufs[size_t(t)].init();
     }
 
@@ -4917,11 +4951,11 @@ int run_engine(int argc, char** argv) {
     list_csv_paths(data_dir + "/clicks", 0, all_paths);
     list_csv_paths(data_dir + "/events", 1, all_paths);
 
-    const bool keep_fds = use_pread && (all_paths.size() < 480);
+    const bool keep_fds = pread_events_clicks && (all_paths.size() < 480);
     std::vector<CsvFile> csv_files(all_paths.size());
     std::atomic<size_t> next_f{0};
 
-    // Parallel open + guard-paged mmap (zero fd leak, zero SIGBUS even when fsz % 4096 == 0!)
+    // Parallel open + selective mmap (links mmap by default; events+clicks pread with persistent fds!)
     pool.run([&](int) {
         while (true) {
             size_t i = next_f.fetch_add(1, std::memory_order_relaxed);
@@ -4932,7 +4966,8 @@ int run_engine(int argc, char** argv) {
             size_t fsz = (::fstat(fd, &st) == 0 && st.st_size > 0) ? size_t(st.st_size) : 0;
             const char* mbase = nullptr;
             size_t mlen_tot = 0;
-            if (!use_pread && fsz > 0) {
+            const bool want_mmap = !force_all_pread && (force_all_mmap || all_paths[i].second == 2);
+            if (want_mmap && fsz > 0) {
                 size_t mlen = (fsz + 4095) & ~size_t(4095);
                 void* res = ::mmap(nullptr, mlen + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
                 if (res != MAP_FAILED) {
@@ -4952,7 +4987,7 @@ int run_engine(int argc, char** argv) {
     });
 
     size_t total_event_bytes = 0;
-    bool need_readbufs = use_pread;
+    bool need_readbufs = pread_events_clicks;
     for (const auto& f : csv_files) {
         if (f.kind == 1) total_event_bytes += f.file_size;
         if (f.file_size > 0 && f.map_base == nullptr) need_readbufs = true;

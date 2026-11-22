@@ -905,17 +905,23 @@ static SS_ALWAYS_INLINE bool parse_ts_branchless_ms(const char* s, size_t len, i
     return parse_ts_slow(s, len, out_ms, lut);
 }
 
-// Out-of-line F2 (±HH:MM) + slow timestamp helper for format-selected fast scanner!
-static SS_NOINLINE bool parse_ts_f2_or_slow_rel(
-    const char* s, size_t len, const DateLut& lut,
-    int64_t& out_rel_sec, int64_t& out_ms, bool& out_from_sec
-) {
+// Out-of-line F2 (±HH:MM) + slow timestamp helper returning by value (zero stack-escaping out-params!)
+struct TsF2SlowRes {
+    int64_t rel_sec;
+    int64_t ms;
+    bool ok;
+    bool from_sec;
+};
+
+static SS_NOINLINE TsF2SlowRes parse_ts_f2_or_slow_rel(const char* s, size_t len, const DateLut& lut) {
     if (__builtin_expect(len == 25 && (s[19] == '+' || s[19] == '-'), 1)) {
-        out_from_sec = true;
-        return lut.parse_f2_rel_sec(s, out_rel_sec);
+        int64_t rel_sec = 0;
+        bool ok = lut.parse_f2_rel_sec(s, rel_sec);
+        return {rel_sec, 0LL, ok, true};
     }
-    out_from_sec = false;
-    return parse_ts_slow(s, len, out_ms, lut);
+    int64_t ms = 0;
+    bool ok = parse_ts_slow(s, len, ms, lut);
+    return {0LL, ms, ok, false};
 }
 
 static SS_NOINLINE bool parse_ts_f2_or_slow_ms(const char* s, size_t len, int64_t& out_ms, const DateLut& lut) {
