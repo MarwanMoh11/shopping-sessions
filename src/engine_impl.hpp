@@ -515,10 +515,13 @@ static SS_ALWAYS_INLINE void scan_mmap_csv(const CsvTask& task, OnFields&& on_fi
         if (cur >= limit) return;
     }
 
-    Slice f[N];
     uint64_t cms[68];
     uint16_t npos[4098];
     bool done = false;
+
+    auto on_cold = [&](const Slice* fs) SS_COLD_NOINLINE {
+        on_fields(fs);
+    };
 
     while (cur < limit) {
         size_t avail = fsz - cur;
@@ -571,8 +574,13 @@ static SS_ALWAYS_INLINE void scan_mmap_csv(const CsvTask& task, OnFields&& on_fi
             for (uint32_t ri = 0; ri < nnl; ++ri) {
                 size_t nl_rel = npos[ri];
                 uint32_t L = uint32_t(nl_rel - ls);
-                if (__builtin_expect(extract_clean_csv<N>(bptr + ls, ls, L, cms, f), 1)) {
+                Slice f[N];
+                int er = extract_clean_csv<N>(bptr + ls, ls, L, cms, f);
+                if (__builtin_expect(er > 0, 1)) {
                     on_fields(f);
+                } else if (__builtin_expect(er < 0, 0)) {
+                    Slice fs[N];
+                    if (parse_csv_line_scalar<N>(bptr + ls, bptr + nl_rel, fs)) on_cold(fs);
                 }
                 ls = nl_rel + 1;
                 if (__builtin_expect(ls >= lrel, 0)) {
@@ -582,9 +590,10 @@ static SS_ALWAYS_INLINE void scan_mmap_csv(const CsvTask& task, OnFields&& on_fi
                 }
             }
         } else {
+            Slice fs[N];
             for (uint32_t ri = 0; ri < nnl; ++ri) {
                 size_t nl_rel = npos[ri];
-                if (parse_csv_line_scalar<N>(bptr + ls, bptr + nl_rel, f)) on_fields(f);
+                if (parse_csv_line_scalar<N>(bptr + ls, bptr + nl_rel, fs)) on_cold(fs);
                 ls = nl_rel + 1;
                 if (__builtin_expect(ls >= lrel, 0)) {
                     cur += ls;
@@ -597,7 +606,8 @@ static SS_ALWAYS_INLINE void scan_mmap_csv(const CsvTask& task, OnFields&& on_fi
         if (__builtin_expect(ls == 0, 0)) {
             const char* nl = find_nl_simd(bptr + (nblks << 6), base + fsz);
             if (!nl) break;
-            if (parse_csv_line_scalar<N>(bptr, nl, f)) on_fields(f);
+            Slice fs[N];
+            if (parse_csv_line_scalar<N>(bptr, nl, fs)) on_cold(fs);
             cur = size_t(nl - base) + 1;
         } else {
             cur += ls;
@@ -608,13 +618,14 @@ static SS_ALWAYS_INLINE void scan_mmap_csv(const CsvTask& task, OnFields&& on_fi
         const char* line = base + cur;
         const char* nl = find_nl_simd(line, base + fsz);
         const char* le = nl ? nl : (base + fsz);
-        if (parse_csv_line_scalar<N>(line, le, f)) on_fields(f);
+        Slice fs[N];
+        if (parse_csv_line_scalar<N>(line, le, fs)) on_cold(fs);
         cur = nl ? (size_t(nl - base) + 1) : fsz;
     }
 }
 
 template <int N, typename OnFields>
-static SS_ALWAYS_INLINE void scan_pread_csv(const CsvTask& task, ReadBuf& rbuf, OnFields&& on_fields) {
+static SS_NOINLINE void scan_pread_csv(const CsvTask& task, ReadBuf& rbuf, OnFields&& on_fields) {
     const CsvFile& file = *task.file;
     int fd = file.fd;
     bool close_after = false;
@@ -632,9 +643,12 @@ static SS_ALWAYS_INLINE void scan_pread_csv(const CsvTask& task, ReadBuf& rbuf, 
     bool first_read = true;
     bool hit_limit = false;
 
-    Slice f[N];
     uint64_t cms[68];
     uint16_t npos[4098];
+
+    auto on_cold = [&](const Slice* fs) SS_COLD_NOINLINE {
+        on_fields(fs);
+    };
 
     while (true) {
         if (file_pos >= fsz) break;
@@ -724,8 +738,13 @@ static SS_ALWAYS_INLINE void scan_pread_csv(const CsvTask& task, ReadBuf& rbuf, 
                 for (uint32_t ri = 0; ri < nnl; ++ri) {
                     size_t nl_rel = npos[ri];
                     uint32_t L = uint32_t(nl_rel - ls);
-                    if (__builtin_expect(extract_clean_csv<N>(bptr + ls, ls, L, cms, f), 1)) {
+                    Slice f[N];
+                    int er = extract_clean_csv<N>(bptr + ls, ls, L, cms, f);
+                    if (__builtin_expect(er > 0, 1)) {
                         on_fields(f);
+                    } else if (__builtin_expect(er < 0, 0)) {
+                        Slice fs[N];
+                        if (parse_csv_line_scalar<N>(bptr + ls, bptr + nl_rel, fs)) on_cold(fs);
                     }
                     ls = nl_rel + 1;
                     if (__builtin_expect(ls >= lrel, 0)) {
@@ -735,9 +754,10 @@ static SS_ALWAYS_INLINE void scan_pread_csv(const CsvTask& task, ReadBuf& rbuf, 
                     }
                 }
             } else {
+                Slice fs[N];
                 for (uint32_t ri = 0; ri < nnl; ++ri) {
                     size_t nl_rel = npos[ri];
-                    if (parse_csv_line_scalar<N>(bptr + ls, bptr + nl_rel, f)) on_fields(f);
+                    if (parse_csv_line_scalar<N>(bptr + ls, bptr + nl_rel, fs)) on_cold(fs);
                     ls = nl_rel + 1;
                     if (__builtin_expect(ls >= lrel, 0)) {
                         cur += ls;
@@ -750,7 +770,8 @@ static SS_ALWAYS_INLINE void scan_pread_csv(const CsvTask& task, ReadBuf& rbuf, 
             if (__builtin_expect(ls == 0, 0)) {
                 const char* nl = find_nl_simd(bptr + (nblks << 6), rbuf.data + total);
                 if (!nl) break;
-                if (parse_csv_line_scalar<N>(bptr, nl, f)) on_fields(f);
+                Slice fs[N];
+                if (parse_csv_line_scalar<N>(bptr, nl, fs)) on_cold(fs);
                 cur = size_t(nl - rbuf.data) + 1;
                 if (cur >= limit_in_buf) { done = true; break; }
             } else {
@@ -764,7 +785,8 @@ static SS_ALWAYS_INLINE void scan_pread_csv(const CsvTask& task, ReadBuf& rbuf, 
             const char* line = rbuf.data + cur;
             const char* nl = find_nl_simd(line, rbuf.data + total);
             if (!nl) break;
-            if (parse_csv_line_scalar<N>(line, nl, f)) on_fields(f);
+            Slice fs[N];
+            if (parse_csv_line_scalar<N>(line, nl, fs)) on_cold(fs);
             cur = size_t(nl - rbuf.data) + 1;
         }
 
@@ -772,7 +794,8 @@ static SS_ALWAYS_INLINE void scan_pread_csv(const CsvTask& task, ReadBuf& rbuf, 
 
         if (file_pos >= fsz) {
             if (cur < total && buf_file_off + cur < limit) {
-                if (parse_csv_line_scalar<N>(rbuf.data + cur, rbuf.data + total, f)) on_fields(f);
+                Slice fs[N];
+                if (parse_csv_line_scalar<N>(rbuf.data + cur, rbuf.data + total, fs)) on_cold(fs);
             }
             break;
         }
@@ -1102,13 +1125,28 @@ struct UserDict {
         uint32_t _pad;
     };
 
+    // 1-cache-line 3-way associative inline 128-bit user table for 'u' + 32 lowercase hex!
+    // Eliminates the gslots -> gentries -> 2GB mmap page walk -> memcmp chain (~3.6M lookups/run)!
+    struct alignas(64) HexLine {
+        uint64_t k[3][2];  // 48 B exact 128-bit keys
+        uint32_t pid[3];   // 12 B dense PIDs
+        uint32_t ctrl;     // 4 B atomic_ref: bits 0..2 claimed, bits 8..10 ready
+    };
+    static_assert(sizeof(HexLine) == 64, "HexLine must be 64 bytes");
+
     bool fast_dict_mode = false;
     uint64_t* uslots = nullptr;
     size_t ucap = 0;
     size_t umask = 0;
     size_t uslots_bytes = 0;
 
-    // Lock-free general/long-ID user dictionary (handles 100% of 33B hex, UTF-8, uppercase & overflows!)
+    // Inline 128-bit HexDict (THP-backed 64B cache-line table)
+    HexLine* hlines = nullptr;
+    size_t hcap = 0;
+    size_t hmask = 0;
+    size_t hlines_bytes = 0;
+
+    // Lock-free general/fallback user dictionary (rare non-hex long, UTF-8, uppercase & d>254 overflows!)
     // gslots[i] = [hash_tag32 : 32][entry_idx_plus_1 : 32] (0 = empty)
     uint64_t* gslots = nullptr;
     size_t gcap = 0;
@@ -1137,13 +1175,123 @@ struct UserDict {
         __builtin_prefetch(&uslots[size_t(h48) & umask], 0, 1);
     }
 
+    SS_ALWAYS_INLINE void prefetch_hline(uint64_t h) const {
+        __builtin_prefetch(&hlines[size_t(h) & hmask], 0, 1);
+    }
+
     SS_ALWAYS_INLINE void prefetch_gslot(uint64_t h) const {
         __builtin_prefetch(&gslots[size_t(h) & gmask], 0, 1);
     }
 
+    SS_COLD_NOINLINE bool lease_pid_slow(uint32_t& tl_cur, uint32_t& tl_end) {
+        uint32_t base = next_pid.fetch_add(1024, std::memory_order_relaxed);
+        if (__builtin_expect(base >= MAX_DICT_PIDS, 0)) {
+            dict_overflow.store(true, std::memory_order_relaxed);
+            return false;
+        }
+        tl_cur = base;
+        tl_end = base + 1024;
+        return true;
+    }
+
+    // Lock-free insert of pre-assigned linked 128-bit hex user -> cid during Pass 3!
+    SS_NOINLINE void insert_linked_hex(uint64_t lo, uint64_t hi, uint64_t h, uint32_t cid) {
+        size_t li = size_t(h) & hmask;
+        for (size_t pr = 0; pr < hcap; ++pr) {
+            HexLine& line = hlines[li];
+            std::atomic_ref<uint32_t> ac(line.ctrl);
+            for (;;) {
+                uint32_t c = ac.load(std::memory_order_acquire);
+                uint32_t claimed = c & 7U;
+                uint32_t ready   = (c >> 8) & 7U;
+                if (ready & 1U) { if (((line.k[0][0] ^ lo) | (line.k[0][1] ^ hi)) == 0) return; }
+                if (ready & 2U) { if (((line.k[1][0] ^ lo) | (line.k[1][1] ^ hi)) == 0) return; }
+                if (ready & 4U) { if (((line.k[2][0] ^ lo) | (line.k[2][1] ^ hi)) == 0) return; }
+                if (__builtin_expect(claimed != ready, 0)) {
+                    #if defined(__x86_64__)
+                    __builtin_ia32_pause();
+                    #elif defined(__aarch64__)
+                    asm volatile("yield");
+                    #endif
+                    continue;
+                }
+                if (claimed == 7U) break;
+                uint32_t e = uint32_t(__builtin_ctz(~claimed & 7U));
+                uint32_t exp = c;
+                if (ac.compare_exchange_weak(exp, c | (1U << e),
+                                             std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    line.k[e][0] = lo;
+                    line.k[e][1] = hi;
+                    line.pid[e]  = cid;
+                    ac.fetch_or(1U << (8U + e), std::memory_order_release);
+                    return;
+                }
+            }
+            li = (li + 1) & hmask;
+        }
+        dict_overflow.store(true, std::memory_order_relaxed);
+    }
+
+    // Single-cache-line lock-free lookup/insert of 128-bit 'u' + 32 hex user -> dense pid!
+    // Out-of-line (NOT cold) so 13.4% rows stay fast while hot scan loop stays DSB-resident!
+    SS_NOINLINE uint32_t get_or_insert_hex(
+        uint64_t lo, uint64_t hi, uint64_t h,
+        StringArenaPool& arenas, int tid,
+        uint32_t& tl_cur, uint32_t& tl_end
+    ) {
+        size_t li = size_t(h) & hmask;
+        for (size_t pr = 0; pr < hcap; ++pr) {
+            HexLine& line = hlines[li];
+            std::atomic_ref<uint32_t> ac(line.ctrl);
+            for (;;) {
+                uint32_t c = ac.load(std::memory_order_acquire);
+                uint32_t claimed = c & 7U;
+                uint32_t ready   = (c >> 8) & 7U;
+                if (ready & 1U) { if (((line.k[0][0] ^ lo) | (line.k[0][1] ^ hi)) == 0) return line.pid[0]; }
+                if (ready & 2U) { if (((line.k[1][0] ^ lo) | (line.k[1][1] ^ hi)) == 0) return line.pid[1]; }
+                if (ready & 4U) { if (((line.k[2][0] ^ lo) | (line.k[2][1] ^ hi)) == 0) return line.pid[2]; }
+                if (__builtin_expect(claimed != ready, 0)) {
+                    #if defined(__x86_64__)
+                    __builtin_ia32_pause();
+                    #elif defined(__aarch64__)
+                    asm volatile("yield");
+                    #endif
+                    continue;
+                }
+                if (__builtin_expect(claimed == 7U, 0)) break;
+                uint32_t e = uint32_t(__builtin_ctz(~claimed & 7U));
+                uint32_t exp = c;
+                if (ac.compare_exchange_weak(exp, c | (1U << e),
+                                             std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    if (__builtin_expect(tl_cur >= tl_end, 0)) {
+                        if (!lease_pid_slow(tl_cur, tl_end)) {
+                            line.k[e][0] = lo;
+                            line.k[e][1] = hi;
+                            line.pid[e]  = 0;
+                            ac.fetch_or(1U << (8U + e), std::memory_order_release);
+                            return 0;
+                        }
+                    }
+                    uint32_t np = tl_cur++;
+                    char tmp[33];
+                    decode_uhex128(lo, hi, tmp);
+                    pid_name[np] = arenas.store_fallback(tid, tmp, 33);
+                    line.k[e][0] = lo;
+                    line.k[e][1] = hi;
+                    line.pid[e]  = np;
+                    ac.fetch_or(1U << (8U + e), std::memory_order_release);
+                    return np;
+                }
+            }
+            li = (li + 1) & hmask;
+        }
+        dict_overflow.store(true, std::memory_order_relaxed);
+        return 0;
+    }
+
     // Lock-free insert of pre-assigned linked (KeyRef -> cid) into gslots during Pass 3!
     // Always hashes raw UTF-8/ASCII bytes via hash_bytes() so it matches scan lookups 100% identically!
-    SS_NOINLINE void insert_linked_general(
+    SS_COLD_NOINLINE void insert_linked_general(
         uint64_t k, uint32_t cid, const StringArenaPool& arenas, uint32_t& g_cur, uint32_t& g_end
     ) {
         char tmp[10];
@@ -1184,9 +1332,8 @@ struct UserDict {
         dict_overflow.store(true, std::memory_order_relaxed);
     }
 
-    // Lock-free lookup/insert of ANY variable-width user_id (33B hex, UTF-8, uppercase, overflow) -> dense pid!
-    // ZERO mutexes, ZERO byte copies on hits, ZERO copies on mmap inserts!
-    SS_ALWAYS_INLINE uint32_t get_or_insert_general(
+    // Cold lock-free lookup/insert of rare general user_id (uppercase, UTF-8, unusual length, d>254 overflow) -> pid!
+    SS_COLD_NOINLINE uint32_t get_or_insert_general(
         const char* s, size_t len, uint64_t h,
         uint32_t seg_id, const char* seg_base_ptr,
         StringArenaPool& arenas, int tid,
@@ -1208,13 +1355,7 @@ struct UserDict {
                 }
             } else {
                 if (__builtin_expect(tl_cur >= tl_end, 0)) {
-                    uint32_t base = next_pid.fetch_add(1024, std::memory_order_relaxed);
-                    if (__builtin_expect(base >= MAX_DICT_PIDS, 0)) {
-                        dict_overflow.store(true, std::memory_order_relaxed);
-                        return 0;
-                    }
-                    tl_cur = base;
-                    tl_end = base + 1024;
+                    if (!lease_pid_slow(tl_cur, tl_end)) return 0;
                 }
                 if (__builtin_expect(g_cur >= g_end, 0)) {
                     uint32_t base = next_gentry.fetch_add(256, std::memory_order_relaxed);
@@ -1237,7 +1378,6 @@ struct UserDict {
                     ++g_cur;
                     return np;
                 }
-                // Lost CAS: check winner at this slot (candidate np & ei stay unconsumed!)
                 if (uint32_t(exp >> 32) == tag) {
                     uint32_t oei = uint32_t(exp) - 1U;
                     if (key_eq_raw(gentries[oei].key, s, len, arenas)) {
@@ -1251,7 +1391,20 @@ struct UserDict {
         return 0;
     }
 
+    SS_COLD_NOINLINE uint32_t get_or_insert_uid48_overflow(
+        uint64_t u48,
+        StringArenaPool& arenas, int tid,
+        uint32_t& tl_cur, uint32_t& tl_end,
+        uint32_t& g_cur, uint32_t& g_end
+    ) {
+        char tmp[16]{};
+        size_t ulen = decode_uid48_inline(u48, tmp);
+        uint64_t gh = hash_bytes(tmp, ulen);
+        return get_or_insert_general(tmp, ulen, gh, UINT32_MAX, nullptr, arenas, tid, tl_cur, tl_end, g_cur, g_end);
+    }
+
     // Lock-free, carry-safe (d = 1..254) lookup/insert of uid48 -> dense 24-bit pid!
+    // Cold lease refill & d>254 overflow moved out-of-line for minimal DSB footprint!
     SS_ALWAYS_INLINE uint32_t get_or_insert_uid48(
         uint64_t u48, uint64_t h48,
         StringArenaPool& arenas, int tid,
@@ -1269,13 +1422,7 @@ struct UserDict {
             }
             if (__builtin_expect(sl == 0, 1)) {
                 if (__builtin_expect(tl_cur >= tl_end, 0)) {
-                    uint32_t base = next_pid.fetch_add(1024, std::memory_order_relaxed);
-                    if (__builtin_expect(base >= MAX_DICT_PIDS, 0)) {
-                        dict_overflow.store(true, std::memory_order_relaxed);
-                        return 0;
-                    }
-                    tl_cur = base;
-                    tl_end = base + 1024;
+                    if (!lease_pid_slow(tl_cur, tl_end)) return 0;
                 }
                 uint32_t np = tl_cur;
                 uint64_t exp = 0;
@@ -1291,11 +1438,7 @@ struct UserDict {
             }
             idx = (idx + 1) & umask;
         }
-        // Ultra-rare d > 254 overflow -> route lock-free through gslots using exact decoded ASCII!
-        char tmp[16]{};
-        size_t ulen = decode_uid48_inline(u48, tmp);
-        uint64_t gh = hash_bytes(tmp, ulen);
-        return get_or_insert_general(tmp, ulen, gh, UINT32_MAX, nullptr, arenas, tid, tl_cur, tl_end, g_cur, g_end);
+        return get_or_insert_uid48_overflow(u48, arenas, tid, tl_cur, tl_end, g_cur, g_end);
     }
 
     SS_ALWAYS_INLINE uint64_t resolve_classic(uint64_t k, const StringArenaPool& arenas) const {
@@ -1313,69 +1456,69 @@ struct UserDict {
     void dontneed_tables() {
 #if defined(__linux__) && defined(MADV_DONTNEED)
         if (uslots && uslots_bytes) ::madvise(uslots, uslots_bytes, MADV_DONTNEED);
+        if (hlines && hlines_bytes) ::madvise(hlines, hlines_bytes, MADV_DONTNEED);
         if (gslots && gslots_bytes) ::madvise(gslots, gslots_bytes, MADV_DONTNEED);
         if (slots && slots_bytes) ::madvise(slots, slots_bytes, MADV_DONTNEED);
 #endif
     }
 
-    void build_and_load_dims(
+    void build(
         const std::vector<CsvTask>& tasks,
         std::vector<ReadBuf>& rbufs,
         ThreadPool& pool,
         StringArenaPool& arenas,
-        Products& products,
-        Campaigns& campaigns,
-        const std::string& data_dir,
         size_t total_event_bytes,
         bool allow_fast_dict
     ) {
         struct Edge { uint64_t a, b; };
         std::vector<std::vector<Edge>> thread_edges(static_cast<size_t>(pool.nthreads));
         std::atomic<size_t> next_t{0};
-        std::atomic<size_t> total_long_links{0};
+        std::atomic<size_t> total_hex_links{0};
+        std::atomic<size_t> total_nonhex_links{0};
 
-        // Pass 1: Overlap products.csv + campaigns.csv loads with parallel links/*.csv scan!
-        // Zero-copy KeyRef in mmap mode; supports ALL variable-width / 33B hex / UTF-8 IDs!
-        pool.run([&](int tid) {
-            if (tid == 0) {
-                products.load(data_dir + "/products.csv");
-                if (pool.nthreads == 1) campaigns.load(data_dir + "/campaigns.csv");
-            } else if (tid == 1) {
-                campaigns.load(data_dir + "/campaigns.csv");
-            }
-            if (tasks.empty()) return;
-            auto& edges = thread_edges[size_t(tid)];
-            edges.reserve(65536);
-            auto& rbuf = rbufs[size_t(tid)];
-            size_t local_long = 0;
-            while (true) {
-                size_t ti = next_t.fetch_add(1, std::memory_order_relaxed);
-                if (ti >= tasks.size()) break;
-                const CsvTask& task = tasks[ti];
-                const uint32_t seg_id = task.file->seg_id;
-                const char* seg_base = task.file->map_base;
-                scan_csv<2>(task, rbuf, [&](const Slice f[2]) SS_LAMBDA_INLINE {
-                    if (__builtin_expect((f[0].len > 0) & (f[1].len > 0), 1)) {
-                        uint64_t ka = encode_keyref_padded(f[0].ptr, f[0].len, seg_id, seg_base, arenas, tid);
-                        uint64_t kb = encode_keyref_padded(f[1].ptr, f[1].len, seg_id, seg_base, arenas, tid);
-                        if (__builtin_expect(ka == kb, 0)) return;
-                        if (__builtin_expect(((ka | kb) & FALLBACK_BIT) != 0, 0)) {
-                            if (key_eq(ka, kb, arenas)) return;
-                            local_long += ((ka & FALLBACK_BIT) != 0) + ((kb & FALLBACK_BIT) != 0);
+        // Pass 1: Pure parallel links/*.csv scan (products/campaigns load concurrently on dedicated thread!)
+        if (!tasks.empty()) {
+            pool.run([&](int tid) {
+                auto& edges = thread_edges[size_t(tid)];
+                edges.reserve(65536);
+                auto& rbuf = rbufs[size_t(tid)];
+                size_t local_hex = 0, local_nonhex = 0;
+                while (true) {
+                    size_t ti = next_t.fetch_add(1, std::memory_order_relaxed);
+                    if (ti >= tasks.size()) break;
+                    const CsvTask& task = tasks[ti];
+                    const uint32_t seg_id = task.file->seg_id;
+                    const char* seg_base = task.file->map_base;
+                    scan_csv<2>(task, rbuf, [&](const Slice f[2]) SS_LAMBDA_INLINE {
+                        if (__builtin_expect((f[0].len > 0) & (f[1].len > 0), 1)) {
+                            uint64_t ka = encode_keyref_padded(f[0].ptr, f[0].len, seg_id, seg_base, arenas, tid);
+                            uint64_t kb = encode_keyref_padded(f[1].ptr, f[1].len, seg_id, seg_base, arenas, tid);
+                            if (__builtin_expect(ka == kb, 0)) return;
+                            if (__builtin_expect(((ka | kb) & FALLBACK_BIT) != 0, 0)) {
+                                if (key_eq(ka, kb, arenas)) return;
+                                if ((ka & FALLBACK_BIT) != 0) {
+                                    if (f[0].len == 33 && f[0].ptr[0] == 'u') ++local_hex; else ++local_nonhex;
+                                }
+                                if ((kb & FALLBACK_BIT) != 0) {
+                                    if (f[1].len == 33 && f[1].ptr[0] == 'u') ++local_hex; else ++local_nonhex;
+                                }
+                            }
+                            edges.push_back({ka, kb});
                         }
-                        edges.push_back({ka, kb});
-                    }
-                });
-            }
-            if (local_long) total_long_links.fetch_add(local_long, std::memory_order_relaxed);
-        });
+                    });
+                }
+                if (local_hex) total_hex_links.fetch_add(local_hex, std::memory_order_relaxed);
+                if (local_nonhex) total_nonhex_links.fetch_add(local_nonhex, std::memory_order_relaxed);
+            });
+        }
 
         size_t total_edges = 0;
         for (int t = 0; t < pool.nthreads; ++t) total_edges += thread_edges[size_t(t)].size();
-        size_t long_cnt = total_long_links.load(std::memory_order_relaxed);
-        has_fallback = (long_cnt > 0);
+        size_t hex_cnt = total_hex_links.load(std::memory_order_relaxed);
+        size_t nonhex_cnt = total_nonhex_links.load(std::memory_order_relaxed);
+        has_fallback = ((hex_cnt + nonhex_cnt) > 0);
 
-        // Allocate Unified Lock-Free Total User Dictionary (BOTH short uid48 AND general/long/UTF-8 IDs!)
+        // Allocate Unified Lock-Free Total User Dictionary (uid48 + 3-way 64B HexDict + general fallback!)
         if (allow_fast_dict) {
             size_t est_users = std::max<size_t>(total_edges * 2, total_edges + total_event_bytes / 1500);
             ucap = 65536;
@@ -1384,23 +1527,37 @@ struct UserDict {
             uslots_bytes = alloc_mmap_actual_size(ucap * sizeof(uint64_t), ucap * sizeof(uint64_t) >= (2ULL << 20));
             uslots = static_cast<uint64_t*>(alloc_mmap(ucap * sizeof(uint64_t), ucap * sizeof(uint64_t) >= (2ULL << 20)));
 
-            // Size lock-free general table generously for 12.5%-100% long/UTF-8 users!
-            size_t est_gen = std::max<size_t>(long_cnt * 2 + total_event_bytes / 4500, 4096);
-            if (total_edges > 0 && long_cnt * 4 > total_edges * 2) {
+            // Size 3-way 64B HexDict cleanly: <= 0.6 entry load (256K lines = 16 MB at 20M, 512K lines = 32 MB at 60M!)
+            size_t est_hex = std::max<size_t>((hex_cnt >> 1) + total_event_bytes / 12000, 4096);
+            if (total_edges > 0 && hex_cnt * 4 > total_edges * 2) {
+                est_hex = std::max(est_hex, est_users);
+            }
+            hcap = 4096;
+            while (hcap * 9 < est_hex * 5) hcap <<= 1;
+            hmask = hcap - 1;
+            bool h_hp = (hcap * sizeof(HexLine) >= (2ULL << 20));
+            hlines_bytes = alloc_mmap_actual_size(hcap * sizeof(HexLine), h_hp);
+            hlines = static_cast<HexLine*>(alloc_mmap(hcap * sizeof(HexLine), h_hp));
+
+            // gslots now handles only rare non-hex / UTF-8 / uppercase IDs -> 4 MB VA non-THP (almost 0 RAM touched!),
+            // scaling up automatically if a dataset actually has many non-hex long links!
+            size_t est_gen = std::max<size_t>(nonhex_cnt * 2 + 131072, 131072);
+            if (total_edges > 0 && nonhex_cnt * 4 > total_edges * 2) {
                 est_gen = std::max(est_gen, est_users);
             }
-            gcap = 16384;
+            gcap = 262144;
             while (gcap * 2 < est_gen * 5) gcap <<= 1;
             gmask = gcap - 1;
-            gslots_bytes = alloc_mmap_actual_size(gcap * sizeof(uint64_t), gcap * sizeof(uint64_t) >= (2ULL << 20));
-            gslots = static_cast<uint64_t*>(alloc_mmap(gcap * sizeof(uint64_t), gcap * sizeof(uint64_t) >= (2ULL << 20)));
+            bool g_hp = (nonhex_cnt >= 65536) && (gcap * sizeof(uint64_t) >= (2ULL << 20));
+            gslots_bytes = alloc_mmap_actual_size(gcap * sizeof(uint64_t), g_hp);
+            gslots = static_cast<uint64_t*>(alloc_mmap(gcap * sizeof(uint64_t), g_hp));
 
             gentries_bytes = size_t(MAX_GENTRIES) * sizeof(GenEntry);
             gentries = static_cast<GenEntry*>(alloc_mmap(gentries_bytes, false));
             next_gentry.store(0, std::memory_order_relaxed);
 
-            pid_name_bytes = PID_NAME_CAP * sizeof(uint64_t);
-            pid_name = static_cast<uint64_t*>(alloc_mmap(pid_name_bytes, false));
+            pid_name_bytes = alloc_mmap_actual_size(PID_NAME_CAP * sizeof(uint64_t), true);
+            pid_name = static_cast<uint64_t*>(alloc_mmap(PID_NAME_CAP * sizeof(uint64_t), true));
             next_pid.store(1, std::memory_order_relaxed);
 
             if (total_edges == 0) {
@@ -1419,13 +1576,13 @@ struct UserDict {
             size_t dsu_bytes = dsu_hp
                 ? ((raw_dsu_bytes + (2ULL << 20) - 1) & ~((2ULL << 20) - 1))
                 : ((raw_dsu_bytes + 4095) & ~size_t(4095));
-            size_t hcap = dsu_bytes / sizeof(DsuSlot);
+            size_t dcap = dsu_bytes / sizeof(DsuSlot);
             auto* dsu = static_cast<DsuSlot*>(alloc_mmap(dsu_bytes, dsu_hp));
 
             auto slot_of = [&](uint64_t k) SS_LAMBDA_INLINE -> size_t {
-                return size_t((static_cast<unsigned __int128>(hash_key64(k, arenas)) * hcap) >> 64);
+                return size_t((static_cast<unsigned __int128>(hash_key64(k, arenas)) * dcap) >> 64);
             };
-            // Pass 2a: Lock-free interning of ALL KeyRef endpoints (short AND 33B hex / UTF-8!) into dsu[]!
+            // Pass 2a: Lock-free interning of ALL KeyRef endpoints into dsu[]!
             auto insert_key = [&](uint64_t k) SS_LAMBDA_INLINE -> uint32_t {
                 size_t s = slot_of(k);
                 while (true) {
@@ -1440,7 +1597,7 @@ struct UserDict {
                             return uint32_t(s);
                         }
                     }
-                    if (++s == hcap) s = 0;
+                    if (++s == dcap) s = 0;
                 }
             };
             std::vector<std::vector<std::pair<uint32_t, uint32_t>>> thread_idx_edges(static_cast<size_t>(pool.nthreads));
@@ -1458,7 +1615,7 @@ struct UserDict {
                 }
             });
 
-            // Pass 2b: Parallel Union-by-Exact-Key over 100% IMMUTABLE dsu[].key (handles mixed short & 33B hex!)
+            // Pass 2b: Parallel Union-by-Exact-Key over 100% IMMUTABLE dsu[].key
             auto find_root = [&](uint32_t x) SS_LAMBDA_INLINE -> uint32_t {
                 while (true) {
                     std::atomic_ref<uint32_t> ap(dsu[x].parent);
@@ -1498,45 +1655,126 @@ struct UserDict {
                 }
             });
 
-            // Pass 3 (SINGLE PARALLEL PASS!): CAS dense comp_id on roots + publish to uslots (uid48) OR gslots (general)!
+            // Pass 3 (64-SLOT SOFTWARE-PIPELINED PARALLEL PUBLISH!):
+            // Batched root-walk prefetch + write-intent uslots/hlines home prefetch!
             pool.run([&](int tid) {
-                size_t s = (hcap * size_t(tid)) / size_t(pool.nthreads);
-                size_t e = (hcap * size_t(tid + 1)) / size_t(pool.nthreads);
+                size_t s = (dcap * size_t(tid)) / size_t(pool.nthreads);
+                size_t e = (dcap * size_t(tid + 1)) / size_t(pool.nthreads);
                 uint32_t tl_cur = 0, tl_end = 0;
                 uint32_t g_cur = 0, g_end = 0;
-                for (size_t i = s; i < e; ++i) {
-                    uint64_t k = dsu[i].key;
-                    if (k == 0) continue;
-                    uint32_t r = uint32_t(i);
-                    while (dsu[r].parent != 0) r = dsu[r].parent - 1;
-                    std::atomic_ref<uint32_t> ac(dsu[r].comp_id);
-                    uint32_t cid = ac.load(std::memory_order_relaxed);
-                    if (cid == 0) {
-                        if (__builtin_expect(tl_cur >= tl_end, 0)) {
-                            uint32_t base = next_pid.fetch_add(256, std::memory_order_relaxed);
-                            if (__builtin_expect(base >= MAX_DICT_PIDS, 0)) {
-                                dict_overflow.store(true, std::memory_order_relaxed);
+
+                static constexpr uint32_t WIN = 64;
+                uint64_t b_key[WIN];
+                uint64_t b_v0[WIN];
+                uint64_t b_v1[WIN];
+                uint64_t b_vh[WIN];
+                uint32_t b_root[WIN];
+                uint32_t b_cid[WIN];
+                uint8_t  b_dom[WIN]; // 0 = uid48, 1 = uhex128, 2 = general
+                uint8_t  act[WIN];
+
+                size_t pos = s;
+                while (pos < e) {
+                    uint32_t cnt = 0;
+                    uint32_t na = 0;
+                    while (pos < e && cnt < WIN) {
+                        uint64_t k = dsu[pos].key;
+                        if (k != 0) {
+                            b_key[cnt] = k;
+                            uint32_t p1 = dsu[pos].parent;
+                            if (p1 == 0) {
+                                b_root[cnt] = uint32_t(pos);
+                            } else {
+                                uint32_t nxt = p1 - 1;
+                                b_root[cnt] = nxt;
+                                __builtin_prefetch(&dsu[nxt], 0, 1);
+                                act[na++] = uint8_t(cnt);
+                            }
+                            ++cnt;
+                        }
+                        ++pos;
+                    }
+                    if (cnt == 0) break;
+
+                    // Step A: Lockstep prefetched root-walk rounds for the batch
+                    while (na > 0) {
+                        uint32_t nna = 0;
+                        for (uint32_t ai = 0; ai < na; ++ai) {
+                            uint8_t j = act[ai];
+                            uint32_t p1 = dsu[b_root[j]].parent;
+                            if (p1 != 0) {
+                                uint32_t nxt = p1 - 1;
+                                b_root[j] = nxt;
+                                __builtin_prefetch(&dsu[nxt], 0, 1);
+                                act[nna++] = j;
+                            }
+                        }
+                        na = nna;
+                    }
+
+                    // Step B: Assign root comp_id + pure-byte domain dispatch + write-intent home prefetch
+                    for (uint32_t j = 0; j < cnt; ++j) {
+                        uint32_t r = b_root[j];
+                        std::atomic_ref<uint32_t> ac(dsu[r].comp_id);
+                        uint32_t cid = ac.load(std::memory_order_relaxed);
+                        if (cid == 0) {
+                            if (__builtin_expect(tl_cur >= tl_end, 0)) {
+                                uint32_t base = next_pid.fetch_add(256, std::memory_order_relaxed);
+                                if (__builtin_expect(base >= MAX_DICT_PIDS, 0)) {
+                                    dict_overflow.store(true, std::memory_order_relaxed);
+                                    b_dom[j] = 3;
+                                    continue;
+                                }
+                                tl_cur = base;
+                                tl_end = base + 256;
+                            }
+                            uint32_t cand = tl_cur;
+                            uint32_t exp = 0;
+                            if (ac.compare_exchange_strong(exp, cand, std::memory_order_relaxed)) {
+                                pid_name[cand] = dsu[r].key;
+                                cid = cand;
+                                ++tl_cur;
+                            } else {
+                                cid = exp;
+                            }
+                        }
+                        b_cid[j] = cid;
+
+                        uint64_t k = b_key[j];
+                        if (__builtin_expect((k & FALLBACK_BIT) == 0, 1)) {
+                            char tmp[16]{};
+                            size_t len = decode_inline(k, tmp);
+                            uint64_t u48 = 0;
+                            if (__builtin_expect(encode_uid48_padded(tmp, len, u48), 1)) {
+                                uint64_t h48 = mix48(u48);
+                                b_dom[j] = 0;
+                                b_v0[j] = h48;
+                                __builtin_prefetch(&uslots[size_t(h48) & umask], 1, 1);
                                 continue;
                             }
-                            tl_cur = base;
-                            tl_end = base + 256;
-                        }
-                        uint32_t cand = tl_cur;
-                        uint32_t exp = 0;
-                        if (ac.compare_exchange_strong(exp, cand, std::memory_order_relaxed)) {
-                            pid_name[cand] = dsu[r].key;
-                            cid = cand;
-                            ++tl_cur;
+                            b_dom[j] = 2;
                         } else {
-                            cid = exp;
+                            auto sv = arenas.get_fallback(k);
+                            uint64_t lo = 0, hi = 0;
+                            if (__builtin_expect(encode_uhex128(sv.data(), sv.size(), lo, hi), 1)) {
+                                uint64_t h = hash_uhex128(lo, hi);
+                                b_dom[j] = 1;
+                                b_v0[j] = lo;
+                                b_v1[j] = hi;
+                                b_vh[j] = h;
+                                __builtin_prefetch(&hlines[size_t(h) & hmask], 1, 1);
+                            } else {
+                                b_dom[j] = 2;
+                            }
                         }
                     }
-                    if (__builtin_expect((k & FALLBACK_BIT) == 0, 1)) {
-                        char tmp[16]{};
-                        size_t len = decode_inline(k, tmp);
-                        uint64_t u48 = 0;
-                        if (__builtin_expect(encode_uid48_padded(tmp, len, u48), 1)) {
-                            uint64_t h48 = mix48(u48);
+
+                    // Step C: Execute prefetched CAS inserts into uslots / hlines / gslots!
+                    for (uint32_t j = 0; j < cnt; ++j) {
+                        uint8_t dm = b_dom[j];
+                        if (__builtin_expect(dm == 0, 1)) {
+                            uint64_t h48 = b_v0[j];
+                            uint32_t cid = b_cid[j];
                             size_t home = size_t(h48) & umask;
                             const uint64_t tag_hi = (h48 >> 16) << 32;
                             bool placed = false;
@@ -1550,11 +1788,15 @@ struct UserDict {
                                     break;
                                 }
                             }
-                            if (__builtin_expect(placed, 1)) continue;
+                            if (__builtin_expect(!placed, 0)) {
+                                insert_linked_general(b_key[j], cid, arenas, g_cur, g_end);
+                            }
+                        } else if (dm == 1) {
+                            insert_linked_hex(b_v0[j], b_v1[j], b_vh[j], b_cid[j]);
+                        } else if (dm == 2) {
+                            insert_linked_general(b_key[j], b_cid[j], arenas, g_cur, g_end);
                         }
                     }
-                    // ALL 33B hex IDs, UTF-8 IDs, uppercase IDs, non-'u' IDs & d>254 overflows -> lock-free gslots!
-                    insert_linked_general(k, cid, arenas, g_cur, g_end);
                 }
             });
 
@@ -1569,6 +1811,7 @@ struct UserDict {
 
             // Ultra-rare >16.7M link components -> fall back to classic!
             uslots = nullptr; uslots_bytes = 0;
+            hlines = nullptr; hlines_bytes = 0;
             gslots = nullptr; gslots_bytes = 0;
             gentries = nullptr; gentries_bytes = 0;
             pid_name = nullptr; pid_name_bytes = 0;
@@ -1651,6 +1894,43 @@ struct FastSideEvent {
 };
 static_assert(sizeof(FastSideEvent) == 32, "FastSideEvent must be exactly 32 bytes");
 
+// Pre-reserved 2MB-THP bump slab for FastSideEvent (zero realloc copies, zero 4KB page fault storms!)
+struct FastSideSlab {
+    static constexpr uint32_t MAX_ITEMS = 1U << 26;
+    FastSideEvent* data = nullptr;
+    uint32_t count = 0;
+    uint32_t cap = 0;
+
+    void init(size_t reserve_bytes) {
+        size_t aligned = (reserve_bytes + (2ULL << 20) - 1) & ~((2ULL << 20) - 1);
+        if (aligned < (4ULL << 20)) aligned = (4ULL << 20);
+        size_t max_bytes = size_t(MAX_ITEMS) * sizeof(FastSideEvent);
+        if (aligned > max_bytes) aligned = max_bytes;
+        data = static_cast<FastSideEvent*>(alloc_mmap(aligned, true));
+        count = 0;
+        cap = uint32_t(aligned / sizeof(FastSideEvent));
+    }
+
+    SS_COLD_NOINLINE void grow() {
+        size_t new_cap = std::min<size_t>(size_t(MAX_ITEMS), size_t(cap) * 2);
+        if (new_cap <= cap) std::abort();
+        size_t new_bytes = new_cap * sizeof(FastSideEvent);
+        auto* nd = static_cast<FastSideEvent*>(alloc_mmap(new_bytes, new_bytes >= (2ULL << 20)));
+        if (count) std::memcpy(nd, data, size_t(count) * sizeof(FastSideEvent));
+        data = nd;
+        cap = uint32_t(new_cap);
+    }
+
+    SS_ALWAYS_INLINE uint32_t push(const FastSideEvent& ev) {
+        if (__builtin_expect(count >= cap, 0)) grow();
+        uint32_t idx = count++;
+        data[idx] = ev;
+        return idx;
+    }
+
+    SS_ALWAYS_INLINE const FastSideEvent& operator[](size_t i) const { return data[i]; }
+};
+
 struct SideEvent {
     uint64_t eid_key64;
     uint64_t user_key64; // used in wide/classic mode
@@ -1703,23 +1983,23 @@ struct RawEvent16 {
     SS_ALWAYS_INLINE uint32_t inline_pid() const { return uint32_t((w1 >> 8) & 0xFFFFFFULL); }
 };
 
-template <typename SideT>
+template <typename SideContainer>
 static SS_COLD_NOINLINE int64_t get_exact_ingest_ms_slow(
     const RawEvent16& ev,
     int64_t win_start_sec,
-    const std::vector<std::vector<SideT>>& sides
+    const std::vector<SideContainer>& sides
 ) {
     uint32_t ir = ev.ingest_rel();
     if (ir != 0) return (win_start_sec + int64_t(ir) - RawEvent16::ING_BIAS) * 1000LL;
     return sides[ev.w1 >> 26][ev.w1 & 0x03FFFFFFU].ingest_ms;
 }
 
-template <typename SideT>
+template <typename SideContainer>
 static SS_ALWAYS_INLINE bool ingest_strictly_earlier(
     const RawEvent16& a,
     const RawEvent16& b,
     int64_t win_start_sec,
-    const std::vector<std::vector<SideT>>& sides
+    const std::vector<SideContainer>& sides
 ) {
     uint32_t ia = a.ingest_rel();
     uint32_t ib = b.ingest_rel();
@@ -2221,42 +2501,176 @@ static void mkdir_p(const std::string& path) {
 }
 
 // ============================================================================
-// Split L1I-Hot Per-Task Scanners (Unified Short + Variable-Width Prefetch Rings!)
+// Split L1I-Hot Per-Task Scanners (24B Store-Port-Light Core + Sparse Side Prefetch Rings!)
 // ============================================================================
-struct ClickRingFast {
-    uint64_t u48;         // valid if is_short == 1
-    uint64_t h;           // mix48(u48) if is_short, else hash_bytes(u_ptr, u_len)
-    uint64_t cid;         // exact zero-copy KeyRef
-    uint64_t ts_camp44;   // (uint64_t(ts - click_start_ms) << 12) | camp_idx
-    const char* u_ptr;    // valid in persistent mmap when !is_short
-    const char* seg_base;
-    uint32_t u_len;
-    uint32_t seg_id;
-    uint8_t  is_short;
-};
-struct EvRingFast {
-    uint64_t u48;         // valid if flags & 1
-    uint64_t h;           // mix48(u48) if short_u, else hash_bytes(u_ptr, u_len)
-    uint64_t rem39;
-    uint64_t eid_key64;   // used when is_side
-    int64_t  ing_ms;      // used when is_side
-    const char* u_ptr;    // valid in persistent mmap when !short_u
-    const char* seg_base;
-    uint32_t u_len;
-    uint32_t seg_id;
-    uint32_t eb;
-    uint32_t irel21;
-    uint32_t ts_rel_ms;
-    uint32_t price;
-    uint32_t cat_id;
-    uint8_t  flags;       // bit0: short_u, bit1: is_side, bit2: eid_in_side
-};
 static constexpr size_t RING_SZ   = 32;
 static constexpr size_t RING_MASK = RING_SZ - 1;
 static constexpr size_t RING_LAG  = 24;
 
+static constexpr uint64_t EV_F_SHORT_U   = 1ULL << 0;
+static constexpr uint64_t EV_F_HEX_U     = 1ULL << 1;
+static constexpr uint64_t EV_F_NEED_SIDE = 1ULL << 2;
+static constexpr uint64_t EV_F_EID_SIDE  = 1ULL << 3;
+
+struct EvRingHex {
+    uint64_t lo, hi;
+};
+struct EvRingGen {
+    const char* ptr;
+    const char* seg_base;
+    uint32_t len;
+    uint32_t seg_id;
+};
+struct EvRingSide {
+    uint64_t eid_key64;
+    int64_t  ing_ms;
+    uint32_t price;
+    uint32_t cat_id;
+};
+
+// 24 B core (3 stores/row vs 11 in v11! Recomputes mix48(u48) in 3 uops at emit!)
+struct EvRingCore {
+    uint64_t q0;        // [u48:48 (bits 63..16)][eb:9 (bits 15..7)][flags:7 (bits 6..0)]
+    uint64_t q1;        // [rem39:39 (bits 63..25)][irel21:21 (bits 24..4)][0:4]
+    uint32_t ts_rel_ms;
+    uint32_t _pad;
+};
+static_assert(sizeof(EvRingCore) == 24, "EvRingCore must be 24 bytes");
+
+struct EvRingState {
+    EvRingCore core[RING_SZ];
+    EvRingHex  hex[RING_SZ];
+    EvRingSide side[RING_SZ];
+    EvRingGen  gen[RING_SZ];
+};
+
+// 24 B click core (3 stores/row vs 8 in v11!)
+// u48_kind = (u48 << 2) | kind, where kind: 0 = uid48, 1 = uhex128, 2 = general
+struct ClickRingCore {
+    uint64_t u48_kind;
+    uint64_t cid;
+    uint64_t ts_camp44;
+};
+static_assert(sizeof(ClickRingCore) == 24, "ClickRingCore must be 24 bytes");
+
+struct ClickRingState {
+    ClickRingCore core[RING_SZ];
+    EvRingHex     hex[RING_SZ];
+    EvRingGen     gen[RING_SZ];
+};
+
+static SS_NOINLINE void emit_ev_side_slow(
+    uint32_t eb, uint32_t irel21, uint64_t rem39, bool eid_in_side,
+    uint32_t ts_rel_ms, uint32_t pid,
+    const EvRingSide& sd, int tid,
+    PartitionedStore<RawEvent16, 256, EV_BUCKETS, 4>::ThreadState& ev_out,
+    FastSideSlab& side_slab
+) {
+    uint32_t sidx = side_slab.push({sd.eid_key64, ts_rel_ms, pid, sd.ing_ms, sd.price, sd.cat_id});
+    ev_out.push(eb, RawEvent16::make_side(true, irel21, eid_in_side, rem39, tid, sidx));
+}
+
+static SS_COLD_NOINLINE void emit_ev_direct_gen_cold(
+    const char* uptr, size_t ulen,
+    uint32_t eb, uint32_t irel21, uint64_t rem39, bool need_side, bool eid_in_side,
+    uint32_t ts_rel_ms, uint64_t eid_k64, int64_t ing_ms, uint32_t price, uint32_t cat_id,
+    UserDict& dict, StringArenaPool& arenas, int tid,
+    PartitionedStore<RawEvent16, 256, EV_BUCKETS, 4>::ThreadState& ev_out,
+    FastSideSlab& side_slab,
+    uint32_t& tl_cur, uint32_t& tl_end, uint32_t& g_cur, uint32_t& g_end
+) {
+    uint64_t h = hash_bytes(uptr, ulen);
+    uint32_t pid = dict.get_or_insert_general(uptr, ulen, h, UINT32_MAX, nullptr, arenas, tid, tl_cur, tl_end, g_cur, g_end);
+    if (!need_side) {
+        ev_out.push(eb, RawEvent16::make_inline_pid(irel21, rem39, ts_rel_ms, pid));
+    } else {
+        uint32_t sidx = side_slab.push({eid_k64, ts_rel_ms, pid, ing_ms, price, cat_id});
+        ev_out.push(eb, RawEvent16::make_side(true, irel21, eid_in_side, rem39, tid, sidx));
+    }
+}
+
+static SS_COLD_NOINLINE void emit_clk_direct_gen_cold(
+    const char* uptr, size_t ulen, uint64_t cid, uint64_t ts_camp44,
+    UserDict& dict, StringArenaPool& arenas, int tid,
+    PartitionedStore<CompactClick, 128, PERSON_BUCKETS, 4>::ThreadState& clk_out,
+    uint32_t& tl_cur, uint32_t& tl_end, uint32_t& g_cur, uint32_t& g_end
+) {
+    uint64_t h = hash_bytes(uptr, ulen);
+    uint32_t pid = dict.get_or_insert_general(uptr, ulen, h, UINT32_MAX, nullptr, arenas, tid, tl_cur, tl_end, g_cur, g_end);
+    uint32_t pb = pid & uint32_t(PERSON_BUCKETS - 1);
+    clk_out.push(pb, CompactClick{cid, (uint64_t(pid >> PERSON_SHIFT) << 44) | ts_camp44});
+}
+
+static SS_COLD_NOINLINE bool parse_purchase_cold(
+    const char* price_ptr, size_t price_len,
+    const char* prod_ptr, size_t prod_len,
+    const Products& products,
+    uint32_t& out_price, uint32_t& out_cat_id
+) {
+    if (!parse_price_cents(price_ptr, price_len, out_price)) return false;
+    out_cat_id = products.lookup(prod_ptr, prod_len);
+    return true;
+}
+
+static SS_NOINLINE void encode_long_eid_slow(
+    const char* s, size_t len, uint32_t seg_id, const char* seg_base,
+    StringArenaPool& arenas, int tid,
+    uint64_t& out_k64, uint32_t& out_eb, uint64_t& out_rem39
+) {
+    uint64_t k64 = encode_keyref_padded(s, len, seg_id, seg_base, arenas, tid);
+    uint64_t h64 = ((k64 & FALLBACK_BIT) == 0) ? mix64(k64) : hash_bytes(s, len);
+    out_k64 = k64;
+    out_eb = uint32_t(h64 >> 55);
+    out_rem39 = h64 & RawEvent16::REM39_MASK;
+}
+
+static SS_COLD_NOINLINE bool parse_ingest_slow_ev(
+    const char* s, size_t len, const DateLut& lut, int64_t win_start_sec,
+    int64_t& ing_ms, bool& ing_whole_sec, int64_t& ing_rel_sec
+) {
+    if (!parse_ts(s, len, ing_ms, lut)) return false;
+    ing_whole_sec = (ing_ms % 1000LL == 0);
+    ing_rel_sec = ing_ms / 1000LL - win_start_sec;
+    return true;
+}
+
+static SS_COLD_NOINLINE bool check_ts_slow_ev(
+    const char* s, size_t len, const DateLut& lut,
+    bool ts_ok, bool ts_from_sec, bool ing_whole_sec,
+    int64_t win_start_sec, int64_t win_start_ms, int64_t win_dur_ms,
+    int64_t ts_rel_sec, uint32_t ts_ms_rem, int64_t ing_rel_sec,
+    int64_t& ing_ms, int64_t& ts_ms, bool& out_ts_from_sec
+) {
+    if (!ts_ok) {
+        ts_ok = parse_ts_slow(s, len, ts_ms, lut);
+        ts_from_sec = false;
+    }
+    out_ts_from_sec = ts_from_sec;
+    if (!ts_ok) return false;
+    if (ts_from_sec) ts_ms = (win_start_sec + ts_rel_sec) * 1000LL + int64_t(ts_ms_rem);
+    if (ing_whole_sec) ing_ms = (win_start_sec + ing_rel_sec) * 1000LL;
+    if (uint64_t(ts_ms - win_start_ms) >= uint64_t(win_dur_ms) || ing_ms - ts_ms > DAY_MS) return false;
+    return true;
+}
+
+static SS_COLD_NOINLINE void push_invalid_ev_cold(
+    bool eid_in_side, uint32_t irel21, uint32_t eb, uint64_t rem39,
+    uint64_t eid_k64, bool ing_whole_sec, int64_t win_start_sec, int64_t ing_rel_sec, int64_t ing_ms,
+    int tid,
+    PartitionedStore<RawEvent16, 256, EV_BUCKETS, 4>::ThreadState& ev_out,
+    FastSideSlab& side_slab
+) {
+    if (!eid_in_side && irel21 != 0) {
+        ev_out.push(eb, RawEvent16::make_invalid_inline(irel21, rem39));
+        return;
+    }
+    if (ing_whole_sec) ing_ms = (win_start_sec + ing_rel_sec) * 1000LL;
+    uint32_t sidx = side_slab.push({eid_k64, 0U, 0U, ing_ms, 0U, 0U});
+    ev_out.push(eb, RawEvent16::make_side(false, irel21, eid_in_side, rem39, tid, sidx));
+}
+
 static SS_ALWAYS_INLINE void emit_click_ring_entry(
-    const ClickRingFast& r,
+    const ClickRingState& st, size_t slot,
     UserDict& dict,
     StringArenaPool& arenas,
     int tid,
@@ -2264,33 +2678,59 @@ static SS_ALWAYS_INLINE void emit_click_ring_entry(
     uint32_t& tl_cur, uint32_t& tl_end,
     uint32_t& g_cur,  uint32_t& g_end
 ) {
-    uint32_t pid = __builtin_expect(r.is_short != 0, 1)
-        ? dict.get_or_insert_uid48(r.u48, r.h, arenas, tid, tl_cur, tl_end, g_cur, g_end)
-        : dict.get_or_insert_general(r.u_ptr, r.u_len, r.h, r.seg_id, r.seg_base, arenas, tid, tl_cur, tl_end, g_cur, g_end);
+    const ClickRingCore& r = st.core[slot];
+    uint64_t uk = r.u48_kind;
+    uint32_t kind = uint32_t(uk & 3ULL);
+    uint32_t pid;
+    if (__builtin_expect(kind == 0U, 1)) {
+        uint64_t u48 = uk >> 2;
+        pid = dict.get_or_insert_uid48(u48, mix48(u48), arenas, tid, tl_cur, tl_end, g_cur, g_end);
+    } else if (__builtin_expect(kind == 1U, 1)) {
+        const EvRingHex& hx = st.hex[slot];
+        pid = dict.get_or_insert_hex(hx.lo, hx.hi, hash_uhex128(hx.lo, hx.hi), arenas, tid, tl_cur, tl_end);
+    } else {
+        const EvRingGen& gn = st.gen[slot];
+        pid = dict.get_or_insert_general(gn.ptr, gn.len, hash_bytes(gn.ptr, gn.len),
+                                         gn.seg_id, gn.seg_base, arenas, tid, tl_cur, tl_end, g_cur, g_end);
+    }
     uint32_t pb = pid & uint32_t(PERSON_BUCKETS - 1);
     clk_out.push(pb, CompactClick{r.cid, (uint64_t(pid >> PERSON_SHIFT) << 44) | r.ts_camp44});
 }
 
 static SS_ALWAYS_INLINE void emit_ev_ring_entry(
-    const EvRingFast& r,
+    const EvRingState& st, size_t slot,
     UserDict& dict,
     StringArenaPool& arenas,
     int tid,
     PartitionedStore<RawEvent16, 256, EV_BUCKETS, 4>::ThreadState& ev_out,
-    std::vector<FastSideEvent>& side_vec,
+    FastSideSlab& side_slab,
     uint32_t& tl_cur, uint32_t& tl_end,
     uint32_t& g_cur,  uint32_t& g_end
 ) {
-    uint32_t pid = __builtin_expect((r.flags & 1U) != 0, 1)
-        ? dict.get_or_insert_uid48(r.u48, r.h, arenas, tid, tl_cur, tl_end, g_cur, g_end)
-        : dict.get_or_insert_general(r.u_ptr, r.u_len, r.h, r.seg_id, r.seg_base, arenas, tid, tl_cur, tl_end, g_cur, g_end);
-    if (__builtin_expect((r.flags & 2U) == 0, 1)) {
-        ev_out.push(r.eb, RawEvent16::make_inline_pid(r.irel21, r.rem39, r.ts_rel_ms, pid));
+    const EvRingCore& r = st.core[slot];
+    const uint64_t q0 = r.q0;
+    const uint64_t q1 = r.q1;
+    const uint32_t ts_rel_ms = r.ts_rel_ms;
+    uint32_t pid;
+    if (__builtin_expect((q0 & EV_F_SHORT_U) != 0, 1)) {
+        uint64_t u48 = q0 >> 16;
+        pid = dict.get_or_insert_uid48(u48, mix48(u48), arenas, tid, tl_cur, tl_end, g_cur, g_end);
+    } else if (__builtin_expect((q0 & EV_F_HEX_U) != 0, 1)) {
+        const EvRingHex& hx = st.hex[slot];
+        pid = dict.get_or_insert_hex(hx.lo, hx.hi, hash_uhex128(hx.lo, hx.hi), arenas, tid, tl_cur, tl_end);
     } else {
-        uint32_t sidx = uint32_t(side_vec.size());
-        if (__builtin_expect(sidx >= (1U << 26), 0)) std::abort();
-        side_vec.push_back({r.eid_key64, r.ts_rel_ms, pid, r.ing_ms, r.price, r.cat_id});
-        ev_out.push(r.eb, RawEvent16::make_side(true, r.irel21, (r.flags & 4U) != 0, r.rem39, tid, sidx));
+        const EvRingGen& gn = st.gen[slot];
+        pid = dict.get_or_insert_general(gn.ptr, gn.len, hash_bytes(gn.ptr, gn.len),
+                                         gn.seg_id, gn.seg_base, arenas, tid, tl_cur, tl_end, g_cur, g_end);
+    }
+    const uint32_t eb = uint32_t((q0 >> 7) & 0x1FFULL);
+    const uint64_t rem39 = q1 >> 25;
+    const uint32_t irel21 = uint32_t((q1 >> 4) & 0x1FFFFFULL);
+    if (__builtin_expect((q0 & EV_F_NEED_SIDE) == 0, 1)) {
+        ev_out.push(eb, RawEvent16::make_inline_pid(irel21, rem39, ts_rel_ms, pid));
+    } else {
+        emit_ev_side_slow(eb, irel21, rem39, (q0 & EV_F_EID_SIDE) != 0, ts_rel_ms, pid,
+                          st.side[slot], tid, ev_out, side_slab);
     }
 }
 
@@ -2305,7 +2745,7 @@ static SS_NOINLINE void process_click_task_fast(
     int64_t click_start_ms,
     int64_t win_end_ms,
     PartitionedStore<CompactClick, 128, PERSON_BUCKETS, 4>::ThreadState& clk_out,
-    ClickRingFast cring[RING_SZ],
+    ClickRingState& cring,
     size_t& cpushed,
     uint32_t& tl_cur, uint32_t& tl_end,
     uint32_t& g_cur,  uint32_t& g_end
@@ -2323,29 +2763,34 @@ static SS_NOINLINE void process_click_task_fast(
                                      ts >= click_start_ms && ts < win_end_ms, 1)) {
                     uint64_t cid = encode_keyref_padded(f[0].ptr, f[0].len, seg_id, seg_base, arenas, tid);
                     uint64_t ts_camp44 = (uint64_t(uint32_t(ts - click_start_ms)) << 12) | uint64_t(camp_idx);
+                    const size_t slot = cpushed & RING_MASK;
                     uint64_t u48 = 0;
+                    uint64_t uk = 0;
                     if (__builtin_expect(encode_uid48_padded(f[1].ptr, f[1].len, u48), 1)) {
-                        uint64_t h48 = mix48(u48);
-                        cring[cpushed & RING_MASK] = {u48, h48, cid, ts_camp44, nullptr, nullptr, 0U, UINT32_MAX, 1U};
-                        dict.prefetch_uslot(h48);
-                        if (__builtin_expect(cpushed >= RING_LAG, 1)) {
-                            emit_click_ring_entry(cring[(cpushed - RING_LAG) & RING_MASK], dict, arenas, tid, clk_out, tl_cur, tl_end, g_cur, g_end);
-                        }
-                        ++cpushed;
-                    } else if (__builtin_expect(is_mmap, 1)) {
-                        uint64_t h = hash_bytes(f[1].ptr, f[1].len);
-                        cring[cpushed & RING_MASK] = {0ULL, h, cid, ts_camp44, f[1].ptr, seg_base, uint32_t(f[1].len), seg_id, 0U};
-                        dict.prefetch_gslot(h);
-                        if (__builtin_expect(cpushed >= RING_LAG, 1)) {
-                            emit_click_ring_entry(cring[(cpushed - RING_LAG) & RING_MASK], dict, arenas, tid, clk_out, tl_cur, tl_end, g_cur, g_end);
-                        }
-                        ++cpushed;
+                        uk = (u48 << 2);
+                        dict.prefetch_uslot(mix48(u48));
                     } else {
-                        uint64_t h = hash_bytes(f[1].ptr, f[1].len);
-                        uint32_t pid = dict.get_or_insert_general(f[1].ptr, f[1].len, h, UINT32_MAX, nullptr, arenas, tid, tl_cur, tl_end, g_cur, g_end);
-                        uint32_t pb = pid & uint32_t(PERSON_BUCKETS - 1);
-                        clk_out.push(pb, CompactClick{cid, (uint64_t(pid >> PERSON_SHIFT) << 44) | ts_camp44});
+                        uint64_t lo = 0, hi = 0;
+                        if (__builtin_expect(encode_uhex128(f[1].ptr, f[1].len, lo, hi), 1)) {
+                            uk = 1ULL;
+                            cring.hex[slot] = {lo, hi};
+                            dict.prefetch_hline(hash_uhex128(lo, hi));
+                        } else if (__builtin_expect(is_mmap, 1)) {
+                            uk = 2ULL;
+                            cring.gen[slot] = {f[1].ptr, seg_base, uint32_t(f[1].len), seg_id};
+                            dict.prefetch_gslot(hash_bytes(f[1].ptr, f[1].len));
+                        } else {
+                            emit_clk_direct_gen_cold(f[1].ptr, f[1].len, cid, ts_camp44,
+                                                     dict, arenas, tid, clk_out, tl_cur, tl_end, g_cur, g_end);
+                            return;
+                        }
                     }
+                    cring.core[slot] = {uk, cid, ts_camp44};
+                    if (__builtin_expect(cpushed >= RING_LAG, 1)) {
+                        emit_click_ring_entry(cring, (cpushed - RING_LAG) & RING_MASK,
+                                              dict, arenas, tid, clk_out, tl_cur, tl_end, g_cur, g_end);
+                    }
+                    ++cpushed;
                 }
             }
         }
@@ -2365,8 +2810,8 @@ static SS_NOINLINE void process_event_task_fast(
     int64_t win_dur_ms,
     int64_t win_dur_sec,
     PartitionedStore<RawEvent16, 256, EV_BUCKETS, 4>::ThreadState& ev_out,
-    std::vector<FastSideEvent>& side_vec,
-    EvRingFast ering[RING_SZ],
+    FastSideSlab& side_slab,
+    EvRingState& ering,
     size_t& epushed,
     uint32_t& tl_cur, uint32_t& tl_end,
     uint32_t& g_cur,  uint32_t& g_end
@@ -2381,14 +2826,6 @@ static SS_NOINLINE void process_event_task_fast(
     const char* seg_base = task.file->map_base;
     const bool is_mmap = (seg_id < StringArenaPool::ARENA_SEG_BASE);
 
-    auto push_invalid_side = [&](uint32_t irel21, bool eid_in_side, uint32_t eb, uint64_t rem39,
-                                 uint64_t eid_k64, int64_t ing_ms) SS_COLD_NOINLINE {
-        uint32_t sidx = uint32_t(side_vec.size());
-        if (__builtin_expect(sidx >= (1U << 26), 0)) std::abort();
-        side_vec.push_back({eid_k64, 0U, 0U, ing_ms, 0U, 0U});
-        ev_out.push(eb, RawEvent16::make_side(false, irel21, eid_in_side, rem39, tid, sidx));
-    };
-
     scan_csv<7>(task, rbuf, [&](const Slice f[7]) SS_LAMBDA_INLINE {
         if (__builtin_expect(f[0].len == 0, 0)) return;
 
@@ -2402,12 +2839,10 @@ static SS_NOINLINE void process_event_task_fast(
         if (__builtin_expect(f[3].len == 20 && f[3].ptr[19] == 'Z', 1)) {
             if (__builtin_expect(!lut.parse_ingest_f1_rel_sec_day(f[3].ptr, ing_rel_sec, ing_ym, ing_dd16, ing_day_rel), 0)) return;
         } else {
-            if (!parse_ts(f[3].ptr, f[3].len, ing_ms, lut)) return;
-            ing_whole_sec = (ing_ms % 1000LL == 0);
-            ing_rel_sec = ing_ms / 1000LL - win_start_sec;
+            if (!parse_ingest_slow_ev(f[3].ptr, f[3].len, lut, win_start_sec, ing_ms, ing_whole_sec, ing_rel_sec)) return;
         }
 
-        // 2. Encode event_id -> 48b bijection (short) OR zero-copy KeyRef + fast 3-mul hash (long 33B hex!)
+        // 2. Encode event_id -> 48b bijection (short) OR out-of-line zero-copy KeyRef + hash (12.5% long)
         uint64_t eid48 = 0, eid_k64 = 0, rem39 = 0;
         uint32_t eb = 0;
         bool eid_in_side = false;
@@ -2417,10 +2852,7 @@ static SS_NOINLINE void process_event_task_fast(
             rem39 = h48 & RawEvent16::REM39_MASK;
         } else {
             eid_in_side = true;
-            eid_k64 = encode_keyref_padded(f[0].ptr, f[0].len, seg_id, seg_base, arenas, tid);
-            uint64_t h64 = ((eid_k64 & FALLBACK_BIT) == 0) ? mix64(eid_k64) : hash_bytes(f[0].ptr, f[0].len);
-            eb = uint32_t(h64 >> 55);
-            rem39 = h64 & RawEvent16::REM39_MASK;
+            encode_long_eid_slow(f[0].ptr, f[0].len, seg_id, seg_base, arenas, tid, eid_k64, eb, rem39);
         }
 
         uint32_t irel21 = 0U;
@@ -2437,7 +2869,7 @@ static SS_NOINLINE void process_event_task_fast(
         bool is_pur = (f[4].len == 8) & (v8 == pur_u64);
         bool ok = (f[1].len > 0) & (f[5].len > 0) & (is_vc | is_pur);
 
-        // 4. 100% Branchless F1 / F2 / F3 timestamp parse (eliminates ~14M branch mispredicts!)
+        // 4. 100% Branchless F1 / F2 / F3 timestamp parse (slow check moved out-of-line!)
         int64_t ts_rel_sec = 0;
         int64_t ts_ms = 0;
         uint32_t ts_ms_rem = 0;
@@ -2445,94 +2877,83 @@ static SS_NOINLINE void process_event_task_fast(
         if (__builtin_expect(ok, 1)) {
             bool ts_ok = parse_ts_branchless_rel(f[2].ptr, f[2].len, lut, ing_ym, ing_dd16, ing_day_rel,
                                                  win_start_sec, ts_rel_sec, ts_ms_rem);
-            if (__builtin_expect(!ts_ok, 0)) {
-                ts_ok = parse_ts_slow(f[2].ptr, f[2].len, ts_ms, lut);
-                ts_from_sec = false;
-            }
-            if (__builtin_expect(ts_ok & ts_from_sec & ing_whole_sec, 1)) {
+            if (__builtin_expect(ts_ok & ing_whole_sec, 1)) {
                 if (__builtin_expect(uint64_t(ts_rel_sec) >= uint64_t(win_dur_sec) ||
                                      ing_rel_sec - ts_rel_sec > 86400LL, 0)) {
                     ok = false;
                 }
             } else {
-                if (!ts_ok) {
-                    ok = false;
-                } else {
-                    if (ts_from_sec) ts_ms = (win_start_sec + ts_rel_sec) * 1000LL + int64_t(ts_ms_rem);
-                    if (ing_whole_sec) ing_ms = (win_start_sec + ing_rel_sec) * 1000LL;
-                    if (uint64_t(ts_ms - win_start_ms) >= uint64_t(win_dur_ms) || ing_ms - ts_ms > DAY_MS) {
-                        ok = false;
-                    }
-                }
+                ok = check_ts_slow_ev(f[2].ptr, f[2].len, lut, ts_ok, true, ing_whole_sec,
+                                      win_start_sec, win_start_ms, win_dur_ms,
+                                      ts_rel_sec, ts_ms_rem, ing_rel_sec,
+                                      ing_ms, ts_ms, ts_from_sec);
             }
         }
 
-        // 5. Purchase validation (only ~3% of rows!)
+        // 5. Cold out-of-line purchase validation (~3% of rows!)
         uint32_t price = 0, cat_id = 0;
         if (__builtin_expect(ok & is_pur, 0)) {
-            if (!parse_price_cents(f[6].ptr, f[6].len, price)) {
+            if (!parse_purchase_cold(f[6].ptr, f[6].len, f[5].ptr, f[5].len, products, price, cat_id)) {
                 ok = false;
-            } else {
-                cat_id = products.lookup(f[5].ptr, f[5].len);
             }
         }
 
-        // 6. Invalid row shortcut (inline when standard eid48 + irel21, else tiny side record!)
+        // 6. Cold out-of-line invalid row shortcut
         if (__builtin_expect(!ok, 0)) {
-            if (!eid_in_side && irel21 != 0) {
-                ev_out.push(eb, RawEvent16::make_invalid_inline(irel21, rem39));
-            } else {
-                if (ing_whole_sec) ing_ms = (win_start_sec + ing_rel_sec) * 1000LL;
-                push_invalid_side(irel21, eid_in_side, eb, rem39, eid_k64, ing_ms);
-            }
+            push_invalid_ev_cold(eid_in_side, irel21, eb, rem39, eid_k64,
+                                 ing_whole_sec, win_start_sec, ing_rel_sec, ing_ms,
+                                 tid, ev_out, side_slab);
             return;
         }
 
-        // 7. ALL VALID ROWS (short & long UID, short & long EID, view/cart & purchase!) -> 24-AHEAD PREFETCH RING!
+        // 7. ALL VALID ROWS -> 24 B Core + Sparse Side 24-Ahead Prefetch Ring!
         uint32_t ts_rel_ms = ts_from_sec
             ? uint32_t(ts_rel_sec * 1000LL + int64_t(ts_ms_rem))
             : uint32_t(ts_ms - win_start_ms);
         bool need_side = is_pur | eid_in_side | (irel21 == 0);
-        if (__builtin_expect(need_side && ing_whole_sec && irel21 == 0, 0)) {
-            ing_ms = (win_start_sec + ing_rel_sec) * 1000LL;
-        }
-        uint8_t base_flags = (uint8_t(need_side) << 1) | (uint8_t(eid_in_side) << 2);
+        const size_t slot = epushed & RING_MASK;
+        uint64_t base_q0 = (uint64_t(eb) << 7) | (uint64_t(need_side) << 2) | (uint64_t(eid_in_side) << 3);
 
         uint64_t u48 = 0;
+        uint64_t q0 = base_q0;
         if (__builtin_expect(encode_uid48_padded(f[1].ptr, f[1].len, u48), 1)) {
-            uint64_t h48 = mix48(u48);
-            ering[epushed & RING_MASK] = {
-                u48, h48, rem39, eid_k64, ing_ms, nullptr, nullptr, 0U, UINT32_MAX,
-                eb, irel21, ts_rel_ms, price, cat_id, uint8_t(base_flags | 1U)
-            };
-            dict.prefetch_uslot(h48);
-            if (__builtin_expect(epushed >= RING_LAG, 1)) {
-                emit_ev_ring_entry(ering[(epushed - RING_LAG) & RING_MASK], dict, arenas, tid, ev_out, side_vec, tl_cur, tl_end, g_cur, g_end);
-            }
-            ++epushed;
-        } else if (__builtin_expect(is_mmap, 1)) {
-            uint64_t h = hash_bytes(f[1].ptr, f[1].len);
-            ering[epushed & RING_MASK] = {
-                0ULL, h, rem39, eid_k64, ing_ms, f[1].ptr, seg_base, uint32_t(f[1].len), seg_id,
-                eb, irel21, ts_rel_ms, price, cat_id, base_flags
-            };
-            dict.prefetch_gslot(h);
-            if (__builtin_expect(epushed >= RING_LAG, 1)) {
-                emit_ev_ring_entry(ering[(epushed - RING_LAG) & RING_MASK], dict, arenas, tid, ev_out, side_vec, tl_cur, tl_end, g_cur, g_end);
-            }
-            ++epushed;
+            q0 |= (u48 << 16) | EV_F_SHORT_U;
+            dict.prefetch_uslot(mix48(u48));
         } else {
-            uint64_t h = hash_bytes(f[1].ptr, f[1].len);
-            uint32_t pid = dict.get_or_insert_general(f[1].ptr, f[1].len, h, UINT32_MAX, nullptr, arenas, tid, tl_cur, tl_end, g_cur, g_end);
-            if (!need_side) {
-                ev_out.push(eb, RawEvent16::make_inline_pid(irel21, rem39, ts_rel_ms, pid));
+            uint64_t lo = 0, hi = 0;
+            if (__builtin_expect(encode_uhex128(f[1].ptr, f[1].len, lo, hi), 1)) {
+                q0 |= EV_F_HEX_U;
+                ering.hex[slot] = {lo, hi};
+                dict.prefetch_hline(hash_uhex128(lo, hi));
+            } else if (__builtin_expect(is_mmap, 1)) {
+                ering.gen[slot] = {f[1].ptr, seg_base, uint32_t(f[1].len), seg_id};
+                dict.prefetch_gslot(hash_bytes(f[1].ptr, f[1].len));
             } else {
-                uint32_t sidx = uint32_t(side_vec.size());
-                if (__builtin_expect(sidx >= (1U << 26), 0)) std::abort();
-                side_vec.push_back({eid_k64, ts_rel_ms, pid, ing_ms, price, cat_id});
-                ev_out.push(eb, RawEvent16::make_side(true, irel21, eid_in_side, rem39, tid, sidx));
+                if (need_side && ing_whole_sec && irel21 == 0) ing_ms = (win_start_sec + ing_rel_sec) * 1000LL;
+                emit_ev_direct_gen_cold(f[1].ptr, f[1].len, eb, irel21, rem39, need_side, eid_in_side,
+                                        ts_rel_ms, eid_k64, ing_ms, price, cat_id,
+                                        dict, arenas, tid, ev_out, side_slab, tl_cur, tl_end, g_cur, g_end);
+                return;
             }
         }
+
+        if (__builtin_expect(need_side, 0)) {
+            if (__builtin_expect(ing_whole_sec && irel21 == 0, 0)) {
+                ing_ms = (win_start_sec + ing_rel_sec) * 1000LL;
+            }
+            ering.side[slot] = {eid_k64, ing_ms, price, cat_id};
+        }
+
+        EvRingCore& c = ering.core[slot];
+        c.q0 = q0;
+        c.q1 = (rem39 << 25) | (uint64_t(irel21) << 4);
+        c.ts_rel_ms = ts_rel_ms;
+
+        if (__builtin_expect(epushed >= RING_LAG, 1)) {
+            emit_ev_ring_entry(ering, (epushed - RING_LAG) & RING_MASK,
+                               dict, arenas, tid, ev_out, side_slab, tl_cur, tl_end, g_cur, g_end);
+        }
+        ++epushed;
     });
 }
 
@@ -2753,7 +3174,7 @@ struct FastLocalClick {
 
 static SS_NOINLINE bool run_fast_dict_dedup_sessionize_and_write(
     PartitionedStore<RawEvent16, 256, EV_BUCKETS, 4>& event_store,
-    const std::vector<std::vector<FastSideEvent>>& sides,
+    const std::vector<FastSideSlab>& sides,
     PartitionedStore<CompactClick, 128, PERSON_BUCKETS, 4>& click_store,
     UserDict& dict,
     const Products& products,
@@ -3918,6 +4339,14 @@ int run_engine(int argc, char** argv) {
     int32_t win_end_day = (win_end_ms > win_start_ms) ? ms_to_day(win_end_ms - 1) : win_start_day;
     int32_t num_days = std::max<int32_t>(1, win_end_day - win_start_day + 1);
 
+    // Overlap products.csv + campaigns.csv loading on a dedicated thread from t=0 (joined before use_fast_dict!)
+    Products products;
+    Campaigns campaigns;
+    std::thread dims_thr([&]() {
+        products.load(data_dir + "/products.csv");
+        campaigns.load(data_dir + "/campaigns.csv");
+    });
+
     std::string ud_dir = out_dir + "/user_daily";
     std::string cd_dir = out_dir + "/campaign_daily";
     mkdir_p(ud_dir);
@@ -3993,11 +4422,9 @@ int run_engine(int argc, char** argv) {
                                (uint64_t(win_end_ms - win_start_ms) < (1ULL << 32)) &&
                                (uint64_t(win_end_ms - click_start_ms) < (1ULL << 32));
 
-    Products products;
-    Campaigns campaigns;
     UserDict dict;
-    dict.build_and_load_dims(link_tasks, rbufs, pool, arenas, products, campaigns,
-                             data_dir, total_event_bytes, manifest_compact_ok);
+    dict.build(link_tasks, rbufs, pool, arenas, total_event_bytes, manifest_compact_ok);
+    dims_thr.join();
     double t_links = now_ms();
 
     bool use_fast_dict = manifest_compact_ok && dict.fast_dict_mode &&
@@ -4022,19 +4449,20 @@ int run_engine(int argc, char** argv) {
             }
         }
 
-        std::vector<std::vector<FastSideEvent>> thread_sides(static_cast<size_t>(ncpu));
+        size_t side_reserve = std::max<size_t>(48ULL << 20, std::min<size_t>(256ULL << 20, total_event_bytes / size_t(ncpu * 2)));
+        std::vector<FastSideSlab> thread_sides(static_cast<size_t>(ncpu));
+        for (int t = 0; t < ncpu; ++t) thread_sides[size_t(t)].init(side_reserve);
 
         if (!io_tasks.empty()) {
             std::atomic<size_t> next_t{0};
             pool.run([&](int tid) {
                 auto& clk_out = *click_store.ts[size_t(tid)];
                 auto& ev_out = *event_store.ts[size_t(tid)];
-                auto& side_vec = thread_sides[size_t(tid)];
+                auto& side_slab = thread_sides[size_t(tid)];
                 auto& rbuf = rbufs[size_t(tid)];
-                side_vec.reserve(65536);
 
-                ClickRingFast cring[RING_SZ];
-                EvRingFast    ering[RING_SZ];
+                ClickRingState cring;
+                EvRingState    ering;
                 size_t cpushed = 0, epushed = 0;
                 uint32_t tl_cur = 0, tl_end = 0;
                 uint32_t g_cur = 0, g_end = 0;
@@ -4043,7 +4471,7 @@ int run_engine(int argc, char** argv) {
                     if (cpushed > 0) {
                         size_t s = (cpushed > RING_LAG) ? (cpushed - RING_LAG) : 0;
                         for (size_t k = s; k < cpushed; ++k) {
-                            emit_click_ring_entry(cring[k & RING_MASK], dict, arenas, tid, clk_out, tl_cur, tl_end, g_cur, g_end);
+                            emit_click_ring_entry(cring, k & RING_MASK, dict, arenas, tid, clk_out, tl_cur, tl_end, g_cur, g_end);
                         }
                         cpushed = 0;
                     }
@@ -4052,7 +4480,7 @@ int run_engine(int argc, char** argv) {
                     if (epushed > 0) {
                         size_t s = (epushed > RING_LAG) ? (epushed - RING_LAG) : 0;
                         for (size_t k = s; k < epushed; ++k) {
-                            emit_ev_ring_entry(ering[k & RING_MASK], dict, arenas, tid, ev_out, side_vec, tl_cur, tl_end, g_cur, g_end);
+                            emit_ev_ring_entry(ering, k & RING_MASK, dict, arenas, tid, ev_out, side_slab, tl_cur, tl_end, g_cur, g_end);
                         }
                         epushed = 0;
                     }
@@ -4068,7 +4496,7 @@ int run_engine(int argc, char** argv) {
                     } else {
                         process_event_task_fast(task, rbuf, tid, products, lut, dict, arenas,
                                                 win_start_ms, win_start_sec, win_dur_ms, win_dur_sec,
-                                                ev_out, side_vec, ering, epushed, tl_cur, tl_end, g_cur, g_end);
+                                                ev_out, side_slab, ering, epushed, tl_cur, tl_end, g_cur, g_end);
                     }
                 }
                 drain_clicks();
@@ -4093,8 +4521,7 @@ int run_engine(int argc, char** argv) {
     if (!use_fast_dict) {
         if (dict.fast_dict_mode) {
             dict.fast_dict_mode = false;
-            dict.build_and_load_dims(link_tasks, rbufs, pool, arenas, products, campaigns,
-                                     data_dir, total_event_bytes, false);
+            dict.build(link_tasks, rbufs, pool, arenas, total_event_bytes, false);
         }
         PartitionedStore<PersonClick, 128, PERSON_BUCKETS, 4> click_store;
         PartitionedStore<RawEvent16, 256, EV_BUCKETS, 4> event_store;

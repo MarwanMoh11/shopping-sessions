@@ -263,6 +263,60 @@ static SS_ALWAYS_INLINE size_t decode_uid48_inline(uint64_t uid48, char* out) {
     return be ? (9U - (uint32_t(__builtin_ctzll(be)) >> 3)) : 1U;
 }
 
+// Exact injective 128-bit encoder for 'u' + 32 lowercase hex chars (AVX2 ~12 uops + identical scalar fallback!).
+// Domain predicate depends ONLY on decoded bytes (disjoint from uid48 by length 33 vs 2..9).
+static SS_ALWAYS_INLINE bool encode_uhex128(const char* s, size_t len, uint64_t& lo, uint64_t& hi) {
+    if (__builtin_expect(len != 33 || s[0] != 'u', 0)) return false;
+#if defined(__AVX2__)
+    __m256i v   = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + 1));
+    __m256i d   = _mm256_sub_epi8(v, _mm256_set1_epi8('0'));
+    __m256i a   = _mm256_sub_epi8(v, _mm256_set1_epi8('a'));
+    __m256i isd = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+    __m256i isa = _mm256_cmpeq_epi8(_mm256_min_epu8(a, _mm256_set1_epi8(5)), a);
+    if (__builtin_expect(uint32_t(_mm256_movemask_epi8(_mm256_or_si256(isd, isa))) != 0xFFFFFFFFU, 0)) return false;
+    __m256i nib = _mm256_blendv_epi8(_mm256_add_epi8(a, _mm256_set1_epi8(10)), d, isd);
+    __m256i w   = _mm256_maddubs_epi16(nib, _mm256_set1_epi16(0x0110));
+    __m256i p   = _mm256_permute4x64_epi64(_mm256_packus_epi16(w, w), 0xD8);
+    __m128i k   = _mm256_castsi256_si128(p);
+    lo = uint64_t(_mm_cvtsi128_si64(k));
+    hi = uint64_t(_mm_extract_epi64(k, 1));
+    return true;
+#else
+    uint8_t out[16];
+    for (int i = 0; i < 16; ++i) {
+        unsigned c0 = uint8_t(s[1 + 2 * i]);
+        unsigned c1 = uint8_t(s[2 + 2 * i]);
+        unsigned d0 = c0 - uint8_t('0'), a0 = c0 - uint8_t('a');
+        unsigned d1 = c1 - uint8_t('0'), a1 = c1 - uint8_t('a');
+        unsigned n0 = (d0 <= 9U) ? d0 : ((a0 <= 5U) ? (a0 + 10U) : 16U);
+        unsigned n1 = (d1 <= 9U) ? d1 : ((a1 <= 5U) ? (a1 + 10U) : 16U);
+        if (__builtin_expect((n0 | n1) >= 16U, 0)) return false;
+        out[i] = uint8_t((n0 << 4) | n1);
+    }
+    std::memcpy(&lo, out, 8);
+    std::memcpy(&hi, out + 8, 8);
+    return true;
+#endif
+}
+
+static SS_COLD_NOINLINE void decode_uhex128(uint64_t lo, uint64_t hi, char out[33]) {
+    static constexpr char HEX[16] = {'0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f'};
+    uint8_t b[16];
+    std::memcpy(b, &lo, 8);
+    std::memcpy(b + 8, &hi, 8);
+    out[0] = 'u';
+    for (int i = 0; i < 16; ++i) {
+        out[1 + 2 * i] = HEX[b[i] >> 4];
+        out[2 + 2 * i] = HEX[b[i] & 15U];
+    }
+}
+
+static SS_ALWAYS_INLINE uint64_t hash_uhex128(uint64_t lo, uint64_t hi) {
+    unsigned __int128 r = static_cast<unsigned __int128>(lo ^ 0xa0761d6478bd642fULL) *
+                          static_cast<unsigned __int128>(hi ^ 0xe7037ed1a0b428dbULL);
+    return uint64_t(r) ^ uint64_t(r >> 64);
+}
+
 static SS_COLD_NOINLINE uint64_t encode_key64_slow(const char* s, size_t len, StringArenaPool& arenas, int tid) {
     if (len == 0) return 0;
     if (len == 1) {
@@ -1123,9 +1177,10 @@ static SS_ALWAYS_INLINE bool extract_short64(
 }
 
 // Zero-CLMUL, zero-quote-realign extractor for block-validated clean 4KB windows!
-// Handles 100% of v4 lines: N=7 up to L < 192 (zero k0<3 fallback!), N=4 & N=2 up to L < 128!
+// Returns: 1 = extracted cleanly into `out`, 0 = invalid comma count, -1 = long/empty line needing scalar fallback.
+// NEVER passes `out` to any noinline function so GCC/Clang can 100% SRA `Slice f[N]` into registers!
 template <int N>
-static SS_ALWAYS_INLINE bool extract_clean_csv(
+static SS_ALWAYS_INLINE int extract_clean_csv(
     const char* lp, size_t ls, uint32_t L, const uint64_t* cms, Slice out[N]
 ) {
     auto set_field = [&](int idx, uint32_t s, uint32_t e) SS_LAMBDA_INLINE {
@@ -1135,154 +1190,117 @@ static SS_ALWAYS_INLINE bool extract_clean_csv(
     };
 
     if constexpr (N == 7) {
-        if (__builtin_expect(L > 0U && L < 128U, 1)) {
-            size_t sbi = ls >> 6;
-            unsigned sh = unsigned(ls & 63);
-            uint64_t c0, c1;
-            if (__builtin_expect(sh != 0, 1)) {
-                unsigned rsh = 64U - sh;
-                uint64_t nc = cms[sbi + 1];
-                c0 = (cms[sbi] >> sh) | (nc << rsh);
-                c1 = (nc >> sh) | (cms[sbi + 2] << rsh);
-            } else {
-                c0 = cms[sbi];
-                c1 = cms[sbi + 1];
-            }
-            if (__builtin_expect(L < 64U, 0)) {
-                c0 &= (1ULL << L) - 1ULL;
-                c1 = 0ULL;
-            } else {
-                c1 &= (1ULL << (L - 64U)) - 1ULL;
-            }
-            uint32_t k0 = uint32_t(__builtin_popcountll(c0));
-            uint32_t k1 = uint32_t(__builtin_popcountll(c1));
-            if (__builtin_expect(k0 + k1 != 6U, 0)) return false;
-
-            uint32_t p[8];
-            if (__builtin_expect(k0 >= 2U && k0 <= 4U, 1)) {
-                // 100% branchless 6-comma extraction for k0 in {2, 3, 4} (~98.5% of all v4 events!)
-                p[0] = uint32_t(__builtin_ctzll(c0)); c0 &= c0 - 1;
-                p[1] = uint32_t(__builtin_ctzll(c0)); c0 &= c0 - 1;
-                p[2] = uint32_t(__builtin_ctzll(c0 | (1ULL << 63))); c0 &= c0 - 1;
-                p[3] = uint32_t(__builtin_ctzll(c0 | (1ULL << 63)));
-                p[k0 + 0] = 64U + uint32_t(__builtin_ctzll(c1)); c1 &= c1 - 1;
-                p[k0 + 1] = 64U + uint32_t(__builtin_ctzll(c1)); c1 &= c1 - 1;
-                p[k0 + 2] = 64U + uint32_t(__builtin_ctzll(c1 | (1ULL << 63))); c1 &= c1 - 1;
-                p[k0 + 3] = 64U + uint32_t(__builtin_ctzll(c1 | (1ULL << 63)));
-            } else {
-                uint32_t idx = 0;
-                while (c0) { p[idx++] = uint32_t(__builtin_ctzll(c0)); c0 &= c0 - 1; }
-                while (c1) { p[idx++] = 64U + uint32_t(__builtin_ctzll(c1)); c1 &= c1 - 1; }
-            }
-            set_field(0, 0U,        p[0]);
-            set_field(1, p[0] + 1U, p[1]);
-            set_field(2, p[1] + 1U, p[2]);
-            set_field(3, p[2] + 1U, p[3]);
-            set_field(4, p[3] + 1U, p[4]);
-            set_field(5, p[4] + 1U, p[5]);
-            set_field(6, p[5] + 1U, L);
-            return true;
+        if (__builtin_expect(L == 0U || L >= 128U, 0)) return -1;
+        size_t sbi = ls >> 6;
+        unsigned sh = unsigned(ls & 63);
+        uint64_t c0, c1;
+        if (__builtin_expect(sh != 0, 1)) {
+            unsigned rsh = 64U - sh;
+            uint64_t nc = cms[sbi + 1];
+            c0 = (cms[sbi] >> sh) | (nc << rsh);
+            c1 = (nc >> sh) | (cms[sbi + 2] << rsh);
+        } else {
+            c0 = cms[sbi];
+            c1 = cms[sbi + 1];
         }
-        if (__builtin_expect(L >= 128U && L < 192U, 1)) {
-            size_t sbi = ls >> 6;
-            unsigned sh = unsigned(ls & 63);
-            uint64_t c0, c1, c2;
-            if (__builtin_expect(sh != 0, 1)) {
-                unsigned rsh = 64U - sh;
-                uint64_t nc1 = cms[sbi + 1], nc2 = cms[sbi + 2];
-                c0 = (cms[sbi] >> sh) | (nc1 << rsh);
-                c1 = (nc1 >> sh) | (nc2 << rsh);
-                c2 = (nc2 >> sh) | (cms[sbi + 3] << rsh);
-            } else {
-                c0 = cms[sbi]; c1 = cms[sbi + 1]; c2 = cms[sbi + 2];
-            }
-            c2 &= (1ULL << (L - 128U)) - 1ULL;
-            if (__builtin_expect(uint32_t(__builtin_popcountll(c0)) +
-                                 uint32_t(__builtin_popcountll(c1)) +
-                                 uint32_t(__builtin_popcountll(c2)) != 6U, 0)) return false;
-            uint32_t p[6];
+        if (__builtin_expect(L < 64U, 0)) {
+            c0 &= (1ULL << L) - 1ULL;
+            c1 = 0ULL;
+        } else {
+            c1 &= (1ULL << (L - 64U)) - 1ULL;
+        }
+        uint32_t k0 = uint32_t(__builtin_popcountll(c0));
+        uint32_t k1 = uint32_t(__builtin_popcountll(c1));
+        if (__builtin_expect(k0 + k1 != 6U, 0)) return 0;
+
+        uint32_t p[8];
+        if (__builtin_expect(k0 >= 2U && k0 <= 4U, 1)) {
+            // 100% branchless 6-comma extraction for k0 in {2, 3, 4} (~98.5% of all v4 events!)
+            p[0] = uint32_t(__builtin_ctzll(c0)); c0 &= c0 - 1;
+            p[1] = uint32_t(__builtin_ctzll(c0)); c0 &= c0 - 1;
+            p[2] = uint32_t(__builtin_ctzll(c0 | (1ULL << 63))); c0 &= c0 - 1;
+            p[3] = uint32_t(__builtin_ctzll(c0 | (1ULL << 63)));
+            p[k0 + 0] = 64U + uint32_t(__builtin_ctzll(c1)); c1 &= c1 - 1;
+            p[k0 + 1] = 64U + uint32_t(__builtin_ctzll(c1)); c1 &= c1 - 1;
+            p[k0 + 2] = 64U + uint32_t(__builtin_ctzll(c1 | (1ULL << 63))); c1 &= c1 - 1;
+            p[k0 + 3] = 64U + uint32_t(__builtin_ctzll(c1 | (1ULL << 63)));
+        } else {
             uint32_t idx = 0;
             while (c0) { p[idx++] = uint32_t(__builtin_ctzll(c0)); c0 &= c0 - 1; }
             while (c1) { p[idx++] = 64U + uint32_t(__builtin_ctzll(c1)); c1 &= c1 - 1; }
-            while (c2) { p[idx++] = 128U + uint32_t(__builtin_ctzll(c2)); c2 &= c2 - 1; }
-            set_field(0, 0U,        p[0]);
-            set_field(1, p[0] + 1U, p[1]);
-            set_field(2, p[1] + 1U, p[2]);
-            set_field(3, p[2] + 1U, p[3]);
-            set_field(4, p[3] + 1U, p[4]);
-            set_field(5, p[4] + 1U, p[5]);
-            set_field(6, p[5] + 1U, L);
-            return true;
         }
-        return parse_csv_line_scalar<7>(lp, lp + L, out);
+        set_field(0, 0U,        p[0]);
+        set_field(1, p[0] + 1U, p[1]);
+        set_field(2, p[1] + 1U, p[2]);
+        set_field(3, p[2] + 1U, p[3]);
+        set_field(4, p[3] + 1U, p[4]);
+        set_field(5, p[4] + 1U, p[5]);
+        set_field(6, p[5] + 1U, L);
+        return 1;
     } else if constexpr (N == 4) {
-        if (__builtin_expect(L > 0U && L < 128U, 1)) {
-            size_t sbi = ls >> 6;
-            unsigned sh = unsigned(ls & 63);
-            uint64_t c0, c1;
-            if (__builtin_expect(sh != 0, 1)) {
-                unsigned rsh = 64U - sh;
-                uint64_t nc = cms[sbi + 1];
-                c0 = (cms[sbi] >> sh) | (nc << rsh);
-                c1 = (nc >> sh) | (cms[sbi + 2] << rsh);
-            } else {
-                c0 = cms[sbi];
-                c1 = cms[sbi + 1];
-            }
-            if (__builtin_expect(L < 64U, 1)) {
-                c0 &= (1ULL << L) - 1ULL;
-                c1 = 0ULL;
-            } else {
-                c1 &= (1ULL << (L - 64U)) - 1ULL;
-            }
-            uint32_t k0 = uint32_t(__builtin_popcountll(c0));
-            uint32_t k1 = uint32_t(__builtin_popcountll(c1));
-            if (__builtin_expect(k0 + k1 != 3U, 0)) return false;
-            // 100% branchless 3-comma extraction for ALL k0 in {0, 1, 2, 3} (100% of v4 clicks!)
-            uint32_t p[6];
-            p[0] = uint32_t(__builtin_ctzll(c0 | (1ULL << 63))); c0 &= c0 - 1;
-            p[1] = uint32_t(__builtin_ctzll(c0 | (1ULL << 63))); c0 &= c0 - 1;
-            p[2] = uint32_t(__builtin_ctzll(c0 | (1ULL << 63)));
-            p[k0 + 0] = 64U + uint32_t(__builtin_ctzll(c1 | (1ULL << 63))); c1 &= c1 - 1;
-            p[k0 + 1] = 64U + uint32_t(__builtin_ctzll(c1 | (1ULL << 63))); c1 &= c1 - 1;
-            p[k0 + 2] = 64U + uint32_t(__builtin_ctzll(c1 | (1ULL << 63)));
-            set_field(0, 0U,        p[0]);
-            set_field(1, p[0] + 1U, p[1]);
-            set_field(2, p[1] + 1U, p[2]);
-            set_field(3, p[2] + 1U, L);
-            return true;
+        if (__builtin_expect(L == 0U || L >= 128U, 0)) return -1;
+        size_t sbi = ls >> 6;
+        unsigned sh = unsigned(ls & 63);
+        uint64_t c0, c1;
+        if (__builtin_expect(sh != 0, 1)) {
+            unsigned rsh = 64U - sh;
+            uint64_t nc = cms[sbi + 1];
+            c0 = (cms[sbi] >> sh) | (nc << rsh);
+            c1 = (nc >> sh) | (cms[sbi + 2] << rsh);
+        } else {
+            c0 = cms[sbi];
+            c1 = cms[sbi + 1];
         }
-        return parse_csv_line_scalar<4>(lp, lp + L, out);
+        if (__builtin_expect(L < 64U, 1)) {
+            c0 &= (1ULL << L) - 1ULL;
+            c1 = 0ULL;
+        } else {
+            c1 &= (1ULL << (L - 64U)) - 1ULL;
+        }
+        uint32_t k0 = uint32_t(__builtin_popcountll(c0));
+        uint32_t k1 = uint32_t(__builtin_popcountll(c1));
+        if (__builtin_expect(k0 + k1 != 3U, 0)) return 0;
+        // 100% branchless 3-comma extraction for ALL k0 in {0, 1, 2, 3} (100% of v4 clicks!)
+        uint32_t p[6];
+        p[0] = uint32_t(__builtin_ctzll(c0 | (1ULL << 63))); c0 &= c0 - 1;
+        p[1] = uint32_t(__builtin_ctzll(c0 | (1ULL << 63))); c0 &= c0 - 1;
+        p[2] = uint32_t(__builtin_ctzll(c0 | (1ULL << 63)));
+        p[k0 + 0] = 64U + uint32_t(__builtin_ctzll(c1 | (1ULL << 63))); c1 &= c1 - 1;
+        p[k0 + 1] = 64U + uint32_t(__builtin_ctzll(c1 | (1ULL << 63))); c1 &= c1 - 1;
+        p[k0 + 2] = 64U + uint32_t(__builtin_ctzll(c1 | (1ULL << 63)));
+        set_field(0, 0U,        p[0]);
+        set_field(1, p[0] + 1U, p[1]);
+        set_field(2, p[1] + 1U, p[2]);
+        set_field(3, p[2] + 1U, L);
+        return 1;
     } else if constexpr (N == 2) {
-        if (__builtin_expect(L > 0U && L < 128U, 1)) {
-            size_t sbi = ls >> 6;
-            unsigned sh = unsigned(ls & 63);
-            uint64_t c0, c1;
-            if (__builtin_expect(sh != 0, 1)) {
-                unsigned rsh = 64U - sh;
-                uint64_t nc = cms[sbi + 1];
-                c0 = (cms[sbi] >> sh) | (nc << rsh);
-                c1 = (nc >> sh) | (cms[sbi + 2] << rsh);
-            } else {
-                c0 = cms[sbi];
-                c1 = cms[sbi + 1];
-            }
-            if (__builtin_expect(L < 64U, 1)) {
-                c0 &= (1ULL << L) - 1ULL;
-                c1 = 0ULL;
-            } else {
-                c1 &= (1ULL << (L - 64U)) - 1ULL;
-            }
-            if (__builtin_expect(uint32_t(__builtin_popcountll(c0)) +
-                                 uint32_t(__builtin_popcountll(c1)) != 1U, 0)) return false;
-            uint32_t p0 = c0 ? uint32_t(__builtin_ctzll(c0)) : (64U + uint32_t(__builtin_ctzll(c1)));
-            set_field(0, 0U,        p0);
-            set_field(1, p0 + 1U, L);
-            return true;
+        if (__builtin_expect(L == 0U || L >= 128U, 0)) return -1;
+        size_t sbi = ls >> 6;
+        unsigned sh = unsigned(ls & 63);
+        uint64_t c0, c1;
+        if (__builtin_expect(sh != 0, 1)) {
+            unsigned rsh = 64U - sh;
+            uint64_t nc = cms[sbi + 1];
+            c0 = (cms[sbi] >> sh) | (nc << rsh);
+            c1 = (nc >> sh) | (cms[sbi + 2] << rsh);
+        } else {
+            c0 = cms[sbi];
+            c1 = cms[sbi + 1];
         }
-        return parse_csv_line_scalar<2>(lp, lp + L, out);
+        if (__builtin_expect(L < 64U, 1)) {
+            c0 &= (1ULL << L) - 1ULL;
+            c1 = 0ULL;
+        } else {
+            c1 &= (1ULL << (L - 64U)) - 1ULL;
+        }
+        if (__builtin_expect(uint32_t(__builtin_popcountll(c0)) +
+                             uint32_t(__builtin_popcountll(c1)) != 1U, 0)) return 0;
+        uint32_t p0 = c0 ? uint32_t(__builtin_ctzll(c0)) : (64U + uint32_t(__builtin_ctzll(c1)));
+        set_field(0, 0U,        p0);
+        set_field(1, p0 + 1U, L);
+        return 1;
     } else {
-        return parse_csv_line_scalar<N>(lp, lp + L, out);
+        return -1;
     }
 }
 

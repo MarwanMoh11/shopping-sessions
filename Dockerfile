@@ -10,10 +10,11 @@ RUN set -eux; \
     ARCH="$(uname -m)"; \
     FLAGS="-O3 -std=c++20 -DNDEBUG -fno-exceptions -fno-rtti -pthread -fno-plt -fno-stack-protector -fomit-frame-pointer -ffunction-sections -fdata-sections"; \
     if [ "$ARCH" = "x86_64" ]; then \
+        X86_JCC="-Wa,-mbranches-within-32B-boundaries -falign-loops=32"; \
         g++ $FLAGS -march=x86-64 -c /src/main.cpp -o /src/main.o; \
-        g++ $FLAGS -fvisibility=hidden -march=x86-64                                     -c /src/engine_base.cpp   -o /src/engine_base.o; \
-        g++ $FLAGS -fvisibility=hidden -march=x86-64-v3 -mpclmul                         -c /src/engine_avx2.cpp   -o /src/engine_avx2.o; \
-        g++ $FLAGS -fvisibility=hidden -march=x86-64-v4 -mtune=cascadelake -mpclmul -mprefer-vector-width=256 -c /src/engine_avx512.cpp -o /src/engine_avx512.o; \
+        g++ $FLAGS $X86_JCC -fvisibility=hidden -march=x86-64                                     -c /src/engine_base.cpp   -o /src/engine_base.o; \
+        g++ $FLAGS $X86_JCC -fvisibility=hidden -march=x86-64-v3 -mpclmul                         -c /src/engine_avx2.cpp   -o /src/engine_avx2.o; \
+        g++ $FLAGS $X86_JCC -fvisibility=hidden -march=x86-64-v4 -mtune=cascadelake -mpclmul -mprefer-vector-width=256 -c /src/engine_avx512.cpp -o /src/engine_avx512.o; \
         g++ $FLAGS -static -Wl,--gc-sections \
             /src/main.o /src/engine_base.o /src/engine_avx2.o /src/engine_avx512.o -o /app; \
     else \
