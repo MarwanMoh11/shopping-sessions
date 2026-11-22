@@ -213,6 +213,12 @@ static SS_ALWAYS_INLINE uint64_t mix48(uint64_t x) {
     x ^= x >> 24;
     return x;
 }
+static SS_ALWAYS_INLINE uint64_t unmix48(uint64_t x) {
+    x ^= x >> 24;
+    x = (x * 0x30b52c8740edULL) & MASK48;
+    x ^= x >> 24;
+    return x;
+}
 
 // Ultra-fast 4-instruction validator for 2..9 byte IDs starting with `pfx` whose active bytes
 // lie in [0x30..0x3F] U [0x60..0x7F] (covers 100% of base36 '0'-'9','a'-'z'; rejects \0, 'A'-'Z', UTF-8!).
@@ -234,6 +240,7 @@ static SS_ALWAYS_INLINE bool encode_eid48_padded(const char* s, size_t len, uint
     return false;
 }
 
+// Zero-bswap little-endian 48-bit uid encoder (pid_name decodes directly via clzll, never order-compared!)
 static SS_ALWAYS_INLINE bool encode_uid48_padded(const char* s, size_t len, uint64_t& out_uid48) {
     if (__builtin_expect((len - 2) <= 7 && s[0] == 'u', 1)) {
         uint64_t raw8;
@@ -245,22 +252,21 @@ static SS_ALWAYS_INLINE bool encode_uid48_padded(const char* s, size_t len, uint
                      | (~(check | (check >> 2)) & 0x1010101010101010ULL);
         if (__builtin_expect(bad == 0, 1)) {
             uint64_t x = ((raw8 & 0x4040404040404040ULL) >> 1) | (raw8 & 0x1F1F1F1F1F1F1F1FULL);
-            out_uid48 = pext48(__builtin_bswap64(x));
+            out_uid48 = pext48(x);
             return true;
         }
     }
     return false;
 }
 
-// Decode uid48 directly into ASCII bytes ('u' + 1..8 chars), returns exact length in 2..9!
+// Decode little-endian uid48 directly into ASCII bytes ('u' + 1..8 chars), returns exact length in 2..9!
 static SS_ALWAYS_INLINE size_t decode_uid48_inline(uint64_t uid48, char* out) {
     out[0] = 'u';
     uint64_t u = pdep48(uid48);
     uint64_t b5 = u & 0x2020202020202020ULL;
-    uint64_t be = u | (b5 << 1) | ((~b5) & ((u & 0x1010101010101010ULL) << 1));
-    uint64_t le = __builtin_bswap64(be);
+    uint64_t le = u | (b5 << 1) | ((~b5) & ((u & 0x1010101010101010ULL) << 1));
     std::memcpy(out + 1, &le, 8);
-    return be ? (9U - (uint32_t(__builtin_ctzll(be)) >> 3)) : 1U;
+    return le ? (9U - (uint32_t(__builtin_clzll(le)) >> 3)) : 1U;
 }
 
 // Exact injective 128-bit encoder for PFX ('u' or 'e') + 32 lowercase hex chars (AVX2 ~12 uops + identical scalar!).
@@ -688,6 +694,58 @@ struct DateLut {
         uint32_t mm = uint32_t((p >> 24) & 0xFFU);
         uint32_t ss = uint32_t((p >> 48) & 0xFFU);
         out_hms = hh * 3600U + mm * 60U + ss;
+        return true;
+    }
+
+    // Trusted F1 parser for ingest_ts (rules.md: "ingest_ts is always valid F1") - zero extra live state!
+    SS_ALWAYS_INLINE bool parse_ingest_f1_rel_sec(const char* s, int64_t& out_rel_sec) const {
+        uint64_t w;
+        std::memcpy(&w, s + 11, 8);
+        uint64_t d = w - 0x30303A30303A3030ULL;
+        uint64_t p = d * 10ULL + (d >> 8);
+        uint32_t hms = uint32_t(p & 0xFFU) * 3600U + uint32_t((p >> 24) & 0xFFU) * 60U + uint32_t((p >> 48) & 0xFFU);
+        uint64_t ym; uint16_t dd16;
+        std::memcpy(&ym, s, 8);
+        std::memcpy(&dd16, s + 8, 2);
+        uint32_t idx = (((uint32_t(ym >> 48)) & 3U) << 6) | ((uint32_t(dd16) & 3U) << 4) | ((uint32_t(dd16 >> 8)) & 15U);
+        const FastDay& fd = days[idx];
+        if (__builtin_expect((fd.ym == ym) & (fd.dd16 == dd16), 1)) {
+            out_rel_sec = int64_t(fd.rel_sec) + int64_t(hms);
+            return true;
+        }
+        int64_t day_rel;
+        if (!parse_date_rel_slow(s, day_rel)) return false;
+        out_rel_sec = day_rel + int64_t(hms);
+        return true;
+    }
+
+    // Branchless F1 (20B 'Z') + F2 (25B '±HH:MM') ISO parser: zero same_day mispredict & zero noinline F2 call!
+    // Caller guarantees >= 25 readable bytes at `s` (mmap guard page / padded ReadBuf).
+    SS_ALWAYS_INLINE bool parse_iso_f12_rel_sec(const char* s, size_t len, int64_t& out_rel_sec) const {
+        uint32_t hms;
+        if (__builtin_expect(!parse_hms_swar(s, hms), 0)) return false;
+        uint64_t ym; uint16_t dd16;
+        std::memcpy(&ym, s, 8);
+        std::memcpy(&dd16, s + 8, 2);
+        uint32_t idx = (((uint32_t(ym >> 48)) & 3U) << 6) | ((uint32_t(dd16) & 3U) << 4) | ((uint32_t(dd16 >> 8)) & 15U);
+        const FastDay& fd = days[idx];
+        int64_t day_rel;
+        if (__builtin_expect((fd.ym == ym) & (fd.dd16 == dd16), 1)) {
+            day_rel = int64_t(fd.rel_sec);
+        } else {
+            if (!parse_date_rel_slow(s, day_rel)) return false;
+        }
+        uint8_t c19 = uint8_t(s[19]);
+        unsigned oh0 = uint8_t(s[20]) - uint8_t('0'), oh1 = uint8_t(s[21]) - uint8_t('0');
+        unsigned om0 = uint8_t(s[23]) - uint8_t('0'), om1 = uint8_t(s[24]) - uint8_t('0');
+        unsigned oh = oh0 * 10U + oh1, om = om0 * 10U + om1;
+        bool is_f1 = (len == 20) & (c19 == 'Z');
+        bool is_f2 = (len == 25) & ((c19 == '+') | (c19 == '-')) & (s[22] == ':') &
+                     (oh0 <= 9U) & (oh1 <= 9U) & (om0 <= 9U) & (om1 <= 9U) & (oh <= 23U) & (om <= 59U);
+        if (__builtin_expect(!(is_f1 | is_f2), 0)) return false;
+        int64_t off_mag = int64_t(oh * 3600U + om * 60U);
+        int64_t off_s = is_f2 ? ((c19 == '+') ? -off_mag : off_mag) : 0LL;
+        out_rel_sec = day_rel + int64_t(hms) + off_s;
         return true;
     }
 
@@ -1208,14 +1266,62 @@ static SS_ALWAYS_INLINE bool extract_short64(
     }
 }
 
-// Branchless safe ctz64 (uses 1-cycle _tzcnt_u64 on BMI1 x86_64; MSB sentinel 1ULL<<63 on non-BMI!)
-static SS_ALWAYS_INLINE uint32_t ctz64_safe(uint64_t x) {
+// Branchless safe ctz64 returning uint64_t (zero-extended natively by _tzcnt_u64, zero movabs masks!)
+static SS_ALWAYS_INLINE uint64_t ctz64_u64(uint64_t x) {
 #if defined(__BMI__)
-    return uint32_t(_tzcnt_u64(x));
+    return _tzcnt_u64(x);
 #else
-    return uint32_t(__builtin_ctzll(x | (1ULL << 63)));
+    return uint64_t(__builtin_ctzll(x | (1ULL << 63)));
 #endif
 }
+
+static SS_ALWAYS_INLINE uint32_t ctz64_safe(uint64_t x) {
+    return uint32_t(ctz64_u64(x));
+}
+
+static SS_ALWAYS_INLINE uint64_t pext_u64_fast(uint64_t src, uint64_t mask) {
+#if defined(__BMI2__)
+    return _pext_u64(src, mask);
+#else
+    uint64_t res = 0, bit = 1;
+    while (mask) {
+        uint64_t lsb = mask & -mask;
+        if (src & lsb) res |= bit;
+        mask ^= lsb;
+        bit <<= 1;
+    }
+    return res;
+#endif
+}
+
+// Zero-quote-load separator-indexed CSV row accessor (1-cycle quote flags from pext((RQ<<1)|rq_carry, S)!)
+template <int N>
+struct SepsCsvRow {
+    const char* bptr;
+    const uint16_t* sp;
+    uint32_t ls;
+    uint32_t qm;
+
+    template <int I>
+    SS_ALWAYS_INLINE Slice get() const {
+        uint32_t s;
+        if constexpr (I == 0) s = ls;
+        else s = uint32_t(sp[I - 1]) + 1U;
+        uint32_t e = uint32_t(sp[I]);
+        uint32_t q = (qm >> I) & 1U;
+        return {bptr + s + q, size_t((e - s) - (q << 1))};
+    }
+
+    template <int I>
+    SS_ALWAYS_INLINE bool nonempty() const {
+        uint32_t s;
+        if constexpr (I == 0) s = ls;
+        else s = uint32_t(sp[I - 1]) + 1U;
+        uint32_t e = uint32_t(sp[I]);
+        uint32_t q = (qm >> I) & 1U;
+        return (e - s) > (q << 1);
+    }
+};
 
 // Register-only lazy CSV row accessors (ZERO stack spills, ZERO store-forwarding stalls!)
 template <int N>
@@ -1226,8 +1332,12 @@ struct PackedCsvRow {
 
     template <int I>
     SS_ALWAYS_INLINE Slice get() const {
-        uint32_t s = (I == 0) ? 0U : (uint32_t((pk >> ((I - 1) * 8)) & 0xFFU) + 1U);
-        uint32_t e = (I == N - 1) ? L : uint32_t((pk >> (I * 8)) & 0xFFU);
+        uint32_t s;
+        if constexpr (I == 0) s = 0U;
+        else s = uint32_t((pk >> ((I - 1) * 8)) & 0xFFU) + 1U;
+        uint32_t e;
+        if constexpr (I == N - 1) e = L;
+        else e = uint32_t((pk >> (I * 8)) & 0xFFU);
         uint32_t l = e - s;
         uint32_t q = (l > 0U) & (lp[s] == '"');
         return {lp + s + q, size_t(l - (q << 1))};
@@ -1235,8 +1345,12 @@ struct PackedCsvRow {
 
     template <int I>
     SS_ALWAYS_INLINE bool nonempty() const {
-        uint32_t s = (I == 0) ? 0U : (uint32_t((pk >> ((I - 1) * 8)) & 0xFFU) + 1U);
-        uint32_t e = (I == N - 1) ? L : uint32_t((pk >> (I * 8)) & 0xFFU);
+        uint32_t s;
+        if constexpr (I == 0) s = 0U;
+        else s = uint32_t((pk >> ((I - 1) * 8)) & 0xFFU) + 1U;
+        uint32_t e;
+        if constexpr (I == N - 1) e = L;
+        else e = uint32_t((pk >> (I * 8)) & 0xFFU);
         uint32_t l = e - s;
         return (l > 2U) | ((l > 0U) & (lp[s] != '"'));
     }
