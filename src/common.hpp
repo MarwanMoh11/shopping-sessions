@@ -660,7 +660,7 @@ static SS_ALWAYS_INLINE bool parse_4d(const char* p, int& out) {
 
 struct FastDay {
     uint64_t ym;
-    uint32_t ddT; // low 16 bits = dd16, byte 2 = 'T', byte 3 = 0
+    uint32_t ddT; // valid: low 24 bits = dd + 'T', byte 3 = 0x00; empty/collision: 0xFF000000U
     int32_t  rel_sec;
 };
 
@@ -708,7 +708,7 @@ struct DateLut {
                 }
             }
         }
-        for (auto& e : days) { e.ym = 0; e.ddT = 0; e.rel_sec = INT32_MIN; }
+        for (auto& e : days) { e.ym = 0; e.ddT = 0xFF000000U; e.rel_sec = INT32_MIN; }
         if (d_end - d_start <= 110) {
             for (int64_t d = d_start; d <= d_end; ++d) {
                 int y, m, dy;
@@ -733,10 +733,11 @@ struct DateLut {
                 ddT &= 0x00FFFFFFU;
                 int64_t rel = d * 86400LL - win_start_sec;
                 if (rel < INT32_MIN + 1 || rel > INT32_MAX) continue;
-                if (days[idx].ym == 0) {
+                if (days[idx].ym == 0 && days[idx].ddT == 0xFF000000U) {
                     days[idx] = {ym, ddT, int32_t(rel)};
                 } else {
                     days[idx].ym = ~0ULL;
+                    days[idx].ddT = 0xFF000000U;
                 }
             }
         }
@@ -766,6 +767,7 @@ struct DateLut {
         return true;
     }
 
+    // Scalar SWAR single-HMS fallback (used by ss_base / non-SSE4.1)
     static SS_ALWAYS_INLINE bool parse_hms_swar_noT(const char* s, uint32_t& out_hms) {
         uint64_t w;
         std::memcpy(&w, s + 11, 8);
@@ -781,76 +783,295 @@ struct DateLut {
         return true;
     }
 
-    static SS_ALWAYS_INLINE bool parse_hms_swar(const char* s, uint32_t& out_hms) {
-        if (__builtin_expect(s[10] != 'T', 0)) return false;
-        return parse_hms_swar_noT(s, out_hms);
+    // 128-bit SIMD Dual-HMS parser: validates & parses BOTH p2[0..7] and p3[0..7] ("HH:MM:SS") in ~14 uops (ZERO %zmm!)
+    static SS_ALWAYS_INLINE bool parse_dual_hms_simd(
+        const char* p2, const char* p3, uint32_t& out_hms2, uint32_t& out_hms3
+    ) {
+#if defined(__SSE4_1__) || defined(__AVX2__)
+        const __m128i v_base  = _mm_setr_epi8('0','0',':','0','0',':','0','0',
+                                              '0','0',':','0','0',':','0','0');
+        const __m128i v_max   = _mm_setr_epi8(2, 9, 0, 5, 9, 0, 5, 9,
+                                              2, 9, 0, 5, 9, 0, 5, 9);
+        const __m128i v_shuf  = _mm_setr_epi8(0, 1, 3, 4, 6, 7, -1, -1,
+                                              8, 9, 11, 12, 14, 15, -1, -1);
+        const __m128i v_10_1  = _mm_setr_epi8(10, 1, 10, 1, 10, 1, 0, 0,
+                                              10, 1, 10, 1, 10, 1, 0, 0);
+        const __m128i v_max16 = _mm_setr_epi16(23, 59, 59, 0, 23, 59, 59, 0);
+        const __m128i v_sec   = _mm_setr_epi16(3600, 60, 1, 0, 3600, 60, 1, 0);
+
+        __m128i v2  = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p2));
+        __m128i v3  = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p3));
+        __m128i v   = _mm_unpacklo_epi64(v2, v3);
+        __m128i d   = _mm_sub_epi8(v, v_base);
+        __m128i ov8 = _mm_subs_epu8(d, v_max);
+        __m128i p   = _mm_shuffle_epi8(d, v_shuf);
+        __m128i t16 = _mm_maddubs_epi16(p, v_10_1);
+        __m128i bad = _mm_or_si128(ov8, _mm_subs_epu16(t16, v_max16));
+        if (__builtin_expect(!_mm_testz_si128(bad, bad), 0)) return false;
+
+        __m128i m32  = _mm_madd_epi16(t16, v_sec);
+        __m128i sum  = _mm_add_epi32(m32, _mm_srli_epi64(m32, 32));
+        __m128i pk   = _mm_shuffle_epi32(sum, _MM_SHUFFLE(0, 0, 2, 0));
+        uint64_t r64 = uint64_t(_mm_cvtsi128_si64(pk));
+        out_hms2 = uint32_t(r64);
+        out_hms3 = uint32_t(r64 >> 32);
+        return true;
+#elif defined(__aarch64__)
+        const uint8x16_t v_base  = {'0','0',':','0','0',':','0','0',
+                                    '0','0',':','0','0',':','0','0'};
+        const uint8x16_t v_max   = {2, 9, 0, 5, 9, 0, 5, 9,
+                                    2, 9, 0, 5, 9, 0, 5, 9};
+        const uint8x16_t v_shuf  = {0, 1, 3, 4, 6, 7, 255, 255,
+                                    8, 9, 11, 12, 14, 15, 255, 255};
+        const uint8x16_t v_10_1  = {10, 1, 10, 1, 10, 1, 0, 0,
+                                    10, 1, 10, 1, 10, 1, 0, 0};
+        const uint16x8_t v_max16 = {23, 59, 59, 0, 23, 59, 59, 0};
+
+        uint8x16_t v   = vcombine_u8(vld1_u8(reinterpret_cast<const uint8_t*>(p2)),
+                                     vld1_u8(reinterpret_cast<const uint8_t*>(p3)));
+        uint8x16_t d   = vsubq_u8(v, v_base);
+        uint8x16_t ov8 = vqsubq_u8(d, v_max);
+        uint8x16_t p   = vqtbl1q_u8(d, v_shuf);
+        uint16x8_t t16 = vpaddlq_u8(vmulq_u8(p, v_10_1));
+        uint8x16_t bad = vorrq_u8(ov8, vreinterpretq_u8_u16(vqsubq_u16(t16, v_max16)));
+        if (__builtin_expect(vmaxvq_u32(vreinterpretq_u32_u8(bad)) != 0, 0)) return false;
+
+        out_hms2 = uint32_t(vgetq_lane_u16(t16, 0)) * 3600U
+                 + uint32_t(vgetq_lane_u16(t16, 1)) * 60U
+                 + uint32_t(vgetq_lane_u16(t16, 2));
+        out_hms3 = uint32_t(vgetq_lane_u16(t16, 4)) * 3600U
+                 + uint32_t(vgetq_lane_u16(t16, 5)) * 60U
+                 + uint32_t(vgetq_lane_u16(t16, 6));
+        return true;
+#else
+        return parse_hms_swar_noT(p2 - 11, out_hms2) && parse_hms_swar_noT(p3 - 11, out_hms3);
+#endif
     }
 
-    // Trusted F1 parser for ingest_ts (rules.md: "ingest_ts is always valid F1") - BMI2 pext + 1-mulx hms!
-    SS_ALWAYS_INLINE bool parse_ingest_f1_rel_sec(const char* s, int64_t& out_rel_sec) const {
+    // 128-bit SIMD single-HMS validated parser (~11 uops)
+    static SS_ALWAYS_INLINE bool parse_hms_simd_noT(const char* s, uint32_t& out_hms) {
+#if defined(__SSE4_1__) || defined(__AVX2__)
+        const __m128i v_base  = _mm_setr_epi8('0','0',':','0','0',':','0','0',  0,0,0,0,0,0,0,0);
+        const __m128i v_max   = _mm_setr_epi8(2, 9, 0, 5, 9, 0, 5, 9,           0,0,0,0,0,0,0,0);
+        const __m128i v_shuf  = _mm_setr_epi8(0, 1, 3, 4, 6, 7, -1, -1,        -1,-1,-1,-1,-1,-1,-1,-1);
+        const __m128i v_10_1  = _mm_setr_epi8(10, 1, 10, 1, 10, 1, 0, 0,        0,0,0,0,0,0,0,0);
+        const __m128i v_max16 = _mm_setr_epi16(23, 59, 59, 0, 0, 0, 0, 0);
+        const __m128i v_sec   = _mm_setr_epi16(3600, 60, 1, 0, 0, 0, 0, 0);
+
+        __m128i v   = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + 11));
+        __m128i d   = _mm_sub_epi8(v, v_base);
+        __m128i ov8 = _mm_subs_epu8(d, v_max);
+        __m128i p   = _mm_shuffle_epi8(d, v_shuf);
+        __m128i t16 = _mm_maddubs_epi16(p, v_10_1);
+        __m128i bad = _mm_or_si128(ov8, _mm_subs_epu16(t16, v_max16));
+        if (__builtin_expect(!_mm_testz_si128(bad, bad), 0)) return false;
+
+        __m128i m32 = _mm_madd_epi16(t16, v_sec);
+        uint64_t r  = uint64_t(_mm_cvtsi128_si64(m32));
+        out_hms = uint32_t(r) + uint32_t(r >> 32);
+        return true;
+#elif defined(__aarch64__)
+        const uint8x8_t v_base = {'0','0',':','0','0',':','0','0'};
+        const uint8x8_t v_max  = {2, 9, 0, 5, 9, 0, 5, 9};
+        const uint8x8_t v_shuf = {0, 1, 3, 4, 6, 7, 255, 255};
+        const uint8x8_t v_10_1 = {10, 1, 10, 1, 10, 1, 0, 0};
+        const uint16x4_t v_m16 = {23, 59, 59, 0};
+
+        uint8x8_t v   = vld1_u8(reinterpret_cast<const uint8_t*>(s + 11));
+        uint8x8_t d   = vsub_u8(v, v_base);
+        uint8x8_t ov8 = vqsub_u8(d, v_max);
+        uint8x8_t p   = vtbl1_u8(d, v_shuf);
+        uint16x4_t t  = vpaddl_u8(vmul_u8(p, v_10_1));
+        uint8x8_t bad = vorr_u8(ov8, vreinterpret_u8_u16(vqsub_u16(t, v_m16)));
+        if (__builtin_expect(vget_lane_u64(vreinterpret_u64_u8(bad), 0) != 0, 0)) return false;
+
+        out_hms = uint32_t(vget_lane_u16(t, 0)) * 3600U
+                + uint32_t(vget_lane_u16(t, 1)) * 60U
+                + uint32_t(vget_lane_u16(t, 2));
+        return true;
+#else
+        return parse_hms_swar_noT(s, out_hms);
+#endif
+    }
+
+    // Trusted 7-uop SIMD single-HMS parser for rules.md-guaranteed valid F1 ingest_ts!
+    static SS_ALWAYS_INLINE uint32_t parse_hms_simd_trusted(const char* s) {
+#if defined(__SSE4_1__) || defined(__AVX2__)
+        const __m128i v_base = _mm_setr_epi8('0','0',':','0','0',':','0','0',  0,0,0,0,0,0,0,0);
+        const __m128i v_shuf = _mm_setr_epi8(0, 1, 3, 4, 6, 7, -1, -1,        -1,-1,-1,-1,-1,-1,-1,-1);
+        const __m128i v_10_1 = _mm_setr_epi8(10, 1, 10, 1, 10, 1, 0, 0,        0,0,0,0,0,0,0,0);
+        const __m128i v_sec  = _mm_setr_epi16(3600, 60, 1, 0, 0, 0, 0, 0);
+
+        __m128i v   = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + 11));
+        __m128i p   = _mm_shuffle_epi8(_mm_sub_epi8(v, v_base), v_shuf);
+        __m128i m32 = _mm_madd_epi16(_mm_maddubs_epi16(p, v_10_1), v_sec);
+        uint64_t r  = uint64_t(_mm_cvtsi128_si64(m32));
+        return uint32_t(r) + uint32_t(r >> 32);
+#else
         uint64_t w;
         std::memcpy(&w, s + 11, 8);
         uint64_t d = w - 0x30303A30303A3030ULL;
         uint64_t p = d * 10ULL + (d >> 8);
-        uint32_t hms = hms_from_p(p);
+        return hms_from_p(p);
+#endif
+    }
+
+    // 128-bit SIMD F2 parser: validates & parses HH:MM:SS (s[11..18]) + OH:OM (s[20..24]) simultaneously!
+    // Loads s+11 and s+17 => ZERO over-read past s[24] (100% ASAN-safe even on 25B std::string!).
+    static SS_ALWAYS_INLINE bool parse_f2_hms_tz_simd(
+        const char* s, uint32_t& out_hms, uint32_t& out_tz_sec
+    ) {
+#if defined(__SSE4_1__) || defined(__AVX2__)
+        const __m128i v_base  = _mm_setr_epi8('0','0',':','0','0',':','0','0',
+                                              0, 0, 0, '0','0',':','0','0');
+        const __m128i v_max   = _mm_setr_epi8(2, 9, 0, 5, 9, 0, 5, 9,
+                                              -1, -1, -1, 2, 9, 0, 5, 9);
+        const __m128i v_shuf  = _mm_setr_epi8(0, 1, 3, 4, 6, 7, -1, -1,
+                                              11, 12, 14, 15, -1, -1, -1, -1);
+        const __m128i v_10_1  = _mm_setr_epi8(10, 1, 10, 1, 10, 1, 0, 0,
+                                              10, 1, 10, 1,  0, 0, 0, 0);
+        const __m128i v_max16 = _mm_setr_epi16(23, 59, 59, 0, 23, 59, 0, 0);
+        const __m128i v_sec   = _mm_setr_epi16(3600, 60, 1, 0, 3600, 60, 0, 0);
+
+        __m128i lo  = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + 11));
+        __m128i hi  = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + 17));
+        __m128i v   = _mm_unpacklo_epi64(lo, hi);
+        __m128i d   = _mm_sub_epi8(v, v_base);
+        __m128i ov8 = _mm_subs_epu8(d, v_max);
+        __m128i p   = _mm_shuffle_epi8(d, v_shuf);
+        __m128i t16 = _mm_maddubs_epi16(p, v_10_1);
+        __m128i bad = _mm_or_si128(ov8, _mm_subs_epu16(t16, v_max16));
+        if (__builtin_expect(!_mm_testz_si128(bad, bad), 0)) return false;
+
+        __m128i m32  = _mm_madd_epi16(t16, v_sec);
+        __m128i sum  = _mm_add_epi32(m32, _mm_srli_epi64(m32, 32));
+        __m128i pk   = _mm_shuffle_epi32(sum, _MM_SHUFFLE(0, 0, 2, 0));
+        uint64_t r64 = uint64_t(_mm_cvtsi128_si64(pk));
+        out_hms    = uint32_t(r64);
+        out_tz_sec = uint32_t(r64 >> 32);
+        return true;
+#elif defined(__aarch64__)
+        const uint8x16_t v_base  = {'0','0',':','0','0',':','0','0',
+                                    0, 0, 0, '0','0',':','0','0'};
+        const uint8x16_t v_max   = {2, 9, 0, 5, 9, 0, 5, 9,
+                                    255, 255, 255, 2, 9, 0, 5, 9};
+        const uint8x16_t v_shuf  = {0, 1, 3, 4, 6, 7, 255, 255,
+                                    11, 12, 14, 15, 255, 255, 255, 255};
+        const uint8x16_t v_10_1  = {10, 1, 10, 1, 10, 1, 0, 0,
+                                    10, 1, 10, 1,  0, 0, 0, 0};
+        const uint16x8_t v_max16 = {23, 59, 59, 0, 23, 59, 0, 0};
+
+        uint8x16_t v   = vcombine_u8(vld1_u8(reinterpret_cast<const uint8_t*>(s + 11)),
+                                     vld1_u8(reinterpret_cast<const uint8_t*>(s + 17)));
+        uint8x16_t d   = vsubq_u8(v, v_base);
+        uint8x16_t ov8 = vqsubq_u8(d, v_max);
+        uint8x16_t p   = vqtbl1q_u8(d, v_shuf);
+        uint16x8_t t16 = vpaddlq_u8(vmulq_u8(p, v_10_1));
+        uint8x16_t bad = vorrq_u8(ov8, vreinterpretq_u8_u16(vqsubq_u16(t16, v_max16)));
+        if (__builtin_expect(vmaxvq_u32(vreinterpretq_u32_u8(bad)) != 0, 0)) return false;
+
+        out_hms    = uint32_t(vgetq_lane_u16(t16, 0)) * 3600U
+                   + uint32_t(vgetq_lane_u16(t16, 1)) * 60U
+                   + uint32_t(vgetq_lane_u16(t16, 2));
+        out_tz_sec = uint32_t(vgetq_lane_u16(t16, 4)) * 3600U
+                   + uint32_t(vgetq_lane_u16(t16, 5)) * 60U;
+        return true;
+#else
+        if (__builtin_expect(s[22] != ':', 0)) return false;
+        int oh, om;
+        if (__builtin_expect(!parse_hms_swar_noT(s, out_hms) || !parse_2d(s + 20, oh) || !parse_2d(s + 23, om), 0)) {
+            return false;
+        }
+        if (__builtin_expect((oh > 23) | (om > 59), 0)) return false;
+        out_tz_sec = uint32_t(oh) * 3600U + uint32_t(om) * 60U;
+        return true;
+#endif
+    }
+
+    static SS_ALWAYS_INLINE bool parse_hms_swar(const char* s, uint32_t& out_hms) {
+        if (__builtin_expect(s[10] != 'T', 0)) return false;
+        return parse_hms_simd_noT(s, out_hms);
+    }
+
+    // Out-of-line different-day / FastDay-miss resolver for parse_dual_f1_rel_sec (keeps hot loop DSB-slim!)
+    SS_NOINLINE bool resolve_dual_f1_diff_day(
+        const char* ts2, const char* ts3,
+        uint64_t ym2, uint32_t ddT2,
+        uint64_t ym3, uint32_t ddT3,
+        uint32_t hms2, uint32_t hms3,
+        int64_t& out_ts2_rel, int64_t& out_ts3_rel
+    ) const {
+        int64_t day2, day3;
+        const FastDay& fd2 = days[day_idx(ts2)];
+        if (__builtin_expect(((fd2.ym ^ ym2) | uint64_t(fd2.ddT ^ (ddT2 & 0x00FFFFFFU))) == 0, 1)) {
+            day2 = int64_t(fd2.rel_sec);
+        } else {
+            if (!parse_date_rel_slow(ts2, day2)) return false;
+        }
+        const FastDay& fd3 = days[day_idx(ts3)];
+        if (__builtin_expect(((fd3.ym ^ ym3) | uint64_t(fd3.ddT ^ (ddT3 & 0x00FFFFFFU))) == 0, 1)) {
+            day3 = int64_t(fd3.rel_sec);
+        } else {
+            if (!parse_date_rel_slow(ts3, day3)) return false;
+        }
+        out_ts2_rel = day2 + int64_t(hms2);
+        out_ts3_rel = day3 + int64_t(hms3);
+        return true;
+    }
+
+    // Same-Day Shortcut + 128-bit Dual-HMS F1+F1 parser!
+    // Caller guarantees len2==20, len3==20, ts2[19]=='Z', ts3[19]=='Z'.
+    SS_ALWAYS_INLINE bool parse_dual_f1_rel_sec(
+        const char* ts2, const char* ts3,
+        int64_t& out_ts2_rel, int64_t& out_ts3_rel
+    ) const {
+        uint32_t hms2, hms3;
+        if (__builtin_expect(!parse_dual_hms_simd(ts2 + 11, ts3 + 11, hms2, hms3), 0)) return false;
+        uint64_t ym2, ym3;
+        uint32_t ddT2, ddT3;
+        std::memcpy(&ym2, ts2, 8);
+        std::memcpy(&ddT2, ts2 + 8, 4);
+        std::memcpy(&ym3, ts3, 8);
+        std::memcpy(&ddT3, ts3 + 8, 4);
+
+        const FastDay& fd = days[day_idx(ts2)];
+        uint64_t diff = (ym2 ^ ym3) | (fd.ym ^ ym2)
+                      | uint64_t((ddT2 ^ ddT3) & 0x00FFFFFFU)
+                      | uint64_t(fd.ddT ^ (ddT2 & 0x00FFFFFFU));
+        if (__builtin_expect(diff == 0, 1)) {
+            int64_t day_rel = int64_t(fd.rel_sec);
+            out_ts2_rel = day_rel + int64_t(hms2);
+            out_ts3_rel = day_rel + int64_t(hms3);
+            return true;
+        }
+        return resolve_dual_f1_diff_day(ts2, ts3, ym2, ddT2, ym3, ddT3, hms2, hms3, out_ts2_rel, out_ts3_rel);
+    }
+
+    // Trusted F1 parser for ingest_ts (7-uop SIMD HMS + 1 FastDay lookup!)
+    SS_ALWAYS_INLINE bool parse_ingest_f1_rel_sec(const char* s, int64_t& out_rel_sec) const {
+        uint32_t hms = parse_hms_simd_trusted(s);
         uint64_t ym; uint32_t ddT;
         std::memcpy(&ym, s, 8);
         std::memcpy(&ddT, s + 8, 4);
         const FastDay& fd = days[day_idx(s)];
-        if (__builtin_expect(((fd.ym ^ ym) | ((fd.ddT ^ ddT) & 0x00FFFFFFU)) == 0, 1)) {
+        if (__builtin_expect(((fd.ym ^ ym) | uint64_t(fd.ddT ^ (ddT & 0x00FFFFFFU))) == 0, 1)) {
             out_rel_sec = int64_t(fd.rel_sec) + int64_t(hms);
             return true;
         }
         int64_t day_rel;
         if (!parse_date_rel_slow(s, day_rel)) return false;
         out_rel_sec = day_rel + int64_t(hms);
-        return true;
-    }
-
-    // Merged ddT + 1-mulx hms + 12-uop branchless SWAR F1/F2 tail (zero 14% F2 branch mispredict!).
-    // Caller guarantees >= 27 readable bytes at `s` (mmap guard page / 64B-padded ReadBuf).
-    SS_ALWAYS_INLINE bool parse_iso_f12_rel_sec(const char* s, size_t len, int64_t& out_rel_sec) const {
-        uint32_t hms;
-        if (__builtin_expect(!parse_hms_swar_noT(s, hms), 0)) return false;
-        uint64_t ym; uint32_t ddT;
-        std::memcpy(&ym, s, 8);
-        std::memcpy(&ddT, s + 8, 4);
-        const FastDay& fd = days[day_idx(s)];
-        int64_t day_rel;
-        if (__builtin_expect(((fd.ym ^ ym) | ((fd.ddT ^ ddT) & 0x00FFFFFFU)) == 0, 1)) {
-            day_rel = int64_t(fd.rel_sec);
-        } else {
-            if (!parse_date_rel_slow(s, day_rel)) return false;
-        }
-        uint64_t tz;
-        std::memcpy(&tz, s + 19, 8);
-        uint64_t t5   = (tz >> 8) & 0x000000FFFFFFFFFFULL;
-        uint64_t hi5  = t5 & 0x0000008080808080ULL;
-        uint64_t t5s  = (t5 | 0x0000008080808080ULL) - 0x00000030303A3030ULL;
-        uint64_t d5s  = t5s & 0x0000007F7F7F7F7FULL;
-        uint64_t u5   = d5s + 0x000000767A7F767DULL;
-        uint64_t bad5 = hi5 | ((~t5s | u5) & 0x0000008080808080ULL);
-        uint64_t p5   = d5s * 10ULL + (d5s >> 8);
-        uint32_t oh   = uint32_t(p5 & 0xFFU);
-        uint32_t om   = uint32_t((p5 >> 24) & 0xFFU);
-        uint32_t c19  = uint8_t(tz);
-        uint32_t is_f1 = (len == 20U) & (c19 == 'Z');
-        uint32_t f2_ok = (len == 25U) & ((c19 == '+') | (c19 == '-')) & (bad5 == 0) & (oh <= 23U);
-        if (__builtin_expect((is_f1 | f2_ok) == 0, 0)) return false;
-        int64_t off_mag = int64_t(oh * 3600U + om * 60U);
-        int64_t off_s = is_f1 ? 0LL : ((c19 == '+') ? -off_mag : off_mag);
-        out_rel_sec = day_rel + int64_t(hms) + off_s;
         return true;
     }
 
     SS_ALWAYS_INLINE bool parse_iso19_rel_sec(const char* s, int64_t& out_rel_sec) const {
         uint32_t hms;
-        if (__builtin_expect(!parse_hms_swar_noT(s, hms), 0)) return false;
+        if (__builtin_expect(!parse_hms_simd_noT(s, hms), 0)) return false;
         uint64_t ym; uint32_t ddT;
         std::memcpy(&ym, s, 8);
         std::memcpy(&ddT, s + 8, 4);
         const FastDay& fd = days[day_idx(s)];
-        if (__builtin_expect(((fd.ym ^ ym) | ((fd.ddT ^ ddT) & 0x00FFFFFFU)) == 0, 1)) {
+        if (__builtin_expect(((fd.ym ^ ym) | uint64_t(fd.ddT ^ (ddT & 0x00FFFFFFU))) == 0, 1)) {
             out_rel_sec = int64_t(fd.rel_sec) + int64_t(hms);
             return true;
         }
@@ -860,15 +1081,32 @@ struct DateLut {
         return true;
     }
 
+    // 128-bit SIMD F2 parser (skips scalar parse_2d & SWAR; caller ensures len == 25)
     SS_ALWAYS_INLINE bool parse_f2_rel_sec(const char* s, int64_t& out_rel_sec) const {
-        if (__builtin_expect(((s[19] != '+') & (s[19] != '-')) | (s[22] != ':'), 0)) return false;
-        int64_t rel_s;
-        int oh, om;
-        if (__builtin_expect(!parse_iso19_rel_sec(s, rel_s) || !parse_2d(s + 20, oh) || !parse_2d(s + 23, om), 0)) return false;
-        if (__builtin_expect((oh > 23) | (om > 59), 0)) return false;
-        int64_t off_s = int64_t(oh) * 3600LL + int64_t(om) * 60LL;
-        out_rel_sec = rel_s + ((s[19] == '+') ? -off_s : off_s);
+        char sgn = s[19];
+        if (__builtin_expect((sgn != '+') & (sgn != '-'), 0)) return false;
+        uint32_t hms, tz_sec;
+        if (__builtin_expect(!parse_f2_hms_tz_simd(s, hms, tz_sec), 0)) return false;
+        uint64_t ym; uint32_t ddT;
+        std::memcpy(&ym, s, 8);
+        std::memcpy(&ddT, s + 8, 4);
+        const FastDay& fd = days[day_idx(s)];
+        int64_t day_rel;
+        if (__builtin_expect(((fd.ym ^ ym) | uint64_t(fd.ddT ^ (ddT & 0x00FFFFFFU))) == 0, 1)) {
+            day_rel = int64_t(fd.rel_sec);
+        } else {
+            if (!parse_date_rel_slow(s, day_rel)) return false;
+        }
+        int64_t off_s = (sgn == '+') ? -int64_t(tz_sec) : int64_t(tz_sec);
+        out_rel_sec = day_rel + int64_t(hms) + off_s;
         return true;
+    }
+
+    // Clean len==20 vs len==25 separation: 57% F1 rows NEVER execute F2 ±HH:MM code!
+    SS_ALWAYS_INLINE bool parse_iso_f12_rel_sec(const char* s, size_t len, int64_t& out_rel_sec) const {
+        if (__builtin_expect(len == 20U && s[19] == 'Z', 1)) return parse_iso19_rel_sec(s, out_rel_sec);
+        if (__builtin_expect(len == 25U, 0)) return parse_f2_rel_sec(s, out_rel_sec);
+        return false;
     }
 };
 
@@ -1041,7 +1279,7 @@ static SS_ALWAYS_INLINE uint64_t prefix_xor(uint64_t q) {
 #endif
 }
 
-// 256-bit AVX-512VL Vec64: uses 1-cycle %k opmask compares with ZERO 512-bit ZMM downclocking on Cascade Lake!
+// 256-bit AVX-512VL Vec64: Port-5 opmask compares + Port-0/1 AVX2 eq_p01() (ZERO %zmm!)
 #if defined(__AVX512BW__) && defined(__AVX512VL__)
 struct Vec64 {
     __m256i v0, v1;
@@ -1051,10 +1289,18 @@ struct Vec64 {
             _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32))
         };
     }
+    // Port 5 vpcmpeqb %k + kunpckdq + 1x Port 0 kmovq
     SS_ALWAYS_INLINE uint64_t eq(char ch) const {
         __m256i vc = _mm256_set1_epi8(ch);
-        uint64_t m0 = uint32_t(_mm256_cmpeq_epi8_mask(v0, vc));
-        uint64_t m1 = uint32_t(_mm256_cmpeq_epi8_mask(v1, vc));
+        __mmask32 m0 = _mm256_cmpeq_epi8_mask(v0, vc);
+        __mmask32 m1 = _mm256_cmpeq_epi8_mask(v1, vc);
+        return uint64_t(_mm512_kunpackd(m1, m0));
+    }
+    // Port 0/1 AVX2 vpcmpeqb %ymm + vpmovmskb (offloads ',' off Port 5!)
+    SS_ALWAYS_INLINE uint64_t eq_p01(char ch) const {
+        __m256i vc = _mm256_set1_epi8(ch);
+        uint64_t m0 = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, vc)));
+        uint64_t m1 = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, vc)));
         return m0 | (m1 << 32);
     }
 };
@@ -1073,6 +1319,7 @@ struct Vec64 {
         uint64_t m1 = uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, vc)));
         return m0 | (m1 << 32);
     }
+    SS_ALWAYS_INLINE uint64_t eq_p01(char ch) const { return eq(ch); }
 };
 #elif defined(__aarch64__)
 struct Vec64 {
@@ -1095,6 +1342,7 @@ struct Vec64 {
         s0 = vpaddq_u8(s0, s0);
         return vgetq_lane_u64(vreinterpretq_u64_u8(s0), 0);
     }
+    SS_ALWAYS_INLINE uint64_t eq_p01(char ch) const { return eq(ch); }
 };
 #elif defined(__SSE2__)
 struct Vec64 {
@@ -1115,6 +1363,7 @@ struct Vec64 {
         uint64_t m3 = uint32_t(_mm_movemask_epi8(_mm_cmpeq_epi8(v3, vc)));
         return m0 | (m1 << 16) | (m2 << 32) | (m3 << 48);
     }
+    SS_ALWAYS_INLINE uint64_t eq_p01(char ch) const { return eq(ch); }
 };
 #endif
 
