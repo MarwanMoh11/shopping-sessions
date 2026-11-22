@@ -104,7 +104,7 @@ struct StringArenaPool {
 
     void init(int nthreads) {
         for (int t = 0; t < nthreads; ++t) {
-            base[t] = static_cast<char*>(alloc_mmap(RESERVATION, true));
+            base[t] = static_cast<char*>(alloc_mmap(RESERVATION, false));
             seg_base[ARENA_SEG_BASE + uint32_t(t)] = base[t];
             pos[t] = 0;
         }
@@ -660,7 +660,7 @@ static SS_ALWAYS_INLINE bool parse_4d(const char* p, int& out) {
 
 struct FastDay {
     uint64_t ym;
-    uint32_t ddT; // valid: low 24 bits = dd + 'T', byte 3 = 0x00; empty/collision: 0xFF000000U
+    uint32_t ddT; // valid: exact 4B "-DDT" at s[7..10] (byte 0 == '-' != 0); empty/collision: 0U
     int32_t  rel_sec;
 };
 
@@ -672,16 +672,8 @@ struct DateLut {
     int base_year = -1000000;
     int32_t table[NUM_YEARS * 16 * 32]{};
 
-    static SS_ALWAYS_INLINE uint32_t day_idx(const char* s) {
-#if defined(__BMI2__)
-        uint32_t w4;
-        std::memcpy(&w4, s + 6, 4);
-        return _pext_u32(w4, 0x0F030003U);
-#else
-        return ((uint32_t(uint8_t(s[6])) & 3U) << 6)
-             | ((uint32_t(uint8_t(s[8])) & 3U) << 4)
-             |  (uint32_t(uint8_t(s[9])) & 15U);
-#endif
+    static SS_ALWAYS_INLINE uint32_t day_idx_regs(uint64_t ym, uint32_t ddT) {
+        return (uint32_t(ym >> 42) & 0xC0U) | ((ddT >> 4) & 0x30U) | ((ddT >> 16) & 15U);
     }
 
     static SS_ALWAYS_INLINE uint32_t hms_from_p(uint64_t p) {
@@ -708,7 +700,7 @@ struct DateLut {
                 }
             }
         }
-        for (auto& e : days) { e.ym = 0; e.ddT = 0xFF000000U; e.rel_sec = INT32_MIN; }
+        for (auto& e : days) { e.ym = 0; e.ddT = 0U; e.rel_sec = INT32_MIN; }
         if (d_end - d_start <= 110) {
             for (int64_t d = d_start; d <= d_end; ++d) {
                 int y, m, dy;
@@ -726,18 +718,17 @@ struct DateLut {
                 b[8] = char('0' + dy / 10);
                 b[9] = char('0' + dy % 10);
                 b[10] = 'T';
-                uint32_t idx = day_idx(b);
                 uint64_t ym; uint32_t ddT;
                 std::memcpy(&ym, b, 8);
-                std::memcpy(&ddT, b + 8, 4);
-                ddT &= 0x00FFFFFFU;
+                std::memcpy(&ddT, b + 7, 4);
+                uint32_t idx = day_idx_regs(ym, ddT);
                 int64_t rel = d * 86400LL - win_start_sec;
                 if (rel < INT32_MIN + 1 || rel > INT32_MAX) continue;
-                if (days[idx].ym == 0 && days[idx].ddT == 0xFF000000U) {
+                if (days[idx].ym == 0 && days[idx].ddT == 0U) {
                     days[idx] = {ym, ddT, int32_t(rel)};
                 } else {
                     days[idx].ym = ~0ULL;
-                    days[idx].ddT = 0xFF000000U;
+                    days[idx].ddT = 0U;
                 }
             }
         }
@@ -1002,14 +993,14 @@ struct DateLut {
         int64_t& out_ts2_rel, int64_t& out_ts3_rel
     ) const {
         int64_t day2, day3;
-        const FastDay& fd2 = days[day_idx(ts2)];
-        if (__builtin_expect(((fd2.ym ^ ym2) | uint64_t(fd2.ddT ^ (ddT2 & 0x00FFFFFFU))) == 0, 1)) {
+        const FastDay& fd2 = days[day_idx_regs(ym2, ddT2)];
+        if (__builtin_expect(((fd2.ym ^ ym2) | uint64_t(fd2.ddT ^ ddT2)) == 0, 1)) {
             day2 = int64_t(fd2.rel_sec);
         } else {
             if (!parse_date_rel_slow(ts2, day2)) return false;
         }
-        const FastDay& fd3 = days[day_idx(ts3)];
-        if (__builtin_expect(((fd3.ym ^ ym3) | uint64_t(fd3.ddT ^ (ddT3 & 0x00FFFFFFU))) == 0, 1)) {
+        const FastDay& fd3 = days[day_idx_regs(ym3, ddT3)];
+        if (__builtin_expect(((fd3.ym ^ ym3) | uint64_t(fd3.ddT ^ ddT3)) == 0, 1)) {
             day3 = int64_t(fd3.rel_sec);
         } else {
             if (!parse_date_rel_slow(ts3, day3)) return false;
@@ -1019,7 +1010,7 @@ struct DateLut {
         return true;
     }
 
-    // Same-Day Shortcut + 128-bit Dual-HMS F1+F1 parser!
+    // Same-Day Shortcut + 128-bit Dual-HMS F1+F1 parser (zero-mask "-DDT" + zero-pext day_idx_regs!)
     // Caller guarantees len2==20, len3==20, ts2[19]=='Z', ts3[19]=='Z'.
     SS_ALWAYS_INLINE bool parse_dual_f1_rel_sec(
         const char* ts2, const char* ts3,
@@ -1030,14 +1021,12 @@ struct DateLut {
         uint64_t ym2, ym3;
         uint32_t ddT2, ddT3;
         std::memcpy(&ym2, ts2, 8);
-        std::memcpy(&ddT2, ts2 + 8, 4);
+        std::memcpy(&ddT2, ts2 + 7, 4);
         std::memcpy(&ym3, ts3, 8);
-        std::memcpy(&ddT3, ts3 + 8, 4);
+        std::memcpy(&ddT3, ts3 + 7, 4);
 
-        const FastDay& fd = days[day_idx(ts2)];
-        uint64_t diff = (ym2 ^ ym3) | (fd.ym ^ ym2)
-                      | uint64_t((ddT2 ^ ddT3) & 0x00FFFFFFU)
-                      | uint64_t(fd.ddT ^ (ddT2 & 0x00FFFFFFU));
+        const FastDay& fd = days[day_idx_regs(ym2, ddT2)];
+        uint64_t diff = (ym2 ^ ym3) | (fd.ym ^ ym2) | uint64_t(ddT2 ^ ddT3) | uint64_t(fd.ddT ^ ddT2);
         if (__builtin_expect(diff == 0, 1)) {
             int64_t day_rel = int64_t(fd.rel_sec);
             out_ts2_rel = day_rel + int64_t(hms2);
@@ -1047,14 +1036,14 @@ struct DateLut {
         return resolve_dual_f1_diff_day(ts2, ts3, ym2, ddT2, ym3, ddT3, hms2, hms3, out_ts2_rel, out_ts3_rel);
     }
 
-    // Trusted F1 parser for ingest_ts (7-uop SIMD HMS + 1 FastDay lookup!)
+    // Trusted F1 parser for ingest_ts (7-uop SIMD HMS + 1 zero-mask FastDay lookup!)
     SS_ALWAYS_INLINE bool parse_ingest_f1_rel_sec(const char* s, int64_t& out_rel_sec) const {
         uint32_t hms = parse_hms_simd_trusted(s);
         uint64_t ym; uint32_t ddT;
         std::memcpy(&ym, s, 8);
-        std::memcpy(&ddT, s + 8, 4);
-        const FastDay& fd = days[day_idx(s)];
-        if (__builtin_expect(((fd.ym ^ ym) | uint64_t(fd.ddT ^ (ddT & 0x00FFFFFFU))) == 0, 1)) {
+        std::memcpy(&ddT, s + 7, 4);
+        const FastDay& fd = days[day_idx_regs(ym, ddT)];
+        if (__builtin_expect(((fd.ym ^ ym) | uint64_t(fd.ddT ^ ddT)) == 0, 1)) {
             out_rel_sec = int64_t(fd.rel_sec) + int64_t(hms);
             return true;
         }
@@ -1069,9 +1058,9 @@ struct DateLut {
         if (__builtin_expect(!parse_hms_simd_noT(s, hms), 0)) return false;
         uint64_t ym; uint32_t ddT;
         std::memcpy(&ym, s, 8);
-        std::memcpy(&ddT, s + 8, 4);
-        const FastDay& fd = days[day_idx(s)];
-        if (__builtin_expect(((fd.ym ^ ym) | uint64_t(fd.ddT ^ (ddT & 0x00FFFFFFU))) == 0, 1)) {
+        std::memcpy(&ddT, s + 7, 4);
+        const FastDay& fd = days[day_idx_regs(ym, ddT)];
+        if (__builtin_expect(((fd.ym ^ ym) | uint64_t(fd.ddT ^ ddT)) == 0, 1)) {
             out_rel_sec = int64_t(fd.rel_sec) + int64_t(hms);
             return true;
         }
@@ -1089,10 +1078,10 @@ struct DateLut {
         if (__builtin_expect(!parse_f2_hms_tz_simd(s, hms, tz_sec), 0)) return false;
         uint64_t ym; uint32_t ddT;
         std::memcpy(&ym, s, 8);
-        std::memcpy(&ddT, s + 8, 4);
-        const FastDay& fd = days[day_idx(s)];
+        std::memcpy(&ddT, s + 7, 4);
+        const FastDay& fd = days[day_idx_regs(ym, ddT)];
         int64_t day_rel;
-        if (__builtin_expect(((fd.ym ^ ym) | uint64_t(fd.ddT ^ (ddT & 0x00FFFFFFU))) == 0, 1)) {
+        if (__builtin_expect(((fd.ym ^ ym) | uint64_t(fd.ddT ^ ddT)) == 0, 1)) {
             day_rel = int64_t(fd.rel_sec);
         } else {
             if (!parse_date_rel_slow(s, day_rel)) return false;

@@ -588,6 +588,79 @@ static inline void encode_u16_sparse_rle_dict(
     out.data.resize(start_sz + size_t(dst - base));
 }
 
+// Zero-hash-table 64-bit tzcnt RLE_DICTIONARY encoder for revenue_cents driven directly by top_cat_bitmap!
+// rev_dict[0] = 0LL; rev_dict[1..num_nz] = non-zero revenues in exact row order (handles 1..4 val_bytes for 60M!).
+static inline void encode_rev_bitmap_rle_dict(
+    Buf& out, const uint8_t* bitmap, size_t num_rows, size_t num_nz
+) {
+    const uint32_t n_dict = uint32_t(num_nz) + 1U;
+    const uint8_t bw = bits_for_count(n_dict);
+    out.u8(bw);
+    if (num_rows == 0) return;
+    if (bw == 0) {
+        out.varint_u64(uint64_t(num_rows) << 1);
+        return;
+    }
+    const size_t val_bytes = (size_t(bw) + 7U) >> 3;
+    const size_t start_sz = out.size();
+    out.data.resize(start_sz + num_nz * (6 + 2 * val_bytes) + 64);
+    uint8_t* const base = out.data.data() + start_sz;
+    uint8_t* dst = base;
+
+    auto emit_zrun = [&](size_t zrun) __attribute__((always_inline)) {
+        uint64_t hdr = uint64_t(zrun) << 1;
+        if (__builtin_expect(hdr < 128ULL, 1)) {
+            *dst++ = uint8_t(hdr);
+        } else {
+            while (hdr >= 0x80ULL) { *dst++ = uint8_t((hdr & 0x7FU) | 0x80U); hdr >>= 7; }
+            *dst++ = uint8_t(hdr);
+        }
+        uint32_t z = 0;
+        std::memcpy(dst, &z, 4);
+        dst += val_bytes;
+    };
+    auto emit_one = [&](uint32_t v) __attribute__((always_inline)) {
+        if (__builtin_expect(val_bytes <= 3, 1)) {
+            uint32_t w = 0x02U | (v << 8);
+            std::memcpy(dst, &w, 4);
+            dst += 1 + val_bytes;
+        } else {
+            *dst++ = 0x02U;
+            std::memcpy(dst, &v, 4);
+            dst += 4;
+        }
+    };
+
+    uint32_t cur_idx = 1;
+    size_t zrun = 0;
+    size_t row = 0;
+    while (row < num_rows) {
+        uint64_t w = 0;
+        const size_t rem = num_rows - row;
+        const size_t bits = (rem >= 64) ? 64 : rem;
+        if (__builtin_expect(bits == 64, 1)) {
+            std::memcpy(&w, bitmap + (row >> 3), 8);
+        } else {
+            std::memcpy(&w, bitmap + (row >> 3), (bits + 7) >> 3);
+            w &= (1ULL << bits) - 1ULL;
+        }
+        if (w == 0) { zrun += bits; row += bits; continue; }
+        size_t prev = 0;
+        while (w) {
+            size_t pos = size_t(__builtin_ctzll(w));
+            zrun += (pos - prev);
+            if (zrun) { emit_zrun(zrun); zrun = 0; }
+            emit_one(cur_idx++);
+            prev = pos + 1;
+            w &= w - 1;
+        }
+        zrun += (bits - prev);
+        row += bits;
+    }
+    if (zrun) emit_zrun(zrun);
+    out.data.resize(start_sz + size_t(dst - base));
+}
+
 static inline void write_dict_page_header(Buf& out, int32_t num_values, int32_t page_size) {
     int16_t last = 0;
     out.f_i32(last, 1, 2);          // PageType::DICTIONARY_PAGE = 2
