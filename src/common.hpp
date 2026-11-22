@@ -52,11 +52,8 @@ static inline void* alloc_mmap(size_t bytes, bool hugepage = false) {
         }
         uintptr_t addr = reinterpret_cast<uintptr_t>(raw);
         uintptr_t aligned = (addr + HP - 1) & ~(HP - 1);
-        size_t head = size_t(aligned - addr);
-        size_t tail = req - head - aligned_bytes;
-        if (head > 0) ::munmap(raw, head);
-        if (tail > 0) ::munmap(reinterpret_cast<void*>(aligned + aligned_bytes), tail);
         void* p = reinterpret_cast<void*>(aligned);
+        // Zero munmap() calls (untouched head/tail VA costs 0 physical RAM and avoids mmap_write_lock + TLB shootdowns!)
         ::madvise(p, aligned_bytes, MADV_HUGEPAGE);
         return p;
     }
