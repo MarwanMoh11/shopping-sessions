@@ -263,10 +263,11 @@ static SS_ALWAYS_INLINE size_t decode_uid48_inline(uint64_t uid48, char* out) {
     return be ? (9U - (uint32_t(__builtin_ctzll(be)) >> 3)) : 1U;
 }
 
-// Exact injective 128-bit encoder for 'u' + 32 lowercase hex chars (AVX2 ~12 uops + identical scalar fallback!).
-// Domain predicate depends ONLY on decoded bytes (disjoint from uid48 by length 33 vs 2..9).
-static SS_ALWAYS_INLINE bool encode_uhex128(const char* s, size_t len, uint64_t& lo, uint64_t& hi) {
-    if (__builtin_expect(len != 33 || s[0] != 'u', 0)) return false;
+// Exact injective 128-bit encoder for PFX ('u' or 'e') + 32 lowercase hex chars (AVX2 ~12 uops + identical scalar!).
+// Domain predicate depends ONLY on decoded bytes (disjoint from 2..9B inline codecs by length 33).
+template <char PFX>
+static SS_ALWAYS_INLINE bool encode_hex128(const char* s, size_t len, uint64_t& lo, uint64_t& hi) {
+    if (__builtin_expect(len != 33 || s[0] != PFX, 0)) return false;
 #if defined(__AVX2__)
     __m256i v   = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + 1));
     __m256i d   = _mm256_sub_epi8(v, _mm256_set1_epi8('0'));
@@ -297,6 +298,14 @@ static SS_ALWAYS_INLINE bool encode_uhex128(const char* s, size_t len, uint64_t&
     std::memcpy(&hi, out + 8, 8);
     return true;
 #endif
+}
+
+static SS_ALWAYS_INLINE bool encode_uhex128(const char* s, size_t len, uint64_t& lo, uint64_t& hi) {
+    return encode_hex128<'u'>(s, len, lo, hi);
+}
+
+static SS_ALWAYS_INLINE bool encode_ehex128(const char* s, size_t len, uint64_t& lo, uint64_t& hi) {
+    return encode_hex128<'e'>(s, len, lo, hi);
 }
 
 static SS_COLD_NOINLINE void decode_uhex128(uint64_t lo, uint64_t hi, char out[33]) {
@@ -896,6 +905,29 @@ static SS_ALWAYS_INLINE bool parse_ts_branchless_ms(const char* s, size_t len, i
     return parse_ts_slow(s, len, out_ms, lut);
 }
 
+// Out-of-line F2 (±HH:MM) + slow timestamp helper for format-selected fast scanner!
+static SS_NOINLINE bool parse_ts_f2_or_slow_rel(
+    const char* s, size_t len, const DateLut& lut,
+    int64_t& out_rel_sec, int64_t& out_ms, bool& out_from_sec
+) {
+    if (__builtin_expect(len == 25 && (s[19] == '+' || s[19] == '-'), 1)) {
+        out_from_sec = true;
+        return lut.parse_f2_rel_sec(s, out_rel_sec);
+    }
+    out_from_sec = false;
+    return parse_ts_slow(s, len, out_ms, lut);
+}
+
+static SS_NOINLINE bool parse_ts_f2_or_slow_ms(const char* s, size_t len, int64_t& out_ms, const DateLut& lut) {
+    if (__builtin_expect(len == 25 && (s[19] == '+' || s[19] == '-'), 1)) {
+        int64_t rel_s;
+        if (__builtin_expect(!lut.parse_f2_rel_sec(s, rel_s), 0)) return false;
+        out_ms = (lut.win_start_sec + rel_s) * 1000LL;
+        return true;
+    }
+    return parse_ts_slow(s, len, out_ms, lut);
+}
+
 static SS_ALWAYS_INLINE bool parse_ts(const char* s, size_t len, int64_t& out_ms, const DateLut& lut) {
     if (__builtin_expect(len == 20 && s[19] == 'Z', 1)) {
         int64_t rel_s;
@@ -909,13 +941,7 @@ static SS_ALWAYS_INLINE bool parse_ts(const char* s, size_t len, int64_t& out_ms
         out_ms = sec * 1000LL + int64_t(msr);
         return true;
     }
-    if (__builtin_expect(len == 25 && (s[19] == '+' || s[19] == '-'), 1)) {
-        int64_t rel_s;
-        if (__builtin_expect(!lut.parse_f2_rel_sec(s, rel_s), 0)) return false;
-        out_ms = (lut.win_start_sec + rel_s) * 1000LL;
-        return true;
-    }
-    return parse_ts_slow(s, len, out_ms, lut);
+    return parse_ts_f2_or_slow_ms(s, len, out_ms, lut);
 }
 
 static SS_ALWAYS_INLINE bool parse_price_cents(const char* s, size_t len, uint32_t& out_price) {
@@ -1176,19 +1202,55 @@ static SS_ALWAYS_INLINE bool extract_short64(
     }
 }
 
-// Zero-CLMUL, zero-quote-realign extractor for block-validated clean 4KB windows!
-// Returns: 1 = extracted cleanly into `out`, 0 = invalid comma count, -1 = long/empty line needing scalar fallback.
-// NEVER passes `out` to any noinline function so GCC/Clang can 100% SRA `Slice f[N]` into registers!
-template <int N>
-static SS_ALWAYS_INLINE int extract_clean_csv(
-    const char* lp, size_t ls, uint32_t L, const uint64_t* cms, Slice out[N]
-) {
-    auto set_field = [&](int idx, uint32_t s, uint32_t e) SS_LAMBDA_INLINE {
-        uint32_t len = e - s;
-        uint32_t q = (len > 0) & (lp[s] == '"');
-        out[idx] = {lp + s + q, size_t(len - (q << 1))};
-    };
+// Branchless safe ctz64 (uses 1-cycle _tzcnt_u64 on BMI1 x86_64; MSB sentinel 1ULL<<63 on non-BMI!)
+static SS_ALWAYS_INLINE uint32_t ctz64_safe(uint64_t x) {
+#if defined(__BMI__)
+    return uint32_t(_tzcnt_u64(x));
+#else
+    return uint32_t(__builtin_ctzll(x | (1ULL << 63)));
+#endif
+}
 
+// Register-only lazy CSV row accessors (ZERO stack spills, ZERO store-forwarding stalls!)
+template <int N>
+struct PackedCsvRow {
+    const char* lp;
+    uint64_t pk; // byte i = offset of comma i (for i = 0..N-2)
+    uint32_t L;
+
+    template <int I>
+    SS_ALWAYS_INLINE Slice get() const {
+        uint32_t s = (I == 0) ? 0U : (uint32_t((pk >> ((I - 1) * 8)) & 0xFFU) + 1U);
+        uint32_t e = (I == N - 1) ? L : uint32_t((pk >> (I * 8)) & 0xFFU);
+        uint32_t l = e - s;
+        uint32_t q = (l > 0U) & (lp[s] == '"');
+        return {lp + s + q, size_t(l - (q << 1))};
+    }
+
+    template <int I>
+    SS_ALWAYS_INLINE bool nonempty() const {
+        uint32_t s = (I == 0) ? 0U : (uint32_t((pk >> ((I - 1) * 8)) & 0xFFU) + 1U);
+        uint32_t e = (I == N - 1) ? L : uint32_t((pk >> (I * 8)) & 0xFFU);
+        uint32_t l = e - s;
+        return (l > 2U) | ((l > 0U) & (lp[s] != '"'));
+    }
+};
+
+struct SliceCsvRow {
+    const Slice* f;
+    template <int I>
+    SS_ALWAYS_INLINE Slice get() const { return f[I]; }
+    template <int I>
+    SS_ALWAYS_INLINE bool nonempty() const { return f[I].len > 0; }
+};
+
+// Pure-register comma-offset packer for block-validated clean 4KB windows!
+// Eliminates the 20-cycle overlapping vmovdqu->scalar store-forwarding stall AND all 15 Slice f[7] stack spills!
+// Returns: 1 = packed into `out_pk`, 0 = invalid comma count, -1 = long/empty line needing scalar fallback.
+template <int N>
+static SS_ALWAYS_INLINE int extract_clean_packed(
+    size_t ls, uint32_t L, const uint64_t* cms, uint64_t& out_pk
+) {
     if constexpr (N == 7) {
         if (__builtin_expect(L == 0U || L >= 128U, 0)) return -1;
         size_t sbi = ls >> 6;
@@ -1213,29 +1275,25 @@ static SS_ALWAYS_INLINE int extract_clean_csv(
         uint32_t k1 = uint32_t(__builtin_popcountll(c1));
         if (__builtin_expect(k0 + k1 != 6U, 0)) return 0;
 
-        uint32_t p[8];
         if (__builtin_expect(k0 >= 2U && k0 <= 4U, 1)) {
-            // 100% branchless 6-comma extraction for k0 in {2, 3, 4} (~98.5% of all v4 events!)
-            p[0] = uint32_t(__builtin_ctzll(c0)); c0 &= c0 - 1;
-            p[1] = uint32_t(__builtin_ctzll(c0)); c0 &= c0 - 1;
-            p[2] = uint32_t(__builtin_ctzll(c0 | (1ULL << 63))); c0 &= c0 - 1;
-            p[3] = uint32_t(__builtin_ctzll(c0 | (1ULL << 63)));
-            p[k0 + 0] = 64U + uint32_t(__builtin_ctzll(c1)); c1 &= c1 - 1;
-            p[k0 + 1] = 64U + uint32_t(__builtin_ctzll(c1)); c1 &= c1 - 1;
-            p[k0 + 2] = 64U + uint32_t(__builtin_ctzll(c1 | (1ULL << 63))); c1 &= c1 - 1;
-            p[k0 + 3] = 64U + uint32_t(__builtin_ctzll(c1 | (1ULL << 63)));
-        } else {
-            uint32_t idx = 0;
-            while (c0) { p[idx++] = uint32_t(__builtin_ctzll(c0)); c0 &= c0 - 1; }
-            while (c1) { p[idx++] = 64U + uint32_t(__builtin_ctzll(c1)); c1 &= c1 - 1; }
+            // 100% branchless, 100% in-register byte packing! ZERO stack array, ZERO store-forwarding stall!
+            uint64_t w0 = uint64_t(ctz64_safe(c0));          c0 &= c0 - 1;
+            w0 |= uint64_t(ctz64_safe(c0)) << 8;             c0 &= c0 - 1;
+            w0 |= uint64_t(ctz64_safe(c0)) << 16;            c0 &= c0 - 1;
+            w0 |= uint64_t(ctz64_safe(c0)) << 24;
+            uint64_t w1 = uint64_t(64U + ctz64_safe(c1));    c1 &= c1 - 1;
+            w1 |= uint64_t(64U + ctz64_safe(c1)) << 8;       c1 &= c1 - 1;
+            w1 |= uint64_t(64U + ctz64_safe(c1)) << 16;      c1 &= c1 - 1;
+            w1 |= uint64_t(64U + ctz64_safe(c1)) << 24;
+            uint32_t bsh = k0 << 3;
+            out_pk = (w0 & ((1ULL << bsh) - 1ULL)) | (w1 << bsh);
+            return 1;
         }
-        set_field(0, 0U,        p[0]);
-        set_field(1, p[0] + 1U, p[1]);
-        set_field(2, p[1] + 1U, p[2]);
-        set_field(3, p[2] + 1U, p[3]);
-        set_field(4, p[3] + 1U, p[4]);
-        set_field(5, p[4] + 1U, p[5]);
-        set_field(6, p[5] + 1U, L);
+        uint64_t pk = 0;
+        uint32_t bsh = 0;
+        while (c0) { pk |= uint64_t(__builtin_ctzll(c0)) << bsh; bsh += 8; c0 &= c0 - 1; }
+        while (c1) { pk |= uint64_t(64U + __builtin_ctzll(c1)) << bsh; bsh += 8; c1 &= c1 - 1; }
+        out_pk = pk;
         return 1;
     } else if constexpr (N == 4) {
         if (__builtin_expect(L == 0U || L >= 128U, 0)) return -1;
@@ -1260,18 +1318,15 @@ static SS_ALWAYS_INLINE int extract_clean_csv(
         uint32_t k0 = uint32_t(__builtin_popcountll(c0));
         uint32_t k1 = uint32_t(__builtin_popcountll(c1));
         if (__builtin_expect(k0 + k1 != 3U, 0)) return 0;
-        // 100% branchless 3-comma extraction for ALL k0 in {0, 1, 2, 3} (100% of v4 clicks!)
-        uint32_t p[6];
-        p[0] = uint32_t(__builtin_ctzll(c0 | (1ULL << 63))); c0 &= c0 - 1;
-        p[1] = uint32_t(__builtin_ctzll(c0 | (1ULL << 63))); c0 &= c0 - 1;
-        p[2] = uint32_t(__builtin_ctzll(c0 | (1ULL << 63)));
-        p[k0 + 0] = 64U + uint32_t(__builtin_ctzll(c1 | (1ULL << 63))); c1 &= c1 - 1;
-        p[k0 + 1] = 64U + uint32_t(__builtin_ctzll(c1 | (1ULL << 63))); c1 &= c1 - 1;
-        p[k0 + 2] = 64U + uint32_t(__builtin_ctzll(c1 | (1ULL << 63)));
-        set_field(0, 0U,        p[0]);
-        set_field(1, p[0] + 1U, p[1]);
-        set_field(2, p[1] + 1U, p[2]);
-        set_field(3, p[2] + 1U, L);
+        // 100% branchless, 100% in-register for ALL k0 in {0, 1, 2, 3}!
+        uint64_t w0 = uint64_t(ctz64_safe(c0));          c0 &= c0 - 1;
+        w0 |= uint64_t(ctz64_safe(c0)) << 8;             c0 &= c0 - 1;
+        w0 |= uint64_t(ctz64_safe(c0)) << 16;
+        uint64_t w1 = uint64_t(64U + ctz64_safe(c1));    c1 &= c1 - 1;
+        w1 |= uint64_t(64U + ctz64_safe(c1)) << 8;       c1 &= c1 - 1;
+        w1 |= uint64_t(64U + ctz64_safe(c1)) << 16;
+        uint32_t bsh = k0 << 3;
+        out_pk = (w0 & ((1ULL << bsh) - 1ULL)) | (w1 << bsh);
         return 1;
     } else if constexpr (N == 2) {
         if (__builtin_expect(L == 0U || L >= 128U, 0)) return -1;
@@ -1295,13 +1350,35 @@ static SS_ALWAYS_INLINE int extract_clean_csv(
         }
         if (__builtin_expect(uint32_t(__builtin_popcountll(c0)) +
                              uint32_t(__builtin_popcountll(c1)) != 1U, 0)) return 0;
-        uint32_t p0 = c0 ? uint32_t(__builtin_ctzll(c0)) : (64U + uint32_t(__builtin_ctzll(c1)));
-        set_field(0, 0U,        p0);
-        set_field(1, p0 + 1U, L);
+        out_pk = c0 ? uint64_t(__builtin_ctzll(c0)) : (64ULL + uint64_t(__builtin_ctzll(c1)));
         return 1;
     } else {
         return -1;
     }
+}
+
+// Zero-CLMUL, zero-quote-realign extractor for block-validated clean 4KB windows!
+// Returns: 1 = extracted cleanly into `out`, 0 = invalid comma count, -1 = long/empty line needing scalar fallback.
+// NEVER passes `out` to any noinline function so GCC/Clang can 100% SRA `Slice f[N]` into registers!
+template <int N>
+static SS_ALWAYS_INLINE int extract_clean_csv(
+    const char* lp, size_t ls, uint32_t L, const uint64_t* cms, Slice out[N]
+) {
+    uint64_t pk = 0;
+    int er = extract_clean_packed<N>(ls, L, cms, pk);
+    if (__builtin_expect(er <= 0, 0)) return er;
+    PackedCsvRow<N> row{lp, pk, L};
+    if constexpr (N == 7) {
+        out[0] = row.template get<0>(); out[1] = row.template get<1>(); out[2] = row.template get<2>();
+        out[3] = row.template get<3>(); out[4] = row.template get<4>(); out[5] = row.template get<5>();
+        out[6] = row.template get<6>();
+    } else if constexpr (N == 4) {
+        out[0] = row.template get<0>(); out[1] = row.template get<1>();
+        out[2] = row.template get<2>(); out[3] = row.template get<3>();
+    } else if constexpr (N == 2) {
+        out[0] = row.template get<0>(); out[1] = row.template get<1>();
+    }
+    return 1;
 }
 
 static SS_ALWAYS_INLINE const char* find_nl_simd(const char* p, const char* end) {

@@ -549,12 +549,12 @@ static SS_ALWAYS_INLINE void scan_mmap_csv(const CsvTask& task, OnFields&& on_fi
             rq_carry = RQ >> 63;
             inq ^= (uint64_t(__builtin_popcountll(qm)) & 1ULL);
 
-            // Branchless 2-slot newline flattening (eliminates ~10M while(nm) branch mispredicts!)
+            // 100% branchless 2-slot newline flattening (zero branch on nm==0 / nm2==0 via ctz64_safe!)
             uint32_t base_off = uint32_t(bi << 6);
             uint32_t c = uint32_t(__builtin_popcountll(nm));
-            npos[nnl] = uint16_t(base_off + (nm ? uint32_t(__builtin_ctzll(nm)) : 0U));
+            npos[nnl] = uint16_t(base_off + ctz64_safe(nm));
             uint64_t nm2 = nm & (nm - 1);
-            npos[nnl + 1] = uint16_t(base_off + (nm2 ? uint32_t(__builtin_ctzll(nm2)) : 0U));
+            npos[nnl + 1] = uint16_t(base_off + ctz64_safe(nm2));
             if (__builtin_expect(c <= 2U, 1)) {
                 nnl += c;
             } else {
@@ -716,9 +716,9 @@ static SS_NOINLINE void scan_pread_csv(const CsvTask& task, ReadBuf& rbuf, OnFie
 
                 uint32_t base_off = uint32_t(bi << 6);
                 uint32_t c = uint32_t(__builtin_popcountll(nm));
-                npos[nnl] = uint16_t(base_off + (nm ? uint32_t(__builtin_ctzll(nm)) : 0U));
+                npos[nnl] = uint16_t(base_off + ctz64_safe(nm));
                 uint64_t nm2 = nm & (nm - 1);
-                npos[nnl + 1] = uint16_t(base_off + (nm2 ? uint32_t(__builtin_ctzll(nm2)) : 0U));
+                npos[nnl + 1] = uint16_t(base_off + ctz64_safe(nm2));
                 if (__builtin_expect(c <= 2U, 1)) {
                     nnl += c;
                 } else {
@@ -814,6 +814,336 @@ static SS_ALWAYS_INLINE void scan_csv(const CsvTask& task, ReadBuf& rbuf, OnFiel
         scan_mmap_csv<N>(task, std::forward<OnFields>(on_fields));
     } else {
         scan_pread_csv<N>(task, rbuf, std::forward<OnFields>(on_fields));
+    }
+}
+
+// Register-only lazy-field CSV scanner: passes PackedCsvRow<N>{lp, pk, L} (3 GPRs!) on the clean hot loop,
+// and routes dirty/long/tail lines through a single SS_COLD_NOINLINE SliceCsvRow callback!
+template <int N, typename OnRow>
+static SS_ALWAYS_INLINE void scan_mmap_csv_rows(const CsvTask& task, OnRow&& on_row) {
+    const CsvFile& file = *task.file;
+    const char* base = file.map_base;
+    const size_t fsz = file.file_size;
+    const size_t limit = task.end;
+    if (__builtin_expect(!base || fsz == 0 || task.start >= limit, 0)) return;
+
+#if defined(__linux__) && defined(MADV_POPULATE_READ)
+    {
+        size_t lo = task.start & ~size_t(4095);
+        size_t hi = (std::min<size_t>(fsz, limit + 4096) + 4095) & ~size_t(4095);
+        if (hi > lo) ::madvise(const_cast<char*>(base + lo), hi - lo, MADV_POPULATE_READ);
+    }
+#endif
+
+    size_t cur = task.start;
+    if (task.start == 0) {
+        const char* nl = find_nl_simd(base, base + fsz);
+        if (!nl) return;
+        cur = size_t(nl - base) + 1;
+        if (cur >= limit) return;
+    } else if (base[task.start - 1] != '\n') {
+        const char* nl = find_nl_simd(base + task.start, base + fsz);
+        if (!nl) return;
+        cur = size_t(nl - base) + 1;
+        if (cur >= limit) return;
+    }
+
+    uint64_t cms[68];
+    uint16_t npos[4098];
+    bool done = false;
+
+    auto on_cold = [&](const Slice* fs) SS_COLD_NOINLINE {
+        on_row(SliceCsvRow{fs});
+    };
+
+    while (cur < limit) {
+        size_t avail = fsz - cur;
+        size_t nblks = std::min<size_t>(64, avail >> 6);
+        if (__builtin_expect(nblks == 0, 0)) break;
+
+        const char* bptr = base + cur;
+        uint64_t any_bad = 0;
+        uint64_t s_carry = 1, rq_carry = 0, inq = 0;
+        uint32_t nnl = 0;
+        for (size_t bi = 0; bi < nblks; ++bi) {
+            if ((bi & 7U) == 0) __builtin_prefetch(bptr + (bi << 6) + 2048, 0, 1);
+            Vec64 v = Vec64::load(bptr + (bi << 6));
+            uint64_t nm = v.eq('\n');
+            uint64_t cm = v.eq(',');
+            uint64_t qm = v.eq('"');
+            cms[bi] = cm;
+            uint64_t S  = cm | nm;
+            uint64_t FS = (S << 1) | s_carry;
+            uint64_t RQ = qm & ~FS;
+            uint64_t PX = prefix_xor(qm) ^ (0ULL - inq);
+            any_bad |= (((RQ << 1) | rq_carry) & ~S) | (PX & S);
+            s_carry  = S >> 63;
+            rq_carry = RQ >> 63;
+            inq ^= (uint64_t(__builtin_popcountll(qm)) & 1ULL);
+
+            uint32_t base_off = uint32_t(bi << 6);
+            uint32_t c = uint32_t(__builtin_popcountll(nm));
+            npos[nnl] = uint16_t(base_off + ctz64_safe(nm));
+            uint64_t nm2 = nm & (nm - 1);
+            npos[nnl + 1] = uint16_t(base_off + ctz64_safe(nm2));
+            if (__builtin_expect(c <= 2U, 1)) {
+                nnl += c;
+            } else {
+                nnl += 2;
+                nm2 &= nm2 - 1;
+                while (nm2) {
+                    npos[nnl++] = uint16_t(base_off + uint32_t(__builtin_ctzll(nm2)));
+                    nm2 &= nm2 - 1;
+                }
+            }
+        }
+        cms[nblks] = cms[nblks + 1] = cms[nblks + 2] = 0;
+
+        size_t ls = 0;
+        const size_t lrel = limit - cur;
+        if (__builtin_expect(any_bad == 0, 1)) {
+            for (uint32_t ri = 0; ri < nnl; ++ri) {
+                size_t nl_rel = npos[ri];
+                uint32_t L = uint32_t(nl_rel - ls);
+                uint64_t pk = 0;
+                int er = extract_clean_packed<N>(ls, L, cms, pk);
+                if (__builtin_expect(er > 0, 1)) {
+                    on_row(PackedCsvRow<N>{bptr + ls, pk, L});
+                } else if (__builtin_expect(er < 0, 0)) {
+                    Slice fs[N];
+                    if (parse_csv_line_scalar<N>(bptr + ls, bptr + nl_rel, fs)) on_cold(fs);
+                }
+                ls = nl_rel + 1;
+                if (__builtin_expect(ls >= lrel, 0)) {
+                    cur += ls;
+                    done = true;
+                    break;
+                }
+            }
+        } else {
+            Slice fs[N];
+            for (uint32_t ri = 0; ri < nnl; ++ri) {
+                size_t nl_rel = npos[ri];
+                if (parse_csv_line_scalar<N>(bptr + ls, bptr + nl_rel, fs)) on_cold(fs);
+                ls = nl_rel + 1;
+                if (__builtin_expect(ls >= lrel, 0)) {
+                    cur += ls;
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if (done) break;
+        if (__builtin_expect(ls == 0, 0)) {
+            const char* nl = find_nl_simd(bptr + (nblks << 6), base + fsz);
+            if (!nl) break;
+            Slice fs[N];
+            if (parse_csv_line_scalar<N>(bptr, nl, fs)) on_cold(fs);
+            cur = size_t(nl - base) + 1;
+        } else {
+            cur += ls;
+        }
+    }
+
+    while (cur < limit && cur < fsz) {
+        const char* line = base + cur;
+        const char* nl = find_nl_simd(line, base + fsz);
+        const char* le = nl ? nl : (base + fsz);
+        Slice fs[N];
+        if (parse_csv_line_scalar<N>(line, le, fs)) on_cold(fs);
+        cur = nl ? (size_t(nl - base) + 1) : fsz;
+    }
+}
+
+template <int N, typename OnRow>
+static SS_NOINLINE void scan_pread_csv_rows(const CsvTask& task, ReadBuf& rbuf, OnRow&& on_row) {
+    const CsvFile& file = *task.file;
+    int fd = file.fd;
+    bool close_after = false;
+    if (__builtin_expect(fd < 0, 0)) {
+        fd = ::open(file.path.c_str(), O_RDONLY);
+        if (fd < 0) return;
+        close_after = true;
+    }
+
+    const size_t fsz = file.file_size;
+    const size_t limit = task.end;
+    size_t file_pos = (task.start > 0) ? (task.start - 1) : 0;
+    size_t carry = 0;
+    bool skip_first_line = true;
+    bool first_read = true;
+    bool hit_limit = false;
+
+    uint64_t cms[68];
+    uint16_t npos[4098];
+
+    auto on_cold = [&](const Slice* fs) SS_COLD_NOINLINE {
+        on_row(SliceCsvRow{fs});
+    };
+
+    while (true) {
+        if (file_pos >= fsz) break;
+        size_t bound = hit_limit ? fsz : std::min<size_t>(fsz, limit + 4096);
+        size_t to_read = hit_limit ? std::min<size_t>(4096, fsz - file_pos)
+                                   : std::min<size_t>(ReadBuf::READ_CHUNK, bound > file_pos ? (bound - file_pos) : std::min<size_t>(4096, fsz - file_pos));
+        if (__builtin_expect(carry + to_read + 128 > rbuf.cap, 0)) {
+            rbuf.ensure(carry + to_read + 128);
+        }
+        ssize_t got = pread_full(fd, rbuf.data + carry, to_read, file_pos);
+        if (got <= 0) break;
+        size_t buf_file_off = file_pos - carry;
+        file_pos += size_t(got);
+        size_t total = carry + size_t(got);
+        std::memset(rbuf.data + total, 0, 64);
+
+        size_t cur = 0;
+        if (__builtin_expect(first_read, 0)) {
+            first_read = false;
+            if (task.start > 0) {
+                cur = 1;
+                skip_first_line = (rbuf.data[0] != '\n');
+            }
+        }
+
+        if (__builtin_expect(skip_first_line, 0)) {
+            const char* nl = find_nl_simd(rbuf.data + cur, rbuf.data + total);
+            if (!nl) {
+                if (file_pos >= limit) break;
+                carry = 0;
+                continue;
+            }
+            cur = size_t(nl - rbuf.data) + 1;
+            skip_first_line = false;
+            if (buf_file_off + cur >= limit) break;
+        }
+
+        const size_t limit_in_buf = (limit > buf_file_off) ? std::min<size_t>(limit - buf_file_off, total) : 0;
+        bool done = false;
+
+        while (cur < limit_in_buf) {
+            size_t avail = total - cur;
+            size_t nblks = std::min<size_t>(64, avail >> 6);
+            if (__builtin_expect(nblks == 0, 0)) break;
+
+            const char* bptr = rbuf.data + cur;
+            uint64_t any_bad = 0;
+            uint64_t s_carry = 1, rq_carry = 0, inq = 0;
+            uint32_t nnl = 0;
+            for (size_t bi = 0; bi < nblks; ++bi) {
+                Vec64 v = Vec64::load(bptr + (bi << 6));
+                uint64_t nm = v.eq('\n');
+                uint64_t cm = v.eq(',');
+                uint64_t qm = v.eq('"');
+                cms[bi] = cm;
+                uint64_t S  = cm | nm;
+                uint64_t FS = (S << 1) | s_carry;
+                uint64_t RQ = qm & ~FS;
+                uint64_t PX = prefix_xor(qm) ^ (0ULL - inq);
+                any_bad |= (((RQ << 1) | rq_carry) & ~S) | (PX & S);
+                s_carry  = S >> 63;
+                rq_carry = RQ >> 63;
+                inq ^= (uint64_t(__builtin_popcountll(qm)) & 1ULL);
+
+                uint32_t base_off = uint32_t(bi << 6);
+                uint32_t c = uint32_t(__builtin_popcountll(nm));
+                npos[nnl] = uint16_t(base_off + ctz64_safe(nm));
+                uint64_t nm2 = nm & (nm - 1);
+                npos[nnl + 1] = uint16_t(base_off + ctz64_safe(nm2));
+                if (__builtin_expect(c <= 2U, 1)) {
+                    nnl += c;
+                } else {
+                    nnl += 2;
+                    nm2 &= nm2 - 1;
+                    while (nm2) {
+                        npos[nnl++] = uint16_t(base_off + uint32_t(__builtin_ctzll(nm2)));
+                        nm2 &= nm2 - 1;
+                    }
+                }
+            }
+            cms[nblks] = cms[nblks + 1] = cms[nblks + 2] = 0;
+
+            size_t ls = 0;
+            const size_t lrel = limit_in_buf - cur;
+            if (__builtin_expect(any_bad == 0, 1)) {
+                for (uint32_t ri = 0; ri < nnl; ++ri) {
+                    size_t nl_rel = npos[ri];
+                    uint32_t L = uint32_t(nl_rel - ls);
+                    uint64_t pk = 0;
+                    int er = extract_clean_packed<N>(ls, L, cms, pk);
+                    if (__builtin_expect(er > 0, 1)) {
+                        on_row(PackedCsvRow<N>{bptr + ls, pk, L});
+                    } else if (__builtin_expect(er < 0, 0)) {
+                        Slice fs[N];
+                        if (parse_csv_line_scalar<N>(bptr + ls, bptr + nl_rel, fs)) on_cold(fs);
+                    }
+                    ls = nl_rel + 1;
+                    if (__builtin_expect(ls >= lrel, 0)) {
+                        cur += ls;
+                        done = true;
+                        break;
+                    }
+                }
+            } else {
+                Slice fs[N];
+                for (uint32_t ri = 0; ri < nnl; ++ri) {
+                    size_t nl_rel = npos[ri];
+                    if (parse_csv_line_scalar<N>(bptr + ls, bptr + nl_rel, fs)) on_cold(fs);
+                    ls = nl_rel + 1;
+                    if (__builtin_expect(ls >= lrel, 0)) {
+                        cur += ls;
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            if (done) break;
+            if (__builtin_expect(ls == 0, 0)) {
+                const char* nl = find_nl_simd(bptr + (nblks << 6), rbuf.data + total);
+                if (!nl) break;
+                Slice fs[N];
+                if (parse_csv_line_scalar<N>(bptr, nl, fs)) on_cold(fs);
+                cur = size_t(nl - rbuf.data) + 1;
+                if (cur >= limit_in_buf) { done = true; break; }
+            } else {
+                cur += ls;
+            }
+        }
+
+        if (done && buf_file_off + cur >= limit) break;
+
+        while (cur < limit_in_buf) {
+            const char* line = rbuf.data + cur;
+            const char* nl = find_nl_simd(line, rbuf.data + total);
+            if (!nl) break;
+            Slice fs[N];
+            if (parse_csv_line_scalar<N>(line, nl, fs)) on_cold(fs);
+            cur = size_t(nl - rbuf.data) + 1;
+        }
+
+        if (buf_file_off + cur >= limit) break;
+
+        if (file_pos >= fsz) {
+            if (cur < total && buf_file_off + cur < limit) {
+                Slice fs[N];
+                if (parse_csv_line_scalar<N>(rbuf.data + cur, rbuf.data + total, fs)) on_cold(fs);
+            }
+            break;
+        }
+
+        carry = total - cur;
+        if (carry > 0) std::memmove(rbuf.data, rbuf.data + cur, carry);
+        if (file_pos >= limit) hit_limit = true;
+    }
+
+    if (close_after) ::close(fd);
+}
+
+template <int N, typename OnRow>
+static SS_ALWAYS_INLINE void scan_csv_rows(const CsvTask& task, ReadBuf& rbuf, OnRow&& on_row) {
+    if (__builtin_expect(task.file->map_base != nullptr, 1)) {
+        scan_mmap_csv_rows<N>(task, std::forward<OnRow>(on_row));
+    } else {
+        scan_pread_csv_rows<N>(task, rbuf, std::forward<OnRow>(on_row));
     }
 }
 
@@ -1233,14 +1563,16 @@ struct UserDict {
     }
 
     // Single-cache-line lock-free lookup/insert of 128-bit 'u' + 32 hex user -> dense pid!
-    // Out-of-line (NOT cold) so 13.4% rows stay fast while hot scan loop stays DSB-resident!
+    // Pre-leases PID & decodes name BEFORE claiming the HexLine slot so critical section is 3 stores (~3 ns)!
     SS_NOINLINE uint32_t get_or_insert_hex(
         uint64_t lo, uint64_t hi, uint64_t h,
         StringArenaPool& arenas, int tid,
         uint32_t& tl_cur, uint32_t& tl_end
     ) {
         size_t li = size_t(h) & hmask;
-        for (size_t pr = 0; pr < hcap; ++pr) {
+        const size_t max_lines = std::min<size_t>(hcap, 4096);
+        uint64_t prepared_name = 0;
+        for (size_t pr = 0; pr < max_lines; ++pr) {
             HexLine& line = hlines[li];
             std::atomic_ref<uint32_t> ac(line.ctrl);
             for (;;) {
@@ -1259,23 +1591,22 @@ struct UserDict {
                     continue;
                 }
                 if (__builtin_expect(claimed == 7U, 0)) break;
+                // Prepare PID lease & decoded name OUTSIDE the claimed critical section!
+                if (__builtin_expect(tl_cur >= tl_end, 0)) {
+                    if (!lease_pid_slow(tl_cur, tl_end)) return 0;
+                }
+                if (prepared_name == 0) {
+                    char tmp[33];
+                    decode_uhex128(lo, hi, tmp);
+                    prepared_name = arenas.store_fallback(tid, tmp, 33);
+                }
+                uint32_t np = tl_cur;
                 uint32_t e = uint32_t(__builtin_ctz(~claimed & 7U));
                 uint32_t exp = c;
                 if (ac.compare_exchange_weak(exp, c | (1U << e),
                                              std::memory_order_acq_rel, std::memory_order_acquire)) {
-                    if (__builtin_expect(tl_cur >= tl_end, 0)) {
-                        if (!lease_pid_slow(tl_cur, tl_end)) {
-                            line.k[e][0] = lo;
-                            line.k[e][1] = hi;
-                            line.pid[e]  = 0;
-                            ac.fetch_or(1U << (8U + e), std::memory_order_release);
-                            return 0;
-                        }
-                    }
-                    uint32_t np = tl_cur++;
-                    char tmp[33];
-                    decode_uhex128(lo, hi, tmp);
-                    pid_name[np] = arenas.store_fallback(tid, tmp, 33);
+                    ++tl_cur;
+                    pid_name[np] = prepared_name;
                     line.k[e][0] = lo;
                     line.k[e][1] = hi;
                     line.pid[e]  = np;
@@ -1983,6 +2314,38 @@ struct RawEvent16 {
     SS_ALWAYS_INLINE uint32_t inline_pid() const { return uint32_t((w1 >> 8) & 0xFFFFFFULL); }
 };
 
+// Direct 32-byte inline bucket record for all 'e' + 32 lowercase hex events (2 per 64B AVX2 NT flush!).
+// Eliminates FastSideSlab random DRAM reads, StringArena copies, and mmap memcmp for 99.99% of long EIDs!
+struct LongEv32 {
+    uint64_t k_lo, k_hi;
+    uint64_t ing_pid;   // [(ing_abs_sec + (1LL << 39)) : 40][pid : 24]
+    uint64_t payload;   // [ts_rel_ms : 32][price : 24][cat_id : 7][valid : 1]
+
+    static constexpr int64_t ABS_BIAS = 1LL << 39;
+
+    static SS_ALWAYS_INLINE LongEv32 make_valid(
+        uint64_t lo, uint64_t hi, int64_t ing_abs_sec, uint32_t pid,
+        uint32_t ts_rel_ms, uint32_t price, uint32_t cat_id
+    ) {
+        uint64_t a = (uint64_t(ing_abs_sec + ABS_BIAS) << 24) | uint64_t(pid);
+        uint64_t b = (uint64_t(ts_rel_ms) << 32) | (uint64_t(price) << 8) | (uint64_t(cat_id) << 1) | 1ULL;
+        return {lo, hi, a, b};
+    }
+
+    static SS_ALWAYS_INLINE LongEv32 make_invalid(uint64_t lo, uint64_t hi, int64_t ing_abs_sec) {
+        uint64_t a = uint64_t(ing_abs_sec + ABS_BIAS) << 24;
+        return {lo, hi, a, 0ULL};
+    }
+
+    SS_ALWAYS_INLINE uint64_t ing40() const { return ing_pid >> 24; }
+    SS_ALWAYS_INLINE uint32_t pid() const { return uint32_t(ing_pid & 0xFFFFFFULL); }
+    SS_ALWAYS_INLINE bool is_valid() const { return (payload & 1ULL) != 0; }
+    SS_ALWAYS_INLINE uint32_t ts_rel_ms() const { return uint32_t(payload >> 32); }
+    SS_ALWAYS_INLINE uint32_t price() const { return uint32_t((payload >> 8) & 0xFFFFFFULL); }
+    SS_ALWAYS_INLINE uint32_t cat_id() const { return uint32_t((payload >> 1) & 0x7FULL); }
+};
+static_assert(sizeof(LongEv32) == 32, "LongEv32 must be 32 bytes");
+
 template <typename SideContainer>
 static SS_COLD_NOINLINE int64_t get_exact_ingest_ms_slow(
     const RawEvent16& ev,
@@ -2501,7 +2864,7 @@ static void mkdir_p(const std::string& path) {
 }
 
 // ============================================================================
-// Split L1I-Hot Per-Task Scanners (24B Store-Port-Light Core + Sparse Side Prefetch Rings!)
+// Split L1I-Hot Per-Task Scanners (Zero-Spill Lazy Rows + 24B Core Ring + LongEv32!)
 // ============================================================================
 static constexpr size_t RING_SZ   = 32;
 static constexpr size_t RING_MASK = RING_SZ - 1;
@@ -2511,6 +2874,7 @@ static constexpr uint64_t EV_F_SHORT_U   = 1ULL << 0;
 static constexpr uint64_t EV_F_HEX_U     = 1ULL << 1;
 static constexpr uint64_t EV_F_NEED_SIDE = 1ULL << 2;
 static constexpr uint64_t EV_F_EID_SIDE  = 1ULL << 3;
+static constexpr uint64_t EV_F_LONG_EID  = 1ULL << 4;
 
 struct EvRingHex {
     uint64_t lo, hi;
@@ -2527,8 +2891,14 @@ struct EvRingSide {
     uint32_t price;
     uint32_t cat_id;
 };
+struct EvRingLong {
+    uint64_t elo, ehi;
+    int64_t  ing_abs_sec;
+    uint32_t price;
+    uint32_t cat_id;
+};
 
-// 24 B core (3 stores/row vs 11 in v11! Recomputes mix48(u48) in 3 uops at emit!)
+// 24 B core (3 stores/row! Recomputes mix48(u48) in 3 uops at emit!)
 struct EvRingCore {
     uint64_t q0;        // [u48:48 (bits 63..16)][eb:9 (bits 15..7)][flags:7 (bits 6..0)]
     uint64_t q1;        // [rem39:39 (bits 63..25)][irel21:21 (bits 24..4)][0:4]
@@ -2540,11 +2910,12 @@ static_assert(sizeof(EvRingCore) == 24, "EvRingCore must be 24 bytes");
 struct EvRingState {
     EvRingCore core[RING_SZ];
     EvRingHex  hex[RING_SZ];
+    EvRingLong long_ev[RING_SZ];
     EvRingSide side[RING_SZ];
     EvRingGen  gen[RING_SZ];
 };
 
-// 24 B click core (3 stores/row vs 8 in v11!)
+// 24 B click core (3 stores/row!)
 // u48_kind = (u48 << 2) | kind, where kind: 0 = uid48, 1 = uhex128, 2 = general
 struct ClickRingCore {
     uint64_t u48_kind;
@@ -2559,29 +2930,46 @@ struct ClickRingState {
     EvRingGen     gen[RING_SZ];
 };
 
-static SS_NOINLINE void emit_ev_side_slow(
-    uint32_t eb, uint32_t irel21, uint64_t rem39, bool eid_in_side,
+static SS_NOINLINE void emit_ev_extra_slow(
+    uint64_t q0, uint32_t eb, uint32_t irel21, uint64_t rem39,
     uint32_t ts_rel_ms, uint32_t pid,
-    const EvRingSide& sd, int tid,
+    const EvRingLong& lg, const EvRingSide& sd, int tid,
     PartitionedStore<RawEvent16, 256, EV_BUCKETS, 4>::ThreadState& ev_out,
+    PartitionedStore<LongEv32, 128, EV_BUCKETS, 2>::ThreadState& long_ev_out,
     FastSideSlab& side_slab
 ) {
-    uint32_t sidx = side_slab.push({sd.eid_key64, ts_rel_ms, pid, sd.ing_ms, sd.price, sd.cat_id});
-    ev_out.push(eb, RawEvent16::make_side(true, irel21, eid_in_side, rem39, tid, sidx));
+    if (__builtin_expect((q0 & EV_F_LONG_EID) != 0, 1)) {
+        long_ev_out.push(eb, LongEv32::make_valid(lg.elo, lg.ehi, lg.ing_abs_sec, pid, ts_rel_ms, lg.price, lg.cat_id));
+    } else {
+        uint32_t sidx = side_slab.push({sd.eid_key64, ts_rel_ms, pid, sd.ing_ms, sd.price, sd.cat_id});
+        ev_out.push(eb, RawEvent16::make_side(true, irel21, (q0 & EV_F_EID_SIDE) != 0, rem39, tid, sidx));
+    }
+}
+
+static SS_COLD_NOINLINE void stage_gen_user_ev_cold(
+    const char* uptr, size_t ulen, uint32_t seg_id, const char* seg_base,
+    EvRingGen& dst, const UserDict& dict
+) {
+    dst = {uptr, seg_base, uint32_t(ulen), seg_id};
+    dict.prefetch_gslot(hash_bytes(uptr, ulen));
 }
 
 static SS_COLD_NOINLINE void emit_ev_direct_gen_cold(
     const char* uptr, size_t ulen,
-    uint32_t eb, uint32_t irel21, uint64_t rem39, bool need_side, bool eid_in_side,
-    uint32_t ts_rel_ms, uint64_t eid_k64, int64_t ing_ms, uint32_t price, uint32_t cat_id,
+    uint32_t eb, uint32_t irel21, uint64_t rem39, bool is_long32, bool need_side, bool eid_in_side,
+    uint32_t ts_rel_ms, uint64_t elo, uint64_t ehi, int64_t ing_abs_sec,
+    uint64_t eid_k64, int64_t ing_ms, uint32_t price, uint32_t cat_id,
     UserDict& dict, StringArenaPool& arenas, int tid,
     PartitionedStore<RawEvent16, 256, EV_BUCKETS, 4>::ThreadState& ev_out,
+    PartitionedStore<LongEv32, 128, EV_BUCKETS, 2>::ThreadState& long_ev_out,
     FastSideSlab& side_slab,
     uint32_t& tl_cur, uint32_t& tl_end, uint32_t& g_cur, uint32_t& g_end
 ) {
     uint64_t h = hash_bytes(uptr, ulen);
     uint32_t pid = dict.get_or_insert_general(uptr, ulen, h, UINT32_MAX, nullptr, arenas, tid, tl_cur, tl_end, g_cur, g_end);
-    if (!need_side) {
+    if (is_long32) {
+        long_ev_out.push(eb, LongEv32::make_valid(elo, ehi, ing_abs_sec, pid, ts_rel_ms, price, cat_id));
+    } else if (!need_side) {
         ev_out.push(eb, RawEvent16::make_inline_pid(irel21, rem39, ts_rel_ms, pid));
     } else {
         uint32_t sidx = side_slab.push({eid_k64, ts_rel_ms, pid, ing_ms, price, cat_id});
@@ -2613,10 +3001,28 @@ static SS_COLD_NOINLINE bool parse_purchase_cold(
 }
 
 static SS_NOINLINE void encode_long_eid_slow(
-    const char* s, size_t len, uint32_t seg_id, const char* seg_base,
-    StringArenaPool& arenas, int tid,
+    const char* s, size_t len, bool use_long_ev32, bool ing_whole_sec,
+    uint32_t seg_id, const char* seg_base,
+    StringArenaPool& arenas, int tid, UserDict& dict,
+    bool& out_is_long32, uint64_t& out_elo, uint64_t& out_ehi,
     uint64_t& out_k64, uint32_t& out_eb, uint64_t& out_rem39
 ) {
+    uint64_t elo = 0, ehi = 0;
+    if (__builtin_expect(use_long_ev32 && encode_ehex128(s, len, elo, ehi), 1)) {
+        if (__builtin_expect(!ing_whole_sec, 0)) {
+            dict.dict_overflow.store(true, std::memory_order_relaxed);
+            out_is_long32 = false;
+            out_k64 = 0; out_eb = 0; out_rem39 = 0;
+            return;
+        }
+        uint64_t h = hash_uhex128(elo, ehi);
+        out_is_long32 = true;
+        out_elo = elo;
+        out_ehi = ehi;
+        out_eb = uint32_t(h >> (64 - EV_SHIFT));
+        return;
+    }
+    out_is_long32 = false;
     uint64_t k64 = encode_keyref_padded(s, len, seg_id, seg_base, arenas, tid);
     uint64_t h64 = ((k64 & FALLBACK_BIT) == 0) ? mix64(k64) : hash_bytes(s, len);
     out_k64 = k64;
@@ -2654,12 +3060,18 @@ static SS_COLD_NOINLINE bool check_ts_slow_ev(
 }
 
 static SS_COLD_NOINLINE void push_invalid_ev_cold(
+    bool is_long32, uint64_t elo, uint64_t ehi,
     bool eid_in_side, uint32_t irel21, uint32_t eb, uint64_t rem39,
     uint64_t eid_k64, bool ing_whole_sec, int64_t win_start_sec, int64_t ing_rel_sec, int64_t ing_ms,
     int tid,
     PartitionedStore<RawEvent16, 256, EV_BUCKETS, 4>::ThreadState& ev_out,
+    PartitionedStore<LongEv32, 128, EV_BUCKETS, 2>::ThreadState& long_ev_out,
     FastSideSlab& side_slab
 ) {
+    if (is_long32) {
+        long_ev_out.push(eb, LongEv32::make_invalid(elo, ehi, win_start_sec + ing_rel_sec));
+        return;
+    }
     if (!eid_in_side && irel21 != 0) {
         ev_out.push(eb, RawEvent16::make_invalid_inline(irel21, rem39));
         return;
@@ -2667,6 +3079,14 @@ static SS_COLD_NOINLINE void push_invalid_ev_cold(
     if (ing_whole_sec) ing_ms = (win_start_sec + ing_rel_sec) * 1000LL;
     uint32_t sidx = side_slab.push({eid_k64, 0U, 0U, ing_ms, 0U, 0U});
     ev_out.push(eb, RawEvent16::make_side(false, irel21, eid_in_side, rem39, tid, sidx));
+}
+
+static SS_COLD_NOINLINE uint32_t resolve_gen_user_cold(
+    const EvRingGen& gn, UserDict& dict, StringArenaPool& arenas, int tid,
+    uint32_t& tl_cur, uint32_t& tl_end, uint32_t& g_cur, uint32_t& g_end
+) {
+    return dict.get_or_insert_general(gn.ptr, gn.len, hash_bytes(gn.ptr, gn.len),
+                                      gn.seg_id, gn.seg_base, arenas, tid, tl_cur, tl_end, g_cur, g_end);
 }
 
 static SS_ALWAYS_INLINE void emit_click_ring_entry(
@@ -2689,9 +3109,7 @@ static SS_ALWAYS_INLINE void emit_click_ring_entry(
         const EvRingHex& hx = st.hex[slot];
         pid = dict.get_or_insert_hex(hx.lo, hx.hi, hash_uhex128(hx.lo, hx.hi), arenas, tid, tl_cur, tl_end);
     } else {
-        const EvRingGen& gn = st.gen[slot];
-        pid = dict.get_or_insert_general(gn.ptr, gn.len, hash_bytes(gn.ptr, gn.len),
-                                         gn.seg_id, gn.seg_base, arenas, tid, tl_cur, tl_end, g_cur, g_end);
+        pid = resolve_gen_user_cold(st.gen[slot], dict, arenas, tid, tl_cur, tl_end, g_cur, g_end);
     }
     uint32_t pb = pid & uint32_t(PERSON_BUCKETS - 1);
     clk_out.push(pb, CompactClick{r.cid, (uint64_t(pid >> PERSON_SHIFT) << 44) | r.ts_camp44});
@@ -2703,6 +3121,7 @@ static SS_ALWAYS_INLINE void emit_ev_ring_entry(
     StringArenaPool& arenas,
     int tid,
     PartitionedStore<RawEvent16, 256, EV_BUCKETS, 4>::ThreadState& ev_out,
+    PartitionedStore<LongEv32, 128, EV_BUCKETS, 2>::ThreadState& long_ev_out,
     FastSideSlab& side_slab,
     uint32_t& tl_cur, uint32_t& tl_end,
     uint32_t& g_cur,  uint32_t& g_end
@@ -2719,18 +3138,16 @@ static SS_ALWAYS_INLINE void emit_ev_ring_entry(
         const EvRingHex& hx = st.hex[slot];
         pid = dict.get_or_insert_hex(hx.lo, hx.hi, hash_uhex128(hx.lo, hx.hi), arenas, tid, tl_cur, tl_end);
     } else {
-        const EvRingGen& gn = st.gen[slot];
-        pid = dict.get_or_insert_general(gn.ptr, gn.len, hash_bytes(gn.ptr, gn.len),
-                                         gn.seg_id, gn.seg_base, arenas, tid, tl_cur, tl_end, g_cur, g_end);
+        pid = resolve_gen_user_cold(st.gen[slot], dict, arenas, tid, tl_cur, tl_end, g_cur, g_end);
     }
     const uint32_t eb = uint32_t((q0 >> 7) & 0x1FFULL);
     const uint64_t rem39 = q1 >> 25;
     const uint32_t irel21 = uint32_t((q1 >> 4) & 0x1FFFFFULL);
-    if (__builtin_expect((q0 & EV_F_NEED_SIDE) == 0, 1)) {
+    if (__builtin_expect((q0 & (EV_F_NEED_SIDE | EV_F_LONG_EID)) == 0, 1)) {
         ev_out.push(eb, RawEvent16::make_inline_pid(irel21, rem39, ts_rel_ms, pid));
     } else {
-        emit_ev_side_slow(eb, irel21, rem39, (q0 & EV_F_EID_SIDE) != 0, ts_rel_ms, pid,
-                          st.side[slot], tid, ev_out, side_slab);
+        emit_ev_extra_slow(q0, eb, irel21, rem39, ts_rel_ms, pid,
+                           st.long_ev[slot], st.side[slot], tid, ev_out, long_ev_out, side_slab);
     }
 }
 
@@ -2754,46 +3171,48 @@ static SS_NOINLINE void process_click_task_fast(
     const char* seg_base = task.file->map_base;
     const bool is_mmap = (seg_id < StringArenaPool::ARENA_SEG_BASE);
 
-    scan_csv<4>(task, rbuf, [&](const Slice f[4]) SS_LAMBDA_INLINE {
-        if (__builtin_expect((f[0].len > 0) & (f[1].len > 0) & (f[2].len > 0) & (f[3].len > 0), 1)) {
-            uint32_t camp_idx = campaigns.lookup_padded(f[2].ptr, f[2].len);
-            if (__builtin_expect(camp_idx != FastStringIdMap::NOT_FOUND, 1)) {
-                int64_t ts = 0;
-                if (__builtin_expect(parse_ts_branchless_ms(f[3].ptr, f[3].len, ts, lut) &&
-                                     ts >= click_start_ms && ts < win_end_ms, 1)) {
-                    uint64_t cid = encode_keyref_padded(f[0].ptr, f[0].len, seg_id, seg_base, arenas, tid);
-                    uint64_t ts_camp44 = (uint64_t(uint32_t(ts - click_start_ms)) << 12) | uint64_t(camp_idx);
-                    const size_t slot = cpushed & RING_MASK;
-                    uint64_t u48 = 0;
-                    uint64_t uk = 0;
-                    if (__builtin_expect(encode_uid48_padded(f[1].ptr, f[1].len, u48), 1)) {
-                        uk = (u48 << 2);
-                        dict.prefetch_uslot(mix48(u48));
-                    } else {
-                        uint64_t lo = 0, hi = 0;
-                        if (__builtin_expect(encode_uhex128(f[1].ptr, f[1].len, lo, hi), 1)) {
-                            uk = 1ULL;
-                            cring.hex[slot] = {lo, hi};
-                            dict.prefetch_hline(hash_uhex128(lo, hi));
-                        } else if (__builtin_expect(is_mmap, 1)) {
-                            uk = 2ULL;
-                            cring.gen[slot] = {f[1].ptr, seg_base, uint32_t(f[1].len), seg_id};
-                            dict.prefetch_gslot(hash_bytes(f[1].ptr, f[1].len));
-                        } else {
-                            emit_clk_direct_gen_cold(f[1].ptr, f[1].len, cid, ts_camp44,
-                                                     dict, arenas, tid, clk_out, tl_cur, tl_end, g_cur, g_end);
-                            return;
-                        }
-                    }
-                    cring.core[slot] = {uk, cid, ts_camp44};
-                    if (__builtin_expect(cpushed >= RING_LAG, 1)) {
-                        emit_click_ring_entry(cring, (cpushed - RING_LAG) & RING_MASK,
-                                              dict, arenas, tid, clk_out, tl_cur, tl_end, g_cur, g_end);
-                    }
-                    ++cpushed;
-                }
+    scan_csv_rows<4>(task, rbuf, [&](auto row) SS_LAMBDA_INLINE {
+        Slice f2 = row.template get<2>();
+        if (__builtin_expect(f2.len == 0, 0)) return;
+        uint32_t camp_idx = campaigns.lookup_padded(f2.ptr, f2.len);
+        if (__builtin_expect(camp_idx == FastStringIdMap::NOT_FOUND, 0)) return;
+        Slice f3 = row.template get<3>();
+        int64_t ts = 0;
+        if (__builtin_expect(f3.len == 0 || !parse_ts(f3.ptr, f3.len, ts, lut) ||
+                             ts < click_start_ms || ts >= win_end_ms, 0)) return;
+        Slice f0 = row.template get<0>();
+        Slice f1 = row.template get<1>();
+        if (__builtin_expect((f0.len == 0) | (f1.len == 0), 0)) return;
+
+        uint64_t cid = encode_keyref_padded(f0.ptr, f0.len, seg_id, seg_base, arenas, tid);
+        uint64_t ts_camp44 = (uint64_t(uint32_t(ts - click_start_ms)) << 12) | uint64_t(camp_idx);
+        const size_t slot = cpushed & RING_MASK;
+        uint64_t u48 = 0;
+        uint64_t uk = 0;
+        if (__builtin_expect(encode_uid48_padded(f1.ptr, f1.len, u48), 1)) {
+            uk = (u48 << 2);
+            dict.prefetch_uslot(mix48(u48));
+        } else {
+            uint64_t lo = 0, hi = 0;
+            if (__builtin_expect(encode_uhex128(f1.ptr, f1.len, lo, hi), 1)) {
+                uk = 1ULL;
+                cring.hex[slot] = {lo, hi};
+                dict.prefetch_hline(hash_uhex128(lo, hi));
+            } else if (__builtin_expect(is_mmap, 1)) {
+                uk = 2ULL;
+                stage_gen_user_ev_cold(f1.ptr, f1.len, seg_id, seg_base, cring.gen[slot], dict);
+            } else {
+                emit_clk_direct_gen_cold(f1.ptr, f1.len, cid, ts_camp44,
+                                         dict, arenas, tid, clk_out, tl_cur, tl_end, g_cur, g_end);
+                return;
             }
         }
+        cring.core[slot] = {uk, cid, ts_camp44};
+        if (__builtin_expect(cpushed >= RING_LAG, 1)) {
+            emit_click_ring_entry(cring, (cpushed - RING_LAG) & RING_MASK,
+                                  dict, arenas, tid, clk_out, tl_cur, tl_end, g_cur, g_end);
+        }
+        ++cpushed;
     });
 }
 
@@ -2809,7 +3228,9 @@ static SS_NOINLINE void process_event_task_fast(
     int64_t win_start_sec,
     int64_t win_dur_ms,
     int64_t win_dur_sec,
+    bool use_long_ev32,
     PartitionedStore<RawEvent16, 256, EV_BUCKETS, 4>::ThreadState& ev_out,
+    PartitionedStore<LongEv32, 128, EV_BUCKETS, 2>::ThreadState& long_ev_out,
     FastSideSlab& side_slab,
     EvRingState& ering,
     size_t& epushed,
@@ -2826,33 +3247,37 @@ static SS_NOINLINE void process_event_task_fast(
     const char* seg_base = task.file->map_base;
     const bool is_mmap = (seg_id < StringArenaPool::ARENA_SEG_BASE);
 
-    scan_csv<7>(task, rbuf, [&](const Slice f[7]) SS_LAMBDA_INLINE {
-        if (__builtin_expect(f[0].len == 0, 0)) return;
+    scan_csv_rows<7>(task, rbuf, [&](auto row) SS_LAMBDA_INLINE {
+        Slice f0 = row.template get<0>();
+        if (__builtin_expect(f0.len == 0, 0)) return;
 
-        // 1. Parse ingest_ts + cache 10-byte YYYY-MM-DD for same-day F1 ts reuse!
+        // 1. Parse ingest_ts lazily + cache 10-byte YYYY-MM-DD for same-day F1 ts reuse!
+        Slice f3 = row.template get<3>();
         int64_t ing_rel_sec = 0;
         int64_t ing_ms = 0;
         bool ing_whole_sec = true;
         uint64_t ing_ym = 0;
         uint16_t ing_dd16 = 0;
         int64_t ing_day_rel = 0;
-        if (__builtin_expect(f[3].len == 20 && f[3].ptr[19] == 'Z', 1)) {
-            if (__builtin_expect(!lut.parse_ingest_f1_rel_sec_day(f[3].ptr, ing_rel_sec, ing_ym, ing_dd16, ing_day_rel), 0)) return;
+        if (__builtin_expect(f3.len == 20 && f3.ptr[19] == 'Z', 1)) {
+            if (__builtin_expect(!lut.parse_ingest_f1_rel_sec_day(f3.ptr, ing_rel_sec, ing_ym, ing_dd16, ing_day_rel), 0)) return;
         } else {
-            if (!parse_ingest_slow_ev(f[3].ptr, f[3].len, lut, win_start_sec, ing_ms, ing_whole_sec, ing_rel_sec)) return;
+            if (!parse_ingest_slow_ev(f3.ptr, f3.len, lut, win_start_sec, ing_ms, ing_whole_sec, ing_rel_sec)) return;
         }
 
-        // 2. Encode event_id -> 48b bijection (short) OR out-of-line zero-copy KeyRef + hash (12.5% long)
-        uint64_t eid48 = 0, eid_k64 = 0, rem39 = 0;
+        // 2. Encode event_id -> 48b bijection (short) OR direct 128b LongEv32 / general fallback!
+        uint64_t eid48 = 0, eid_k64 = 0, rem39 = 0, elo = 0, ehi = 0;
         uint32_t eb = 0;
+        bool is_long32 = false;
         bool eid_in_side = false;
-        if (__builtin_expect(encode_eid48_padded(f[0].ptr, f[0].len, eid48), 1)) {
+        if (__builtin_expect(encode_eid48_padded(f0.ptr, f0.len, eid48), 1)) {
             uint64_t h48 = mix48(eid48);
             eb = uint32_t(h48 >> 39);
             rem39 = h48 & RawEvent16::REM39_MASK;
         } else {
-            eid_in_side = true;
-            encode_long_eid_slow(f[0].ptr, f[0].len, seg_id, seg_base, arenas, tid, eid_k64, eb, rem39);
+            encode_long_eid_slow(f0.ptr, f0.len, use_long_ev32, ing_whole_sec, seg_id, seg_base,
+                                 arenas, tid, dict, is_long32, elo, ehi, eid_k64, eb, rem39);
+            eid_in_side = !is_long32;
         }
 
         uint32_t irel21 = 0U;
@@ -2861,83 +3286,99 @@ static SS_NOINLINE void process_event_task_fast(
             if (__builtin_expect(ir > 0 && ir <= RawEvent16::ING_MAX, 1)) irel21 = uint32_t(ir);
         }
 
-        // 3. Branchless event_type (single 8B load!) + non-empty user_id/product_id check
+        // 3. Lazy event_type (single 8B load!) + zero-unpack non-empty user_id/product_id check
+        Slice f4 = row.template get<4>();
         uint64_t v8 = 0;
-        std::memcpy(&v8, f[4].ptr, 8);
+        std::memcpy(&v8, f4.ptr, 8);
         uint32_t v4 = uint32_t(v8);
-        bool is_vc = (f[4].len == 4) & ((v4 == view_u32) | (v4 == cart_u32));
-        bool is_pur = (f[4].len == 8) & (v8 == pur_u64);
-        bool ok = (f[1].len > 0) & (f[5].len > 0) & (is_vc | is_pur);
+        bool is_vc = (f4.len == 4) & ((v4 == view_u32) | (v4 == cart_u32));
+        bool is_pur = (f4.len == 8) & (v8 == pur_u64);
+        bool ok = row.template nonempty<1>() & row.template nonempty<5>() & (is_vc | is_pur);
 
-        // 4. 100% Branchless F1 / F2 / F3 timestamp parse (slow check moved out-of-line!)
+        // 4. Format-selected fast F1 (58%, same-day reuse!) / F3 (32%, 13d SWAR!) / out-of-line F2 (10%)!
         int64_t ts_rel_sec = 0;
         int64_t ts_ms = 0;
         uint32_t ts_ms_rem = 0;
         bool ts_from_sec = true;
         if (__builtin_expect(ok, 1)) {
-            bool ts_ok = parse_ts_branchless_rel(f[2].ptr, f[2].len, lut, ing_ym, ing_dd16, ing_day_rel,
-                                                 win_start_sec, ts_rel_sec, ts_ms_rem);
-            if (__builtin_expect(ts_ok & ing_whole_sec, 1)) {
+            Slice f2 = row.template get<2>();
+            bool ts_ok;
+            if (__builtin_expect(f2.len == 20 && f2.ptr[19] == 'Z', 1)) {
+                ts_ok = lut.parse_iso19_rel_sec_reuse(f2.ptr, ing_ym, ing_dd16, ing_day_rel, ts_rel_sec);
+            } else if (__builtin_expect(f2.len == 13, 1)) {
+                int64_t f3_sec = 0;
+                ts_ok = parse_13d_sec_ms(f2.ptr, f3_sec, ts_ms_rem);
+                ts_rel_sec = f3_sec - win_start_sec;
+            } else {
+                ts_ok = parse_ts_f2_or_slow_rel(f2.ptr, f2.len, lut, ts_rel_sec, ts_ms, ts_from_sec);
+            }
+            if (__builtin_expect(ts_ok & ts_from_sec & ing_whole_sec, 1)) {
                 if (__builtin_expect(uint64_t(ts_rel_sec) >= uint64_t(win_dur_sec) ||
                                      ing_rel_sec - ts_rel_sec > 86400LL, 0)) {
                     ok = false;
                 }
             } else {
-                ok = check_ts_slow_ev(f[2].ptr, f[2].len, lut, ts_ok, true, ing_whole_sec,
+                ok = check_ts_slow_ev(f2.ptr, f2.len, lut, ts_ok, ts_from_sec, ing_whole_sec,
                                       win_start_sec, win_start_ms, win_dur_ms,
                                       ts_rel_sec, ts_ms_rem, ing_rel_sec,
                                       ing_ms, ts_ms, ts_from_sec);
             }
         }
 
-        // 5. Cold out-of-line purchase validation (~3% of rows!)
+        // 5. Cold out-of-line purchase validation (price/product fields unpacked ONLY on 3% purchase rows!)
         uint32_t price = 0, cat_id = 0;
         if (__builtin_expect(ok & is_pur, 0)) {
-            if (!parse_purchase_cold(f[6].ptr, f[6].len, f[5].ptr, f[5].len, products, price, cat_id)) {
+            Slice f6 = row.template get<6>();
+            Slice f5 = row.template get<5>();
+            if (!parse_purchase_cold(f6.ptr, f6.len, f5.ptr, f5.len, products, price, cat_id)) {
                 ok = false;
             }
         }
 
-        // 6. Cold out-of-line invalid row shortcut
+        // 6. Cold out-of-line invalid row shortcut (routes LongEv32 invalid tombstones directly to long_ev_out!)
         if (__builtin_expect(!ok, 0)) {
-            push_invalid_ev_cold(eid_in_side, irel21, eb, rem39, eid_k64,
+            push_invalid_ev_cold(is_long32, elo, ehi, eid_in_side, irel21, eb, rem39, eid_k64,
                                  ing_whole_sec, win_start_sec, ing_rel_sec, ing_ms,
-                                 tid, ev_out, side_slab);
+                                 tid, ev_out, long_ev_out, side_slab);
             return;
         }
 
-        // 7. ALL VALID ROWS -> 24 B Core + Sparse Side 24-Ahead Prefetch Ring!
+        // 7. ALL VALID ROWS -> 24 B Core + Sparse Side/Long 24-Ahead Prefetch Ring!
         uint32_t ts_rel_ms = ts_from_sec
             ? uint32_t(ts_rel_sec * 1000LL + int64_t(ts_ms_rem))
             : uint32_t(ts_ms - win_start_ms);
-        bool need_side = is_pur | eid_in_side | (irel21 == 0);
+        bool need_side = (!is_long32) & (is_pur | eid_in_side | (irel21 == 0));
         const size_t slot = epushed & RING_MASK;
-        uint64_t base_q0 = (uint64_t(eb) << 7) | (uint64_t(need_side) << 2) | (uint64_t(eid_in_side) << 3);
+        uint64_t base_q0 = (uint64_t(eb) << 7) | (uint64_t(need_side) << 2) |
+                           (uint64_t(eid_in_side) << 3) | (uint64_t(is_long32) << 4);
 
+        Slice f1 = row.template get<1>();
         uint64_t u48 = 0;
         uint64_t q0 = base_q0;
-        if (__builtin_expect(encode_uid48_padded(f[1].ptr, f[1].len, u48), 1)) {
+        if (__builtin_expect(encode_uid48_padded(f1.ptr, f1.len, u48), 1)) {
             q0 |= (u48 << 16) | EV_F_SHORT_U;
             dict.prefetch_uslot(mix48(u48));
         } else {
             uint64_t lo = 0, hi = 0;
-            if (__builtin_expect(encode_uhex128(f[1].ptr, f[1].len, lo, hi), 1)) {
+            if (__builtin_expect(encode_uhex128(f1.ptr, f1.len, lo, hi), 1)) {
                 q0 |= EV_F_HEX_U;
                 ering.hex[slot] = {lo, hi};
                 dict.prefetch_hline(hash_uhex128(lo, hi));
             } else if (__builtin_expect(is_mmap, 1)) {
-                ering.gen[slot] = {f[1].ptr, seg_base, uint32_t(f[1].len), seg_id};
-                dict.prefetch_gslot(hash_bytes(f[1].ptr, f[1].len));
+                stage_gen_user_ev_cold(f1.ptr, f1.len, seg_id, seg_base, ering.gen[slot], dict);
             } else {
                 if (need_side && ing_whole_sec && irel21 == 0) ing_ms = (win_start_sec + ing_rel_sec) * 1000LL;
-                emit_ev_direct_gen_cold(f[1].ptr, f[1].len, eb, irel21, rem39, need_side, eid_in_side,
-                                        ts_rel_ms, eid_k64, ing_ms, price, cat_id,
-                                        dict, arenas, tid, ev_out, side_slab, tl_cur, tl_end, g_cur, g_end);
+                emit_ev_direct_gen_cold(f1.ptr, f1.len, eb, irel21, rem39, is_long32, need_side, eid_in_side,
+                                        ts_rel_ms, elo, ehi, win_start_sec + ing_rel_sec,
+                                        eid_k64, ing_ms, price, cat_id,
+                                        dict, arenas, tid, ev_out, long_ev_out, side_slab, tl_cur, tl_end, g_cur, g_end);
                 return;
             }
         }
 
-        if (__builtin_expect(need_side, 0)) {
+        if (__builtin_expect(is_long32, 0)) {
+            ering.long_ev[slot] = {elo, ehi, win_start_sec + ing_rel_sec, price, cat_id};
+        } else if (__builtin_expect(need_side, 0)) {
             if (__builtin_expect(ing_whole_sec && irel21 == 0, 0)) {
                 ing_ms = (win_start_sec + ing_rel_sec) * 1000LL;
             }
@@ -2951,7 +3392,7 @@ static SS_NOINLINE void process_event_task_fast(
 
         if (__builtin_expect(epushed >= RING_LAG, 1)) {
             emit_ev_ring_entry(ering, (epushed - RING_LAG) & RING_MASK,
-                               dict, arenas, tid, ev_out, side_slab, tl_cur, tl_end, g_cur, g_end);
+                               dict, arenas, tid, ev_out, long_ev_out, side_slab, tl_cur, tl_end, g_cur, g_end);
         }
         ++epushed;
     });
@@ -3174,6 +3615,7 @@ struct FastLocalClick {
 
 static SS_NOINLINE bool run_fast_dict_dedup_sessionize_and_write(
     PartitionedStore<RawEvent16, 256, EV_BUCKETS, 4>& event_store,
+    PartitionedStore<LongEv32, 128, EV_BUCKETS, 2>& long_ev_store,
     const std::vector<FastSideSlab>& sides,
     PartitionedStore<CompactClick, 128, PERSON_BUCKETS, 4>& click_store,
     UserDict& dict,
@@ -3190,10 +3632,12 @@ static SS_NOINLINE bool run_fast_dict_dedup_sessionize_and_write(
     const std::string& cd_dir,
     bool prof
 ) {
-    using EvStore   = PartitionedStore<RawEvent16, 256, EV_BUCKETS, 4>;
-    using PEv8Store = PartitionedStore<CompactPersonEv8, 512, PERSON_BUCKETS, 8>;
-    using PurStore  = PartitionedStore<CompactPurchase, 64, PERSON_BUCKETS, 1>;
+    using EvStore     = PartitionedStore<RawEvent16, 256, EV_BUCKETS, 4>;
+    using LongEvStore = PartitionedStore<LongEv32, 128, EV_BUCKETS, 2>;
+    using PEv8Store   = PartitionedStore<CompactPersonEv8, 512, PERSON_BUCKETS, 8>;
+    using PurStore    = PartitionedStore<CompactPurchase, 64, PERSON_BUCKETS, 1>;
     static_assert(sizeof(EvStore::Block) == sizeof(PEv8Store::Block), "Block sizes must match for zero-fault recycling");
+    static_assert(sizeof(LongEvStore::Block) == sizeof(PEv8Store::Block), "LongEv32 block size must match for recycling");
 
     PEv8Store person_ev_store;
     PurStore purchase_store;
@@ -3214,16 +3658,19 @@ static SS_NOINLINE bool run_fast_dict_dedup_sessionize_and_write(
         msd_shift5 = (bits > 5U) ? (bits - 5U) : 0U;
     }
 
-    // Stage 2C: ZERO-mix64 L2-Hot Dedup + ZERO-LinkMap 8B Filtered NT Copy + 4KB Block Recycling!
+    // Stage 2C: ZERO-mix64 L2-Hot Short Dedup + L1D-Hot Direct LongEv32 Dedup + 4KB Block Recycling!
     using EvBlock = typename EvStore::Block;
+    using LongBlock = typename LongEvStore::Block;
     std::atomic<int> next_eb{0};
     pool.run([&](int tid) {
         struct DedupSlot8 { uint32_t fp; uint32_t handle1; };
         std::vector<uint32_t> ht4;
         std::vector<DedupSlot8> ht8;
         std::vector<EvBlock*> blks;
+        std::vector<LongBlock*> lblks;
         ht4.reserve(131072);
         blks.reserve(512);
+        lblks.reserve(128);
 
         auto& out_ev = *person_ev_store.ts[size_t(tid)];
         auto& out_pur = *purchase_store.ts[size_t(tid)];
@@ -3232,139 +3679,238 @@ static SS_NOINLINE bool run_fast_dict_dedup_sessionize_and_write(
             int b = next_eb.fetch_add(1, std::memory_order_relaxed);
             if (b >= EV_BUCKETS) break;
             size_t nb = event_store.bucket_count(b);
-            if (nb == 0) continue;
+            size_t nlb = long_ev_store.bucket_count(b);
+            if (nb == 0 && nlb == 0) continue;
 
-            blks.clear();
-            for (int st = 0; st < pool.nthreads; ++st) {
-                for (auto* blk = event_store.ts[size_t(st)]->heads[b]; blk; blk = blk->next) {
-                    blks.push_back(blk);
+            if (nb > 0) {
+                blks.clear();
+                for (int st = 0; st < pool.nthreads; ++st) {
+                    for (auto* blk = event_store.ts[size_t(st)]->heads[b]; blk; blk = blk->next) {
+                        blks.push_back(blk);
+                    }
                 }
-            }
 
-            size_t hcap = 64;
-            while (hcap < nb + (nb >> 1) + 16) hcap <<= 1;
-            size_t hmask = hcap - 1;
-            const uint32_t nblks = uint32_t(blks.size());
+                size_t hcap = 64;
+                while (hcap < nb + (nb >> 1) + 16) hcap <<= 1;
+                size_t hmask = hcap - 1;
+                const uint32_t nblks = uint32_t(blks.size());
 
-            // Loop 1: Exact dedup on RawEvent16::w0
-            if (__builtin_expect(nblks < 4095, 1)) {
-                ht4.assign(hcap, 0);
-                uint32_t* htp = ht4.data();
+                // Loop 1: Exact dedup on RawEvent16::w0
+                if (__builtin_expect(nblks < 4095, 1)) {
+                    ht4.assign(hcap, 0);
+                    uint32_t* htp = ht4.data();
+                    for (uint32_t bi = 0; bi < nblks; ++bi) {
+                        EvBlock* blk = blks[bi];
+                        const uint32_t cnt = blk->count;
+                        RawEvent16* items = blk->items;
+                        for (uint32_t i = 0; i < cnt; ++i) {
+                            if (__builtin_expect(i + 8 < cnt, 1)) {
+                                __builtin_prefetch(&htp[size_t(items[i + 8].w0) & hmask], 1, 1);
+                            }
+                            RawEvent16& ev = items[i];
+                            uint64_t eid40 = ev.eid40();
+                            uint32_t fp12 = uint32_t((eid40 >> 28) & 0xFFFULL) << 20;
+                            size_t slot = size_t(eid40) & hmask;
+                            while (true) {
+                                uint32_t entry = htp[slot];
+                                if (__builtin_expect(entry == 0, 1)) {
+                                    htp[slot] = fp12 | (((bi << 8) | i) + 1);
+                                    break;
+                                }
+                                if (__builtin_expect((entry & 0xFFF00000U) == fp12, 0)) {
+                                    uint32_t prev = (entry & 0x000FFFFFU) - 1;
+                                    RawEvent16& existing = blks[prev >> 8]->items[prev & 255U];
+                                    if (existing.eid40() == eid40) {
+                                        bool same = true;
+                                        if (__builtin_expect(ev.eid_in_side(), 0)) {
+                                            const FastSideEvent& sa = sides[existing.w1 >> 26][existing.w1 & 0x03FFFFFFU];
+                                            const FastSideEvent& sb = sides[ev.w1 >> 26][ev.w1 & 0x03FFFFFFU];
+                                            same = key_eq(sa.eid_key64, sb.eid_key64, arenas);
+                                        }
+                                        if (same) {
+                                            if (ingest_strictly_earlier(ev, existing, win_start_sec, sides)) {
+                                                existing = ev;
+                                            }
+                                            ev.w0 = 0;
+                                            break;
+                                        }
+                                    }
+                                }
+                                slot = (slot + 1) & hmask;
+                            }
+                        }
+                    }
+                } else {
+                    ht8.assign(hcap, {0, 0});
+                    for (uint32_t bi = 0; bi < nblks; ++bi) {
+                        EvBlock* blk = blks[bi];
+                        const uint32_t cnt = blk->count;
+                        RawEvent16* items = blk->items;
+                        for (uint32_t i = 0; i < cnt; ++i) {
+                            RawEvent16& ev = items[i];
+                            uint64_t eid40 = ev.eid40();
+                            uint32_t fp = uint32_t(eid40 >> 8);
+                            size_t slot = size_t(eid40) & hmask;
+                            while (true) {
+                                uint32_t h1 = ht8[slot].handle1;
+                                if (__builtin_expect(h1 == 0, 1)) {
+                                    ht8[slot] = {fp, ((bi << 8) | i) + 1};
+                                    break;
+                                }
+                                if (__builtin_expect(ht8[slot].fp == fp, 0)) {
+                                    uint32_t prev = h1 - 1;
+                                    RawEvent16& existing = blks[prev >> 8]->items[prev & 255U];
+                                    if (existing.eid40() == eid40) {
+                                        bool same = true;
+                                        if (__builtin_expect(ev.eid_in_side(), 0)) {
+                                            const FastSideEvent& sa = sides[existing.w1 >> 26][existing.w1 & 0x03FFFFFFU];
+                                            const FastSideEvent& sb = sides[ev.w1 >> 26][ev.w1 & 0x03FFFFFFU];
+                                            same = key_eq(sa.eid_key64, sb.eid_key64, arenas);
+                                        }
+                                        if (same) {
+                                            if (ingest_strictly_earlier(ev, existing, win_start_sec, sides)) {
+                                                existing = ev;
+                                            }
+                                            ev.w0 = 0;
+                                            break;
+                                        }
+                                    }
+                                }
+                                slot = (slot + 1) & hmask;
+                            }
+                        }
+                    }
+                }
+
+                // Loop 2 (short): ZERO LinkMap probes — 8B filtered NT copy + 8-ahead FastSideEvent prefetch!
                 for (uint32_t bi = 0; bi < nblks; ++bi) {
                     EvBlock* blk = blks[bi];
                     const uint32_t cnt = blk->count;
-                    RawEvent16* items = blk->items;
+                    const RawEvent16* items = blk->items;
                     for (uint32_t i = 0; i < cnt; ++i) {
                         if (__builtin_expect(i + 8 < cnt, 1)) {
-                            __builtin_prefetch(&htp[size_t(items[i + 8].w0) & hmask], 1, 1);
+                            const RawEvent16& ahead = items[i + 8];
+                            if (__builtin_expect(ahead.is_side() && ahead.is_valid(), 0)) {
+                                __builtin_prefetch(&sides[ahead.w1 >> 26][ahead.w1 & 0x03FFFFFFU], 0, 1);
+                            }
                         }
-                        RawEvent16& ev = items[i];
-                        uint64_t eid40 = ev.eid40();
-                        uint32_t fp12 = uint32_t((eid40 >> 28) & 0xFFFULL) << 20;
-                        size_t slot = size_t(eid40) & hmask;
-                        while (true) {
-                            uint32_t entry = htp[slot];
-                            if (__builtin_expect(entry == 0, 1)) {
-                                htp[slot] = fp12 | (((bi << 8) | i) + 1);
-                                break;
+                        const RawEvent16& ev = items[i];
+                        if (__builtin_expect(!ev.is_valid(), 0)) continue;
+                        if (__builtin_expect(!ev.is_side(), 1)) {
+                            uint32_t pid = ev.inline_pid();
+                            uint32_t ts_rel = ev.inline_ts_rel_ms();
+                            out_ev.push(pid & uint32_t(PERSON_BUCKETS - 1), CompactPersonEv8::make(pid >> PERSON_SHIFT, ts_rel));
+                        } else {
+                            const FastSideEvent& se = sides[ev.w1 >> 26][ev.w1 & 0x03FFFFFFU];
+                            uint32_t pid = se.pid;
+                            uint32_t pb = pid & uint32_t(PERSON_BUCKETS - 1);
+                            uint32_t pid_hi = pid >> PERSON_SHIFT;
+                            uint32_t ts_rel = se.ts_rel_ms;
+                            out_ev.push(pb, CompactPersonEv8::make(pid_hi, ts_rel));
+                            if (__builtin_expect(se.price > 0, 0)) {
+                                out_pur.push(pb, CompactPurchase{pid_hi, ts_rel, se.price, se.cat_id});
                             }
-                            if (__builtin_expect((entry & 0xFFF00000U) == fp12, 0)) {
-                                uint32_t prev = (entry & 0x000FFFFFU) - 1;
-                                RawEvent16& existing = blks[prev >> 8]->items[prev & 255U];
-                                if (existing.eid40() == eid40) {
-                                    bool same = true;
-                                    if (__builtin_expect(ev.eid_in_side(), 0)) {
-                                        const FastSideEvent& sa = sides[existing.w1 >> 26][existing.w1 & 0x03FFFFFFU];
-                                        const FastSideEvent& sb = sides[ev.w1 >> 26][ev.w1 & 0x03FFFFFFU];
-                                        same = key_eq(sa.eid_key64, sb.eid_key64, arenas);
-                                    }
-                                    if (same) {
-                                        if (ingest_strictly_earlier(ev, existing, win_start_sec, sides)) {
-                                            existing = ev;
-                                        }
-                                        ev.w0 = 0;
-                                        break;
-                                    }
-                                }
-                            }
-                            slot = (slot + 1) & hmask;
                         }
                     }
-                }
-            } else {
-                ht8.assign(hcap, {0, 0});
-                for (uint32_t bi = 0; bi < nblks; ++bi) {
-                    EvBlock* blk = blks[bi];
-                    const uint32_t cnt = blk->count;
-                    RawEvent16* items = blk->items;
-                    for (uint32_t i = 0; i < cnt; ++i) {
-                        RawEvent16& ev = items[i];
-                        uint64_t eid40 = ev.eid40();
-                        uint32_t fp = uint32_t(eid40 >> 8);
-                        size_t slot = size_t(eid40) & hmask;
-                        while (true) {
-                            uint32_t h1 = ht8[slot].handle1;
-                            if (__builtin_expect(h1 == 0, 1)) {
-                                ht8[slot] = {fp, ((bi << 8) | i) + 1};
-                                break;
-                            }
-                            if (__builtin_expect(ht8[slot].fp == fp, 0)) {
-                                uint32_t prev = h1 - 1;
-                                RawEvent16& existing = blks[prev >> 8]->items[prev & 255U];
-                                if (existing.eid40() == eid40) {
-                                    bool same = true;
-                                    if (__builtin_expect(ev.eid_in_side(), 0)) {
-                                        const FastSideEvent& sa = sides[existing.w1 >> 26][existing.w1 & 0x03FFFFFFU];
-                                        const FastSideEvent& sb = sides[ev.w1 >> 26][ev.w1 & 0x03FFFFFFU];
-                                        same = key_eq(sa.eid_key64, sb.eid_key64, arenas);
-                                    }
-                                    if (same) {
-                                        if (ingest_strictly_earlier(ev, existing, win_start_sec, sides)) {
-                                            existing = ev;
-                                        }
-                                        ev.w0 = 0;
-                                        break;
-                                    }
-                                }
-                            }
-                            slot = (slot + 1) & hmask;
-                        }
-                    }
+                    out_ev.recycle_block(blk);
                 }
             }
 
-            // Loop 2: ZERO LinkMap probes, ZERO hashing — 8B filtered NT copy + 8-ahead FastSideEvent prefetch!
-            for (uint32_t bi = 0; bi < nblks; ++bi) {
-                EvBlock* blk = blks[bi];
-                const uint32_t cnt = blk->count;
-                const RawEvent16* items = blk->items;
-                for (uint32_t i = 0; i < cnt; ++i) {
-                    if (__builtin_expect(i + 8 < cnt, 1)) {
-                        const RawEvent16& ahead = items[i + 8];
-                        if (__builtin_expect(ahead.is_side() && ahead.is_valid(), 0)) {
-                            __builtin_prefetch(&sides[ahead.w1 >> 26][ahead.w1 & 0x03FFFFFFU], 0, 1);
+            // Direct L1D-hot inline 128-bit LongEv32 dedup (~5K rows/bucket = 32 KB table, ZERO random side reads!)
+            if (nlb > 0) {
+                lblks.clear();
+                for (int st = 0; st < pool.nthreads; ++st) {
+                    for (auto* blk = long_ev_store.ts[size_t(st)]->heads[b]; blk; blk = blk->next) {
+                        lblks.push_back(blk);
+                    }
+                }
+                size_t lcap = 64;
+                while (lcap < nlb + (nlb >> 1) + 16) lcap <<= 1;
+                size_t lmask = lcap - 1;
+                const uint32_t nl = uint32_t(lblks.size());
+
+                if (__builtin_expect(nl < 8191, 1)) {
+                    ht4.assign(lcap, 0);
+                    uint32_t* htp = ht4.data();
+                    for (uint32_t bi = 0; bi < nl; ++bi) {
+                        LongBlock* blk = lblks[bi];
+                        const uint32_t cnt = blk->count;
+                        LongEv32* items = blk->items;
+                        for (uint32_t i = 0; i < cnt; ++i) {
+                            LongEv32& ev = items[i];
+                            uint64_t h = hash_uhex128(ev.k_lo, ev.k_hi);
+                            uint32_t fp12 = uint32_t((h >> 40) & 0xFFFULL) << 20;
+                            size_t slot = size_t(h) & lmask;
+                            while (true) {
+                                uint32_t entry = htp[slot];
+                                if (__builtin_expect(entry == 0, 1)) {
+                                    htp[slot] = fp12 | (((bi << 7) | i) + 1);
+                                    break;
+                                }
+                                if (__builtin_expect((entry & 0xFFF00000U) == fp12, 0)) {
+                                    uint32_t prev = (entry & 0x000FFFFFU) - 1;
+                                    LongEv32& existing = lblks[prev >> 7]->items[prev & 127U];
+                                    if (((existing.k_lo ^ ev.k_lo) | (existing.k_hi ^ ev.k_hi)) == 0) {
+                                        if (ev.ing40() < existing.ing40()) existing = ev;
+                                        ev.payload = 0;
+                                        break;
+                                    }
+                                }
+                                slot = (slot + 1) & lmask;
+                            }
                         }
                     }
-                    const RawEvent16& ev = items[i];
-                    if (__builtin_expect(!ev.is_valid(), 0)) continue;
-                    if (__builtin_expect(!ev.is_side(), 1)) {
-                        uint32_t pid = ev.inline_pid();
-                        uint32_t ts_rel = ev.inline_ts_rel_ms();
-                        out_ev.push(pid & uint32_t(PERSON_BUCKETS - 1), CompactPersonEv8::make(pid >> PERSON_SHIFT, ts_rel));
-                    } else {
-                        const FastSideEvent& se = sides[ev.w1 >> 26][ev.w1 & 0x03FFFFFFU];
-                        uint32_t pid = se.pid;
-                        uint32_t pb = pid & uint32_t(PERSON_BUCKETS - 1);
-                        uint32_t pid_hi = pid >> PERSON_SHIFT;
-                        uint32_t ts_rel = se.ts_rel_ms;
-                        out_ev.push(pb, CompactPersonEv8::make(pid_hi, ts_rel));
-                        if (__builtin_expect(se.price > 0, 0)) {
-                            out_pur.push(pb, CompactPurchase{pid_hi, ts_rel, se.price, se.cat_id});
+                } else {
+                    ht8.assign(lcap, {0, 0});
+                    for (uint32_t bi = 0; bi < nl; ++bi) {
+                        LongBlock* blk = lblks[bi];
+                        const uint32_t cnt = blk->count;
+                        LongEv32* items = blk->items;
+                        for (uint32_t i = 0; i < cnt; ++i) {
+                            LongEv32& ev = items[i];
+                            uint64_t h = hash_uhex128(ev.k_lo, ev.k_hi);
+                            uint32_t fp = uint32_t(h >> 24);
+                            size_t slot = size_t(h) & lmask;
+                            while (true) {
+                                uint32_t h1 = ht8[slot].handle1;
+                                if (__builtin_expect(h1 == 0, 1)) {
+                                    ht8[slot] = {fp, ((bi << 7) | i) + 1};
+                                    break;
+                                }
+                                if (__builtin_expect(ht8[slot].fp == fp, 0)) {
+                                    uint32_t prev = h1 - 1;
+                                    LongEv32& existing = lblks[prev >> 7]->items[prev & 127U];
+                                    if (((existing.k_lo ^ ev.k_lo) | (existing.k_hi ^ ev.k_hi)) == 0) {
+                                        if (ev.ing40() < existing.ing40()) existing = ev;
+                                        ev.payload = 0;
+                                        break;
+                                    }
+                                }
+                                slot = (slot + 1) & lmask;
+                            }
                         }
                     }
                 }
-                // Recycle dead 4 KB RawEvent16 block directly into person_ev_store free list!
-                out_ev.recycle_block(blk);
+
+                for (uint32_t bi = 0; bi < nl; ++bi) {
+                    LongBlock* blk = lblks[bi];
+                    const uint32_t cnt = blk->count;
+                    const LongEv32* items = blk->items;
+                    for (uint32_t i = 0; i < cnt; ++i) {
+                        const LongEv32& ev = items[i];
+                        if (__builtin_expect(!ev.is_valid(), 0)) continue;
+                        uint32_t pid = ev.pid();
+                        uint32_t pb = pid & uint32_t(PERSON_BUCKETS - 1);
+                        uint32_t pid_hi = pid >> PERSON_SHIFT;
+                        uint32_t ts_rel = ev.ts_rel_ms();
+                        out_ev.push(pb, CompactPersonEv8::make(pid_hi, ts_rel));
+                        uint32_t pr = ev.price();
+                        if (__builtin_expect(pr > 0, 0)) {
+                            out_pur.push(pb, CompactPurchase{pid_hi, ts_rel, pr, ev.cat_id()});
+                        }
+                    }
+                    out_ev.recycle_block(blk);
+                }
             }
         }
         out_ev.flush_all();
@@ -3372,17 +3918,19 @@ static SS_NOINLINE bool run_fast_dict_dedup_sessionize_and_write(
     });
     double td1 = now_ms();
 
-    // Stage 3 + Stage 4 FUSED: Direct L1D Array Grouping (NO pht, NO ev_pids!) + 4B Sort + 1-Session Fast Path!
+    // Stage 3 + Stage 4 FUSED: Weighted Bucket Scheduling (events + 2*clicks + 2*purchases) + Direct L1D Grouping!
     int bucket_order[PERSON_BUCKETS];
     size_t bucket_sizes[PERSON_BUCKETS];
+    size_t bucket_weight[PERSON_BUCKETS];
     size_t total_surviving = 0;
     for (int b = 0; b < PERSON_BUCKETS; ++b) {
         bucket_order[b] = b;
         bucket_sizes[b] = person_ev_store.bucket_count(b);
+        bucket_weight[b] = bucket_sizes[b] + 2 * click_store.bucket_count(b) + 2 * purchase_store.bucket_count(b);
         total_surviving += bucket_sizes[b];
     }
     std::sort(bucket_order, bucket_order + PERSON_BUCKETS, [&](int a, int b) {
-        return bucket_sizes[a] > bucket_sizes[b];
+        return bucket_weight[a] > bucket_weight[b];
     });
 
     const uint32_t max_pid = dict.next_pid.load(std::memory_order_acquire);
@@ -4310,6 +4858,18 @@ int run_engine(int argc, char** argv) {
     bool use_pread = std::getenv("USE_PREAD") != nullptr;
     bool force_wide = std::getenv("FORCE_WIDE") != nullptr;
 
+    // Launch products + campaigns loader BEFORE ThreadPool pins main to CPU 0 (inherits full affinity mask!)
+    Products products;
+    Campaigns campaigns;
+    struct ThreadJoiner {
+        std::thread t;
+        void join() { if (t.joinable()) t.join(); }
+        ~ThreadJoiner() { join(); }
+    } dims_thr{std::thread([&]() {
+        products.load(data_dir + "/products.csv");
+        campaigns.load(data_dir + "/campaigns.csv");
+    })};
+
     CpuTopology topo = detect_topology();
     int ncpu = topo.ncpu;
     ThreadPool pool(topo);
@@ -4338,14 +4898,6 @@ int run_engine(int argc, char** argv) {
     int32_t win_start_day = ms_to_day(win_start_ms);
     int32_t win_end_day = (win_end_ms > win_start_ms) ? ms_to_day(win_end_ms - 1) : win_start_day;
     int32_t num_days = std::max<int32_t>(1, win_end_day - win_start_day + 1);
-
-    // Overlap products.csv + campaigns.csv loading on a dedicated thread from t=0 (joined before use_fast_dict!)
-    Products products;
-    Campaigns campaigns;
-    std::thread dims_thr([&]() {
-        products.load(data_dir + "/products.csv");
-        campaigns.load(data_dir + "/campaigns.csv");
-    });
 
     std::string ud_dir = out_dir + "/user_daily";
     std::string cd_dir = out_dir + "/campaign_daily";
@@ -4436,10 +4988,13 @@ int run_engine(int argc, char** argv) {
     double t_scan = t_links;
 
     if (use_fast_dict) {
+        const bool use_long_ev32 = (products.cat_names.size() <= 127);
         PartitionedStore<CompactClick, 128, PERSON_BUCKETS, 4> click_store;
         PartitionedStore<RawEvent16, 256, EV_BUCKETS, 4> event_store;
+        PartitionedStore<LongEv32, 128, EV_BUCKETS, 2> long_ev_store;
         click_store.init(ncpu, 64ULL << 20);
         event_store.init(ncpu, 256ULL << 20);
+        long_ev_store.init(ncpu, use_long_ev32 ? (32ULL << 20) : 0ULL);
 
         if (dict.recycled_dsu && dict.recycled_dsu_bytes >= (4ULL << 20)) {
             size_t slice = (dict.recycled_dsu_bytes / size_t(ncpu)) & ~size_t(4095);
@@ -4449,7 +5004,9 @@ int run_engine(int argc, char** argv) {
             }
         }
 
-        size_t side_reserve = std::max<size_t>(48ULL << 20, std::min<size_t>(256ULL << 20, total_event_bytes / size_t(ncpu * 2)));
+        size_t side_reserve = use_long_ev32
+            ? (16ULL << 20)
+            : std::max<size_t>(48ULL << 20, std::min<size_t>(256ULL << 20, total_event_bytes / size_t(ncpu * 2)));
         std::vector<FastSideSlab> thread_sides(static_cast<size_t>(ncpu));
         for (int t = 0; t < ncpu; ++t) thread_sides[size_t(t)].init(side_reserve);
 
@@ -4458,6 +5015,7 @@ int run_engine(int argc, char** argv) {
             pool.run([&](int tid) {
                 auto& clk_out = *click_store.ts[size_t(tid)];
                 auto& ev_out = *event_store.ts[size_t(tid)];
+                auto& long_ev_out = *long_ev_store.ts[size_t(tid)];
                 auto& side_slab = thread_sides[size_t(tid)];
                 auto& rbuf = rbufs[size_t(tid)];
 
@@ -4480,7 +5038,7 @@ int run_engine(int argc, char** argv) {
                     if (epushed > 0) {
                         size_t s = (epushed > RING_LAG) ? (epushed - RING_LAG) : 0;
                         for (size_t k = s; k < epushed; ++k) {
-                            emit_ev_ring_entry(ering, k & RING_MASK, dict, arenas, tid, ev_out, side_slab, tl_cur, tl_end, g_cur, g_end);
+                            emit_ev_ring_entry(ering, k & RING_MASK, dict, arenas, tid, ev_out, long_ev_out, side_slab, tl_cur, tl_end, g_cur, g_end);
                         }
                         epushed = 0;
                     }
@@ -4495,25 +5053,26 @@ int run_engine(int argc, char** argv) {
                                                 click_start_ms, win_end_ms, clk_out, cring, cpushed, tl_cur, tl_end, g_cur, g_end);
                     } else {
                         process_event_task_fast(task, rbuf, tid, products, lut, dict, arenas,
-                                                win_start_ms, win_start_sec, win_dur_ms, win_dur_sec,
-                                                ev_out, side_slab, ering, epushed, tl_cur, tl_end, g_cur, g_end);
+                                                win_start_ms, win_start_sec, win_dur_ms, win_dur_sec, use_long_ev32,
+                                                ev_out, long_ev_out, side_slab, ering, epushed, tl_cur, tl_end, g_cur, g_end);
                     }
                 }
                 drain_clicks();
                 drain_events();
                 clk_out.flush_all();
                 ev_out.flush_all();
+                long_ev_out.flush_all();
             });
         }
         t_scan = now_ms();
 
         if (__builtin_expect(!dict.dict_overflow.load(std::memory_order_acquire), 1)) {
             write_ok = run_fast_dict_dedup_sessionize_and_write(
-                event_store, thread_sides, click_store, dict, products, campaigns, arenas, pool,
+                event_store, long_ev_store, thread_sides, click_store, dict, products, campaigns, arenas, pool,
                 win_start_ms, win_end_ms, win_start_sec, win_start_day, num_days, ud_dir, cd_dir, prof);
         } else {
-            // Ultra-rare >16.7M distinct users -> rebuild links classic & run wide fallback!
-            std::fprintf(stderr, "UserDict overflow (>16.7M users); falling back to wide mode\n");
+            // Ultra-rare >16.7M distinct users or fractional F3 ingest on hex EID -> rebuild classic & run wide fallback!
+            std::fprintf(stderr, "UserDict/LongEv fallback triggered; running wide mode\n");
             use_fast_dict = false;
         }
     }
