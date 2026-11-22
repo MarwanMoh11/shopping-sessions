@@ -1028,9 +1028,11 @@ static SS_ALWAYS_INLINE bool verify_periodic_nl_bits(const uint64_t* nl_bits, ui
     return diff == 0;
 }
 
-// Zero-quote-load BMI2 PEXT separator-indexed CSV scanner with periodic window fast-path & 4KB micro-batch flush!
-template <int N, typename OnRow, typename OnBatchEnd>
-static SS_NOINLINE void scan_mmap_csv_rows(const CsvTask& task, OnRow&& on_row, OnBatchEnd&& on_batch_end) {
+// Zero-quote-load BMI2 PEXT separator-indexed CSV scanner with periodic window callback & row fallback!
+template <int N, typename OnWindow, typename OnRow, typename OnBatchEnd>
+static SS_NOINLINE void scan_mmap_csv_core(
+    const CsvTask& task, OnWindow&& on_window, OnRow&& on_row, OnBatchEnd&& on_batch_end
+) {
     static constexpr uint32_t ROW_MASK = (1U << N) - 1U;
     static constexpr uint32_t ROW_WANT = 1U << (N - 1);
     static constexpr int UNROLL_K = (N == 4) ? 6 : 8;
@@ -1084,14 +1086,19 @@ static SS_NOINLINE void scan_mmap_csv_rows(const CsvTask& task, OnRow&& on_row, 
         const size_t lrel = limit - cur;
         if (__builtin_expect(sbuf.any_bad == 0, 1)) {
             const uint8_t* q_bytes = reinterpret_cast<const uint8_t*>(q_bits);
-            uint32_t n_used = (nsep / uint32_t(N)) * uint32_t(N);
-            if (__builtin_expect(n_used > 0 && lrel >= (nblks << 6) &&
+            uint32_t n_rows = nsep / uint32_t(N);
+            uint32_t n_used = n_rows * uint32_t(N);
+            if (__builtin_expect(n_rows > 0 && lrel >= (nblks << 6) &&
                                  verify_periodic_nl_bits<N>(nl_bits, nsep, n_used), 1)) {
-                for (uint32_t si = 0; si < n_used; si += uint32_t(N)) {
-                    uint16_t qb16;
-                    std::memcpy(&qb16, q_bytes + (si >> 3), 2);
-                    uint32_t qm = uint32_t(qb16) >> (si & 7U);
-                    on_row(SepsCsvRow<N>{bptr, seps + si, qm});
+                if constexpr (!std::is_same_v<std::decay_t<OnWindow>, std::nullptr_t>) {
+                    on_window(bptr, seps, q_bytes, n_rows);
+                } else {
+                    for (uint32_t si = 0; si < n_used; si += uint32_t(N)) {
+                        uint16_t qb16;
+                        std::memcpy(&qb16, q_bytes + (si >> 3), 2);
+                        uint32_t qm = uint32_t(qb16) >> (si & 7U);
+                        on_row(SepsCsvRow<N>{bptr, seps + si, qm});
+                    }
                 }
                 ls = size_t(seps[n_used - 1]) + 1;
             } else {
@@ -1177,8 +1184,10 @@ static SS_NOINLINE void scan_mmap_csv_rows(const CsvTask& task, OnRow&& on_row, 
     on_batch_end();
 }
 
-template <int N, typename OnRow, typename OnBatchEnd>
-static SS_NOINLINE void scan_pread_csv_rows(const CsvTask& task, ReadBuf& rbuf, OnRow&& on_row, OnBatchEnd&& on_batch_end) {
+template <int N, typename OnWindow, typename OnRow, typename OnBatchEnd>
+static SS_NOINLINE void scan_pread_csv_core(
+    const CsvTask& task, ReadBuf& rbuf, OnWindow&& on_window, OnRow&& on_row, OnBatchEnd&& on_batch_end
+) {
     static constexpr uint32_t ROW_MASK = (1U << N) - 1U;
     static constexpr uint32_t ROW_WANT = 1U << (N - 1);
     static constexpr int UNROLL_K = (N == 4) ? 6 : 8;
@@ -1261,14 +1270,19 @@ static SS_NOINLINE void scan_pread_csv_rows(const CsvTask& task, ReadBuf& rbuf, 
             const size_t lrel = limit_in_buf - cur;
             if (__builtin_expect(sbuf.any_bad == 0, 1)) {
                 const uint8_t* q_bytes = reinterpret_cast<const uint8_t*>(q_bits);
-                uint32_t n_used = (nsep / uint32_t(N)) * uint32_t(N);
-                if (__builtin_expect(n_used > 0 && lrel >= (nblks << 6) &&
+                uint32_t n_rows = nsep / uint32_t(N);
+                uint32_t n_used = n_rows * uint32_t(N);
+                if (__builtin_expect(n_rows > 0 && lrel >= (nblks << 6) &&
                                      verify_periodic_nl_bits<N>(nl_bits, nsep, n_used), 1)) {
-                    for (uint32_t si = 0; si < n_used; si += uint32_t(N)) {
-                        uint16_t qb16;
-                        std::memcpy(&qb16, q_bytes + (si >> 3), 2);
-                        uint32_t qm = uint32_t(qb16) >> (si & 7U);
-                        on_row(SepsCsvRow<N>{bptr, seps + si, qm});
+                    if constexpr (!std::is_same_v<std::decay_t<OnWindow>, std::nullptr_t>) {
+                        on_window(bptr, seps, q_bytes, n_rows);
+                    } else {
+                        for (uint32_t si = 0; si < n_used; si += uint32_t(N)) {
+                            uint16_t qb16;
+                            std::memcpy(&qb16, q_bytes + (si >> 3), 2);
+                            uint32_t qm = uint32_t(qb16) >> (si & 7U);
+                            on_row(SepsCsvRow<N>{bptr, seps + si, qm});
+                        }
                     }
                     ls = size_t(seps[n_used - 1]) + 1;
                 } else {
@@ -1376,13 +1390,22 @@ static SS_NOINLINE void scan_pread_csv_rows(const CsvTask& task, ReadBuf& rbuf, 
     if (close_after) ::close(fd);
 }
 
+template <int N, typename OnWindow, typename OnRow, typename OnBatchEnd>
+static SS_ALWAYS_INLINE void scan_csv_windows(
+    const CsvTask& task, ReadBuf& rbuf, OnWindow&& on_window, OnRow&& on_row, OnBatchEnd&& on_batch_end
+) {
+    if (__builtin_expect(task.file->map_base == nullptr, 1)) {
+        scan_pread_csv_core<N>(task, rbuf, std::forward<OnWindow>(on_window),
+                               std::forward<OnRow>(on_row), std::forward<OnBatchEnd>(on_batch_end));
+    } else {
+        scan_mmap_csv_core<N>(task, std::forward<OnWindow>(on_window),
+                              std::forward<OnRow>(on_row), std::forward<OnBatchEnd>(on_batch_end));
+    }
+}
+
 template <int N, typename OnRow, typename OnBatchEnd>
 static SS_ALWAYS_INLINE void scan_csv_rows(const CsvTask& task, ReadBuf& rbuf, OnRow&& on_row, OnBatchEnd&& on_batch_end) {
-    if (__builtin_expect(task.file->map_base == nullptr, 1)) {
-        scan_pread_csv_rows<N>(task, rbuf, std::forward<OnRow>(on_row), std::forward<OnBatchEnd>(on_batch_end));
-    } else {
-        scan_mmap_csv_rows<N>(task, std::forward<OnRow>(on_row), std::forward<OnBatchEnd>(on_batch_end));
-    }
+    scan_csv_windows<N>(task, rbuf, nullptr, std::forward<OnRow>(on_row), std::forward<OnBatchEnd>(on_batch_end));
 }
 
 // ============================================================================
@@ -1543,6 +1566,30 @@ struct Campaigns {
         }
         return map.find(s, len);
     }
+
+    // Leaf fast-path campaign lookup for (len - 3) <= 3: 1 = found, 0 = definitely absent, -1 = fallback to map.find()
+    SS_ALWAYS_INLINE int try_lookup_fast_c(const char* s, size_t len, uint32_t& out_idx) const {
+        if (__builtin_expect((s[0] == 'c') & (s[1] == '_'), 1)) {
+            uint32_t w;
+            std::memcpy(&w, s + 2, 4);
+            uint32_t sh = uint32_t(6 - len) << 3;
+            uint32_t b0_ok = uint8_t(w) - uint8_t('1');
+            uint32_t shifted = (w << sh) | (0x30303030U & ~((~0U) << sh));
+            uint32_t bad = ((shifted & 0xF0F0F0F0U) ^ 0x30303030U) |
+                           (((shifted + 0x06060606U) & 0xF0F0F0F0U) ^ 0x30303030U);
+            if (__builtin_expect((bad == 0) & (b0_ok < 9U), 1)) {
+                uint32_t d = shifted & 0x0F0F0F0FU;
+                uint32_t p = (d * 10U + (d >> 8)) & 0x00FF00FFU;
+                uint32_t n = (p & 0xFFU) * 100U + (p >> 16);
+                if (__builtin_expect(n < FAST_CAP, 1)) {
+                    uint16_t r = fast_c[n];
+                    if (__builtin_expect(r != NF16, 1)) { out_idx = uint32_t(r); return 1; }
+                    if (__builtin_expect(organic_idx <= NF16, 1)) return 0;
+                }
+            }
+        }
+        return -1;
+    }
 };
 
 struct Products {
@@ -1687,6 +1734,17 @@ struct UserDict {
     static constexpr size_t   PID_NAME_CAP  = 1ULL << 24;
     static constexpr uint32_t MAX_GENTRIES  = (1U << 24) - 4096U;
 
+    // 8-way cache-line-associative uid48 table (K >= 14 => 16,384 lines = 1 MiB VA min):
+    //   slot[w] = [tag34 = h48>>14 : 34][disp6 (1..63) : 6][pid24 : 24]  (0ULL = empty)
+    //   100% lossless bijection (34 + >=14 = >=48 bits), 97-99% 1st-line hit, ZERO cache-line splits!
+    static constexpr size_t   MIN_ULINES = 1ULL << 14;
+    static constexpr uint32_t MAX_UDISP  = 63U;
+
+    struct alignas(64) Uline {
+        uint64_t s[8];
+    };
+    static_assert(sizeof(Uline) == 64, "Uline must be exactly 64 bytes");
+
     struct GenEntry {
         uint64_t key;
         uint32_t pid;
@@ -1703,10 +1761,10 @@ struct UserDict {
     static_assert(sizeof(HexLine) == 64, "HexLine must be 64 bytes");
 
     bool fast_dict_mode = false;
-    uint64_t* uslots = nullptr;
-    size_t ucap = 0;
-    size_t umask = 0;
-    size_t uslots_bytes = 0;
+    Uline* ulines = nullptr;
+    size_t lcap = 0;
+    size_t lmask = 0;
+    size_t ulines_bytes = 0;
 
     // Inline 128-bit HexDict (THP-backed 64B cache-line table)
     HexLine* hlines = nullptr;
@@ -1714,7 +1772,7 @@ struct UserDict {
     size_t hmask = 0;
     size_t hlines_bytes = 0;
 
-    // Lock-free general/fallback user dictionary (rare non-hex long, UTF-8, uppercase & d>254 overflows!)
+    // Lock-free general/fallback user dictionary (rare non-hex long, UTF-8, uppercase & d>63 overflows!)
     // gslots[i] = [hash_tag32 : 32][entry_idx_plus_1 : 32] (0 = empty)
     uint64_t* gslots = nullptr;
     size_t gcap = 0;
@@ -1739,38 +1797,207 @@ struct UserDict {
     void* recycled_dsu = nullptr;
     size_t recycled_dsu_bytes = 0;
 
+    SS_ALWAYS_INLINE void prefetch_h48(uint64_t h48) const {
+        __builtin_prefetch(&ulines[size_t(h48) & lmask], 0, 3);
+    }
+
+    SS_ALWAYS_INLINE void prefetch_h48_l2(uint64_t h48) const {
+        __builtin_prefetch(&ulines[size_t(h48) & lmask], 0, 2);
+    }
+
     SS_ALWAYS_INLINE void prefetch_uslot(uint64_t h48) const {
-        __builtin_prefetch(&uslots[size_t(h48) & umask], 0, 3);
+        prefetch_h48(h48);
+    }
+
+    SS_ALWAYS_INLINE void prefetch_uslot_l2(uint64_t h48) const {
+        prefetch_h48_l2(h48);
     }
 
     SS_ALWAYS_INLINE void prefetch_hline(uint64_t h) const {
         __builtin_prefetch(&hlines[size_t(h) & hmask], 0, 3);
     }
 
+    SS_ALWAYS_INLINE void prefetch_hline_l2(uint64_t h) const {
+        __builtin_prefetch(&hlines[size_t(h) & hmask], 0, 2);
+    }
+
     SS_ALWAYS_INLINE void prefetch_gslot(uint64_t h) const {
         __builtin_prefetch(&gslots[size_t(h) & gmask], 0, 1);
     }
 
-    static SS_ALWAYS_INLINE bool try_lookup_h48_fast(
-        const uint64_t* __restrict slots_p, size_t mask_v, uint64_t h48, uint32_t& out_pid
+    // 256-bit AVX-512VL / AVX2 / NEON / scalar 8-way Uline tag+disp matcher (ZERO %zmm!)
+    static SS_ALWAYS_INLINE uint32_t uline_match_mask(const Uline& line, uint64_t want40) {
+#if defined(__AVX512VL__)
+        __m256i vw = _mm256_set1_epi64x(static_cast<long long>(want40));
+        __m256i v0 = _mm256_srli_epi64(_mm256_load_si256(reinterpret_cast<const __m256i*>(line.s)), 24);
+        __m256i v1 = _mm256_srli_epi64(_mm256_load_si256(reinterpret_cast<const __m256i*>(line.s + 4)), 24);
+        __mmask8 k0 = _mm256_cmpeq_epi64_mask(v0, vw);
+        __mmask8 k1 = _mm256_cmpeq_epi64_mask(v1, vw);
+        return uint32_t(k0) | (uint32_t(k1) << 4);
+#elif defined(__AVX2__)
+        __m256i vw = _mm256_set1_epi64x(static_cast<long long>(want40));
+        __m256i v0 = _mm256_srli_epi64(_mm256_load_si256(reinterpret_cast<const __m256i*>(line.s)), 24);
+        __m256i v1 = _mm256_srli_epi64(_mm256_load_si256(reinterpret_cast<const __m256i*>(line.s + 4)), 24);
+        uint32_t m0 = uint32_t(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v0, vw))));
+        uint32_t m1 = uint32_t(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v1, vw))));
+        return m0 | (m1 << 4);
+#elif defined(__aarch64__)
+        uint64x2_t vw = vdupq_n_u64(want40);
+        uint64x2_t c0 = vceqq_u64(vshrq_n_u64(vld1q_u64(line.s + 0), 24), vw);
+        uint64x2_t c1 = vceqq_u64(vshrq_n_u64(vld1q_u64(line.s + 2), 24), vw);
+        uint64x2_t c2 = vceqq_u64(vshrq_n_u64(vld1q_u64(line.s + 4), 24), vw);
+        uint64x2_t c3 = vceqq_u64(vshrq_n_u64(vld1q_u64(line.s + 6), 24), vw);
+        uint32x4_t m01 = vuzp1q_u32(vreinterpretq_u32_u64(c0), vreinterpretq_u32_u64(c1));
+        uint32x4_t m23 = vuzp1q_u32(vreinterpretq_u32_u64(c2), vreinterpretq_u32_u64(c3));
+        uint16x8_t m8  = vuzp1q_u16(vreinterpretq_u16_u32(m01), vreinterpretq_u16_u32(m23));
+        const uint16x8_t bits = {1, 2, 4, 8, 16, 32, 64, 128};
+        return uint32_t(vaddvq_u16(vandq_u16(m8, bits)));
+#else
+        uint32_t mask = 0;
+        for (uint32_t w = 0; w < 8; ++w) {
+            uint64_t sl = std::atomic_ref<uint64_t>(const_cast<uint64_t&>(line.s[w])).load(std::memory_order_relaxed);
+            mask |= uint32_t((sl >> 24) == want40) << w;
+        }
+        return mask;
+#endif
+    }
+
+    // Single-snapshot 8-way match + empty masks for get_or_insert_h48_slow ((sl>>24)==0 <=> sl==0 because d>=1!)
+    static SS_ALWAYS_INLINE void uline_probe_masks(
+        const Uline& line, uint64_t want40, uint32_t& out_match, uint32_t& out_empty
     ) {
-        uint64_t sl = std::atomic_ref<uint64_t>(const_cast<uint64_t&>(slots_p[size_t(h48) & mask_v])).load(std::memory_order_relaxed);
-        uint64_t want40 = ((h48 >> 16) << 8) | 1ULL;
-        if (__builtin_expect((sl >> 24) == want40, 1)) {
-            out_pid = uint32_t(sl & 0xFFFFFFULL);
+#if defined(__AVX512VL__)
+        __m256i vw = _mm256_set1_epi64x(static_cast<long long>(want40));
+        __m256i vz = _mm256_setzero_si256();
+        __m256i v0 = _mm256_srli_epi64(_mm256_load_si256(reinterpret_cast<const __m256i*>(line.s)), 24);
+        __m256i v1 = _mm256_srli_epi64(_mm256_load_si256(reinterpret_cast<const __m256i*>(line.s + 4)), 24);
+        out_match = uint32_t(_mm256_cmpeq_epi64_mask(v0, vw)) | (uint32_t(_mm256_cmpeq_epi64_mask(v1, vw)) << 4);
+        out_empty = uint32_t(_mm256_cmpeq_epi64_mask(v0, vz)) | (uint32_t(_mm256_cmpeq_epi64_mask(v1, vz)) << 4);
+#elif defined(__AVX2__)
+        __m256i vw = _mm256_set1_epi64x(static_cast<long long>(want40));
+        __m256i vz = _mm256_setzero_si256();
+        __m256i v0 = _mm256_srli_epi64(_mm256_load_si256(reinterpret_cast<const __m256i*>(line.s)), 24);
+        __m256i v1 = _mm256_srli_epi64(_mm256_load_si256(reinterpret_cast<const __m256i*>(line.s + 4)), 24);
+        uint32_t m0 = uint32_t(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v0, vw))));
+        uint32_t m1 = uint32_t(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v1, vw))));
+        uint32_t e0 = uint32_t(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v0, vz))));
+        uint32_t e1 = uint32_t(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v1, vz))));
+        out_match = m0 | (m1 << 4);
+        out_empty = e0 | (e1 << 4);
+#elif defined(__aarch64__)
+        uint64x2_t vw = vdupq_n_u64(want40);
+        uint64x2_t s0 = vshrq_n_u64(vld1q_u64(line.s + 0), 24);
+        uint64x2_t s1 = vshrq_n_u64(vld1q_u64(line.s + 2), 24);
+        uint64x2_t s2 = vshrq_n_u64(vld1q_u64(line.s + 4), 24);
+        uint64x2_t s3 = vshrq_n_u64(vld1q_u64(line.s + 6), 24);
+        const uint16x8_t bits = {1, 2, 4, 8, 16, 32, 64, 128};
+        uint32x4_t m01 = vuzp1q_u32(vreinterpretq_u32_u64(vceqq_u64(s0, vw)), vreinterpretq_u32_u64(vceqq_u64(s1, vw)));
+        uint32x4_t m23 = vuzp1q_u32(vreinterpretq_u32_u64(vceqq_u64(s2, vw)), vreinterpretq_u32_u64(vceqq_u64(s3, vw)));
+        out_match = uint32_t(vaddvq_u16(vandq_u16(vuzp1q_u16(vreinterpretq_u16_u32(m01), vreinterpretq_u16_u32(m23)), bits)));
+        uint32x4_t e01 = vuzp1q_u32(vreinterpretq_u32_u64(vceqzq_u64(s0)), vreinterpretq_u32_u64(vceqzq_u64(s1)));
+        uint32x4_t e23 = vuzp1q_u32(vreinterpretq_u32_u64(vceqzq_u64(s2)), vreinterpretq_u32_u64(vceqzq_u64(s3)));
+        out_empty = uint32_t(vaddvq_u16(vandq_u16(vuzp1q_u16(vreinterpretq_u16_u32(e01), vreinterpretq_u16_u32(e23)), bits)));
+#else
+        uint32_t mm = 0, em = 0;
+        for (uint32_t w = 0; w < 8; ++w) {
+            uint64_t hi = std::atomic_ref<uint64_t>(const_cast<uint64_t&>(line.s[w])).load(std::memory_order_relaxed) >> 24;
+            mm |= uint32_t(hi == want40) << w;
+            em |= uint32_t(hi == 0) << w;
+        }
+        out_match = mm;
+        out_empty = em;
+#endif
+    }
+
+    // 2-insn AVX-512VL empty-slot finder for Pass 3 unique linked-key publish!
+    static SS_ALWAYS_INLINE uint32_t uline_empty_mask(const Uline& line) {
+#if defined(__AVX512VL__)
+        __m256i vz = _mm256_setzero_si256();
+        __m256i v0 = _mm256_load_si256(reinterpret_cast<const __m256i*>(line.s));
+        __m256i v1 = _mm256_load_si256(reinterpret_cast<const __m256i*>(line.s + 4));
+        return uint32_t(_mm256_cmpeq_epi64_mask(v0, vz)) | (uint32_t(_mm256_cmpeq_epi64_mask(v1, vz)) << 4);
+#elif defined(__AVX2__)
+        __m256i vz = _mm256_setzero_si256();
+        __m256i v0 = _mm256_load_si256(reinterpret_cast<const __m256i*>(line.s));
+        __m256i v1 = _mm256_load_si256(reinterpret_cast<const __m256i*>(line.s + 4));
+        uint32_t e0 = uint32_t(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v0, vz))));
+        uint32_t e1 = uint32_t(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v1, vz))));
+        return e0 | (e1 << 4);
+#elif defined(__aarch64__)
+        uint64x2_t e0 = vceqzq_u64(vld1q_u64(line.s + 0));
+        uint64x2_t e1 = vceqzq_u64(vld1q_u64(line.s + 2));
+        uint64x2_t e2 = vceqzq_u64(vld1q_u64(line.s + 4));
+        uint64x2_t e3 = vceqzq_u64(vld1q_u64(line.s + 6));
+        uint32x4_t e01 = vuzp1q_u32(vreinterpretq_u32_u64(e0), vreinterpretq_u32_u64(e1));
+        uint32x4_t e23 = vuzp1q_u32(vreinterpretq_u32_u64(e2), vreinterpretq_u32_u64(e3));
+        const uint16x8_t bits = {1, 2, 4, 8, 16, 32, 64, 128};
+        return uint32_t(vaddvq_u16(vandq_u16(vuzp1q_u16(vreinterpretq_u16_u32(e01), vreinterpretq_u16_u32(e23)), bits)));
+#else
+        uint32_t em = 0;
+        for (uint32_t w = 0; w < 8; ++w) {
+            uint64_t sl = std::atomic_ref<uint64_t>(const_cast<uint64_t&>(line.s[w])).load(std::memory_order_relaxed);
+            em |= uint32_t(sl == 0) << w;
+        }
+        return em;
+#endif
+    }
+
+    static SS_ALWAYS_INLINE bool try_lookup_h48_fast(
+        const Uline* __restrict lines_p, size_t lmask_v, uint64_t h48, uint32_t& out_pid
+    ) {
+        const Uline& line = lines_p[size_t(h48) & lmask_v];
+        const uint64_t want40 = ((h48 >> 8) & ~63ULL) | 1ULL;
+        uint32_t mask = uline_match_mask(line, want40);
+        if (__builtin_expect(mask != 0, 1)) {
+            out_pid = uint32_t(line.s[__builtin_ctz(mask)] & 0xFFFFFFULL);
             return true;
         }
         return false;
     }
 
+    // Branchless 256b+128b SIMD 3-way HexLine lookup (1 single 95%-taken branch vs 3 mispredicting branches!)
     static SS_ALWAYS_INLINE bool try_lookup_hex_fast(
         const HexLine* __restrict lines_p, size_t mask_v, uint64_t lo, uint64_t hi, uint64_t h, uint32_t& out_pid
     ) {
         const HexLine& line = lines_p[size_t(h) & mask_v];
         uint32_t ready = (std::atomic_ref<uint32_t>(const_cast<uint32_t&>(line.ctrl)).load(std::memory_order_acquire) >> 8) & 7U;
-        if ((ready & 1U) && ((line.k[0][0] ^ lo) | (line.k[0][1] ^ hi)) == 0) { out_pid = line.pid[0]; return true; }
-        if ((ready & 2U) && ((line.k[1][0] ^ lo) | (line.k[1][1] ^ hi)) == 0) { out_pid = line.pid[1]; return true; }
-        if ((ready & 4U) && ((line.k[2][0] ^ lo) | (line.k[2][1] ^ hi)) == 0) { out_pid = line.pid[2]; return true; }
+#if defined(__AVX512VL__)
+        __m128i t128 = _mm_set_epi64x(static_cast<long long>(hi), static_cast<long long>(lo));
+        __m256i t256 = _mm256_inserti128_si256(_mm256_castsi128_si256(t128), t128, 1);
+        __m256i v01  = _mm256_load_si256(reinterpret_cast<const __m256i*>(line.k));
+        __m128i v2   = _mm_load_si128(reinterpret_cast<const __m128i*>(line.k[2]));
+        uint32_t m01 = uint32_t(_mm256_cmpeq_epi64_mask(v01, t256));
+        uint32_t m2  = uint32_t(_mm_cmpeq_epi64_mask(v2, t128));
+        uint32_t m6  = m01 | (m2 << 4);
+#if defined(__BMI2__)
+        uint32_t hit = ready & uint32_t(_pext_u32(m6 & (m6 >> 1), 0x15U));
+#else
+        uint32_t hit = ready & (uint32_t((m01 & 3U) == 3U) | (uint32_t((m01 & 12U) == 12U) << 1) | (uint32_t(m2 == 3U) << 2));
+#endif
+#elif defined(__AVX2__)
+        __m128i t128 = _mm_set_epi64x(static_cast<long long>(hi), static_cast<long long>(lo));
+        __m256i t256 = _mm256_inserti128_si256(_mm256_castsi128_si256(t128), t128, 1);
+        __m256i v01  = _mm256_load_si256(reinterpret_cast<const __m256i*>(line.k));
+        __m128i v2   = _mm_load_si128(reinterpret_cast<const __m128i*>(line.k[2]));
+        uint32_t m01 = uint32_t(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v01, t256))));
+        uint32_t m2  = uint32_t(_mm_movemask_pd(_mm_castsi128_pd(_mm_cmpeq_epi64(v2, t128))));
+        uint32_t m6  = m01 | (m2 << 4);
+#if defined(__BMI2__)
+        uint32_t hit = ready & uint32_t(_pext_u32(m6 & (m6 >> 1), 0x15U));
+#else
+        uint32_t hit = ready & (uint32_t((m01 & 3U) == 3U) | (uint32_t((m01 & 12U) == 12U) << 1) | (uint32_t(m2 == 3U) << 2));
+#endif
+#else
+        uint32_t hit = ready & (
+            uint32_t(((line.k[0][0] ^ lo) | (line.k[0][1] ^ hi)) == 0) |
+            (uint32_t(((line.k[1][0] ^ lo) | (line.k[1][1] ^ hi)) == 0) << 1) |
+            (uint32_t(((line.k[2][0] ^ lo) | (line.k[2][1] ^ hi)) == 0) << 2)
+        );
+#endif
+        if (__builtin_expect(hit != 0, 1)) {
+            out_pid = line.pid[__builtin_ctz(hit)];
+            return true;
+        }
         return false;
     }
 
@@ -1811,9 +2038,9 @@ struct UserDict {
                 uint32_t exp = c;
                 if (ac.compare_exchange_weak(exp, c | (1U << e),
                                              std::memory_order_acq_rel, std::memory_order_acquire)) {
-                    line.k[e][0] = lo;
-                    line.k[e][1] = hi;
-                    line.pid[e]  = cid;
+                    std::atomic_ref<uint64_t>(line.k[e][0]).store(lo, std::memory_order_relaxed);
+                    std::atomic_ref<uint64_t>(line.k[e][1]).store(hi, std::memory_order_relaxed);
+                    std::atomic_ref<uint32_t>(line.pid[e]).store(cid, std::memory_order_relaxed);
                     ac.fetch_or(1U << (8U + e), std::memory_order_release);
                     return;
                 }
@@ -1868,9 +2095,9 @@ struct UserDict {
                                              std::memory_order_acq_rel, std::memory_order_acquire)) {
                     ++tl_cur;
                     pid_name[np] = prepared_name;
-                    line.k[e][0] = lo;
-                    line.k[e][1] = hi;
-                    line.pid[e]  = np;
+                    std::atomic_ref<uint64_t>(line.k[e][0]).store(lo, std::memory_order_relaxed);
+                    std::atomic_ref<uint64_t>(line.k[e][1]).store(hi, std::memory_order_relaxed);
+                    std::atomic_ref<uint32_t>(line.pid[e]).store(np, std::memory_order_relaxed);
                     ac.fetch_or(1U << (8U + e), std::memory_order_release);
                     return np;
                 }
@@ -1995,39 +2222,46 @@ struct UserDict {
         return get_or_insert_general(tmp, ulen, gh, UINT32_MAX, nullptr, arenas, tid, tl_cur, tl_end, g_cur, g_end);
     }
 
-    // Lock-free, carry-safe (d = 1..254) slow path for probe miss / first insert (keeps flush_ev_batches tiny & hoisted!)
+    // Lock-free, strictly linearizable 8-way Uline slow path (d = 1..63 lines = up to 504 slots!).
     SS_NOINLINE uint32_t get_or_insert_h48_slow(
         uint64_t h48,
         StringArenaPool& arenas, int tid,
         uint32_t& tl_cur, uint32_t& tl_end,
         uint32_t& g_cur, uint32_t& g_end
     ) {
-        size_t idx = size_t(h48) & umask;
-        const uint64_t tag_hi = (h48 >> 16) << 32;
-        for (uint32_t d = 1; d <= 254; ++d) {
-            std::atomic_ref<uint64_t> slot(uslots[idx]);
-            uint64_t sl = slot.load(std::memory_order_relaxed);
-            const uint64_t want_hi = tag_hi | (uint64_t(d) << 24);
-            if (__builtin_expect((sl & 0xFFFFFFFFFF000000ULL) == want_hi, 1)) {
-                return uint32_t(sl & 0xFFFFFFULL);
+        size_t li = size_t(h48) & lmask;
+        const uint64_t base_tag40 = (h48 >> 8) & ~63ULL;
+        for (uint32_t d = 1; d <= MAX_UDISP; ++d) {
+            Uline& line = ulines[li];
+            const uint64_t want40 = base_tag40 | uint64_t(d);
+            uint32_t match_m = 0, empty_m = 0;
+            uline_probe_masks(line, want40, match_m, empty_m);
+            if (__builtin_expect(match_m != 0, 1)) {
+                return uint32_t(line.s[__builtin_ctz(match_m)] & 0xFFFFFFULL);
             }
-            if (__builtin_expect(sl == 0, 1)) {
-                if (__builtin_expect(tl_cur >= tl_end, 0)) {
-                    if (!lease_pid_slow(tl_cur, tl_end)) return 0;
-                }
-                uint32_t np = tl_cur;
-                uint64_t exp = 0;
-                uint64_t val = want_hi | uint64_t(np);
-                if (slot.compare_exchange_strong(exp, val, std::memory_order_relaxed)) {
-                    pid_name[np] = unmix48(h48);
-                    ++tl_cur;
-                    return np;
-                }
-                if ((exp & 0xFFFFFFFFFF000000ULL) == want_hi) {
-                    return uint32_t(exp & 0xFFFFFFULL);
-                }
+            if (__builtin_expect(empty_m != 0, 1)) {
+                const uint64_t want_hi = want40 << 24;
+                do {
+                    uint32_t w = uint32_t(__builtin_ctz(empty_m));
+                    empty_m &= empty_m - 1;
+                    if (__builtin_expect(tl_cur >= tl_end, 0)) {
+                        if (!lease_pid_slow(tl_cur, tl_end)) return 0;
+                    }
+                    uint32_t np = tl_cur;
+                    uint64_t exp = 0;
+                    uint64_t val = want_hi | uint64_t(np);
+                    std::atomic_ref<uint64_t> slot(line.s[w]);
+                    if (__builtin_expect(slot.compare_exchange_strong(exp, val, std::memory_order_relaxed), 1)) {
+                        pid_name[np] = unmix48(h48);
+                        ++tl_cur;
+                        return np;
+                    }
+                    if (__builtin_expect((exp >> 24) == want40, 0)) {
+                        return uint32_t(exp & 0xFFFFFFULL);
+                    }
+                } while (empty_m != 0);
             }
-            idx = (idx + 1) & umask;
+            li = (li + 1) & lmask;
         }
         return get_or_insert_h48_overflow(h48, arenas, tid, tl_cur, tl_end, g_cur, g_end);
     }
@@ -2039,7 +2273,7 @@ struct UserDict {
         uint32_t& g_cur, uint32_t& g_end
     ) {
         uint32_t pid;
-        if (__builtin_expect(try_lookup_h48_fast(uslots, umask, h48, pid), 1)) return pid;
+        if (__builtin_expect(try_lookup_h48_fast(ulines, lmask, h48, pid), 1)) return pid;
         return get_or_insert_h48_slow(h48, arenas, tid, tl_cur, tl_end, g_cur, g_end);
     }
 
@@ -2057,7 +2291,7 @@ struct UserDict {
 
     void dontneed_tables(bool include_pid_name = false) {
 #if defined(__linux__) && defined(MADV_DONTNEED)
-        if (uslots && uslots_bytes) ::madvise(uslots, uslots_bytes, MADV_DONTNEED);
+        if (ulines && ulines_bytes) ::madvise(ulines, ulines_bytes, MADV_DONTNEED);
         if (hlines && hlines_bytes) ::madvise(hlines, hlines_bytes, MADV_DONTNEED);
         if (gslots && gslots_bytes) ::madvise(gslots, gslots_bytes, MADV_DONTNEED);
         if (gentries && gentries_bytes) ::madvise(gentries, gentries_bytes, MADV_DONTNEED);
@@ -2135,11 +2369,13 @@ struct UserDict {
         has_fallback = ((hex_cnt + nonhex_cnt) > 0);
 
         auto alloc_fast_tables = [&](size_t est_short_users, size_t est_hex_users, size_t est_gen_users) {
-            ucap = 65536;
-            while (ucap * 3 < est_short_users * 5) ucap <<= 1;
-            umask = ucap - 1;
-            uslots_bytes = alloc_mmap_actual_size(ucap * sizeof(uint64_t), ucap * sizeof(uint64_t) >= (2ULL << 20));
-            uslots = static_cast<uint64_t*>(alloc_mmap(ucap * sizeof(uint64_t), ucap * sizeof(uint64_t) >= (2ULL << 20)));
+            lcap = MIN_ULINES;
+            while (lcap * 16 < est_short_users * 3) lcap <<= 1; // target alpha <= 2/3 (66.7%), 8 slots/line
+            lmask = lcap - 1;
+            size_t raw_ubytes = lcap * sizeof(Uline);
+            bool u_hp = (raw_ubytes >= (2ULL << 20));
+            ulines_bytes = alloc_mmap_actual_size(raw_ubytes, u_hp);
+            ulines = static_cast<Uline*>(alloc_mmap(raw_ubytes, u_hp));
 
             hcap = 4096;
             while (hcap * 9 < est_hex_users * 5) hcap <<= 1;
@@ -2170,7 +2406,7 @@ struct UserDict {
                 size_t est_short = std::max<size_t>(total_event_bytes / 1500, 16384);
                 size_t est_hex   = std::max<size_t>(total_event_bytes / 12000, 4096);
                 alloc_fast_tables(est_short, est_hex, 131072);
-                populate_write_parallel(pool, uslots, uslots_bytes);
+                populate_write_parallel(pool, ulines, ulines_bytes);
                 populate_write_parallel(pool, hlines, hlines_bytes);
                 fast_dict_mode = true;
                 return;
@@ -2259,7 +2495,7 @@ struct UserDict {
             size_t est_gen   = std::max<size_t>(nonhex_cnt * 2 + 131072, 131072);
             if (nonhex_cnt > 0 && nonhex_cnt * 4 > total_edges * 2) est_gen = std::max(est_gen, u_fb + total_event_bytes / 1800);
             alloc_fast_tables(est_short, est_hex, est_gen);
-            populate_write_parallel(pool, uslots, uslots_bytes);
+            populate_write_parallel(pool, ulines, ulines_bytes);
             populate_write_parallel(pool, hlines, hlines_bytes);
 
             // Pass 2b: Parallel Union-by-Exact-Key over 100% IMMUTABLE dsu[].key (read-intent prefetch!)
@@ -2392,7 +2628,7 @@ struct UserDict {
                                 uint64_t h48 = mix48(u48);
                                 b_dom[j] = 0;
                                 b_v0[j] = h48;
-                                __builtin_prefetch(&uslots[size_t(h48) & umask], 1, 1);
+                                __builtin_prefetch(&ulines[size_t(h48) & lmask], 1, 1);
                                 continue;
                             }
                             b_dom[j] = 2;
@@ -2417,19 +2653,28 @@ struct UserDict {
                         if (__builtin_expect(dm == 0, 1)) {
                             uint64_t h48 = b_v0[j];
                             uint32_t cid = b_cid[j];
-                            size_t home = size_t(h48) & umask;
-                            const uint64_t tag_hi = (h48 >> 16) << 32;
+                            size_t li = size_t(h48) & lmask;
+                            const uint64_t base_tag40 = (h48 >> 8) & ~63ULL;
                             bool placed = false;
-                            for (uint32_t d = 1; d <= 254; ++d) {
-                                size_t idx = (home + (d - 1)) & umask;
-                                std::atomic_ref<uint64_t> slot(uslots[idx]);
-                                if (__builtin_expect(slot.load(std::memory_order_relaxed) != 0, 0)) continue;
-                                uint64_t val = tag_hi | (uint64_t(d) << 24) | uint64_t(cid);
-                                uint64_t exp = 0;
-                                if (slot.compare_exchange_strong(exp, val, std::memory_order_relaxed)) {
-                                    placed = true;
-                                    break;
+                            for (uint32_t d = 1; d <= MAX_UDISP; ++d) {
+                                Uline& line = ulines[li];
+                                uint32_t empty_m = uline_empty_mask(line);
+                                if (__builtin_expect(empty_m != 0, 1)) {
+                                    const uint64_t val = ((base_tag40 | uint64_t(d)) << 24) | uint64_t(cid);
+                                    do {
+                                        uint32_t w = uint32_t(__builtin_ctz(empty_m));
+                                        empty_m &= empty_m - 1;
+                                        uint64_t exp = 0;
+                                        if (__builtin_expect(
+                                                std::atomic_ref<uint64_t>(line.s[w]).compare_exchange_strong(
+                                                    exp, val, std::memory_order_relaxed), 1)) {
+                                            placed = true;
+                                            break;
+                                        }
+                                    } while (empty_m != 0);
+                                    if (__builtin_expect(placed, 1)) break;
                                 }
+                                li = (li + 1) & lmask;
                             }
                             if (__builtin_expect(!placed, 0)) {
                                 insert_linked_general(b_key[j], cid, arenas, g_cur, g_end);
@@ -2453,7 +2698,7 @@ struct UserDict {
             }
 
             // Ultra-rare >16.7M link components -> fall back to classic!
-            uslots = nullptr; uslots_bytes = 0;
+            ulines = nullptr; ulines_bytes = 0; lcap = 0; lmask = 0;
             hlines = nullptr; hlines_bytes = 0;
             gslots = nullptr; gslots_bytes = 0;
             gentries = nullptr; gentries_bytes = 0;
@@ -3274,10 +3519,16 @@ static void mkdir_p(const std::string& path) {
 }
 
 // ============================================================================
-// Split L1I-Hot Per-Task Scanners (BMI2 PEXT Seps + 4KB Micro-Batch Split + Zero Mix Recompute!)
+// v18 Window-Partitioned Scanners + Decoupled Multi-Window Two-Stage Prefetch Batching
 // ============================================================================
-static constexpr uint32_t EV_BATCH_CAP  = 64;
-static constexpr uint32_t CLK_BATCH_CAP = 128;
+static constexpr uint32_t WIN_CHUNK_EV    = 64;
+static constexpr uint32_t WIN_CHUNK_CLK   = 128;
+static constexpr uint32_t EV_FAST_CAP     = 256;
+static constexpr uint32_t EV_HEX_CAP      = 128;
+static constexpr uint32_t EV_LONG_U48_CAP = 128;
+static constexpr uint32_t EV_EXTRA_CAP    = 64;
+static constexpr uint32_t CLK_FAST_CAP    = 256;
+static constexpr uint32_t CLK_HEX_CAP     = 128;
 
 struct FastEvItem {
     uint64_t h48;
@@ -3288,6 +3539,13 @@ struct FastEvItem {
 struct HexEvItem {
     uint64_t lo, hi, h;
     uint64_t w0;
+    uint32_t ts_rel_ms;
+    uint32_t eb;
+};
+struct LongU48EvItem {
+    uint64_t h48;
+    uint64_t elo, ehi;
+    int64_t  ing_abs_sec;
     uint32_t ts_rel_ms;
     uint32_t eb;
 };
@@ -3302,11 +3560,12 @@ struct ExtraEvItem {
     uint32_t irel21;
     uint32_t flags;          // bit0=hex_u, bit1=long32, bit2=eid_in_side
 };
-struct EvBatchState {
-    uint32_t nfast = 0, nhex = 0, nextra = 0;
-    FastEvItem  fast[EV_BATCH_CAP];
-    HexEvItem   hex[EV_BATCH_CAP];
-    ExtraEvItem extra[EV_BATCH_CAP];
+struct alignas(64) EvBatchState {
+    uint32_t nfast = 0, nhex = 0, nlong_u48 = 0, nextra = 0;
+    FastEvItem    fast[EV_FAST_CAP];
+    HexEvItem     hex[EV_HEX_CAP];
+    LongU48EvItem long_u48[EV_LONG_U48_CAP];
+    ExtraEvItem   extra[EV_EXTRA_CAP];
 };
 
 struct FastClkItem {
@@ -3319,10 +3578,10 @@ struct HexClkItem {
     uint64_t cid;
     uint64_t ts_camp44;
 };
-struct ClkBatchState {
+struct alignas(64) ClkBatchState {
     uint32_t nfast = 0, nhex = 0;
-    FastClkItem fast[CLK_BATCH_CAP];
-    HexClkItem  hex[CLK_BATCH_CAP];
+    FastClkItem fast[CLK_FAST_CAP];
+    HexClkItem  hex[CLK_HEX_CAP];
 };
 
 struct EvTaskCtx {
@@ -3352,8 +3611,15 @@ struct ClkTaskCtx {
     int tid;
     uint32_t seg_id;
     const char* seg_base;
+    const Campaigns& campaigns;
+    const DateLut& lut;
     UserDict& dict;
     StringArenaPool& arenas;
+    int64_t click_start_ms;
+    int64_t win_end_ms;
+    int64_t cs_sec;
+    int64_t ws_minus_cs_sec;
+    uint64_t clk_dur_sec;
     PartitionedStore<CompactClick, CLK_BLK_CAP, PERSON_BUCKETS>::ThreadState& clk_out;
     ClkBatchState& cbatch;
     uint32_t& tl_cur;
@@ -3362,9 +3628,105 @@ struct ClkTaskCtx {
     uint32_t& g_end;
 };
 
-// Micro-Loop B (Events): 1-register-arg flush_ev_batches(ctx) -> hoisted uslots/umask/hlines/hmask + 8-ahead prefetchw!
-static SS_NOINLINE void flush_ev_batches(EvTaskCtx& __restrict ctx) {
+// Independent Micro-Loop B flushers: Stage-2 L2->L1D prefetcht0 + prefetchw blk_cur!
+static SS_NOINLINE void flush_ev_fast(EvTaskCtx& __restrict ctx) {
     EvBatchState& __restrict st = ctx.ebatch;
+    const uint32_t nf = st.nfast;
+    if (__builtin_expect(nf == 0, 0)) return;
+    UserDict& __restrict dict = ctx.dict;
+    StringArenaPool& __restrict arenas = ctx.arenas;
+    const int tid = ctx.tid;
+    auto& __restrict ev_out = ctx.ev_out;
+    uint32_t tl_cur = ctx.tl_cur, tl_end = ctx.tl_end;
+    uint32_t g_cur = ctx.g_cur, g_end = ctx.g_end;
+
+    const UserDict::Uline* const __restrict ulines_p = dict.ulines;
+    const size_t lmask_v = dict.lmask;
+    const FastEvItem* const __restrict items = st.fast;
+
+    for (uint32_t i = 0; i < nf; ++i) {
+        if (__builtin_expect(i + 8 < nf, 1)) {
+            __builtin_prefetch(&ulines_p[size_t(items[i + 8].h48) & lmask_v], 0, 3);
+            __builtin_prefetch(ev_out.blk_cur[items[i + 8].eb], 1, 1);
+        }
+        const FastEvItem& r = items[i];
+        uint32_t pid;
+        if (__builtin_expect(!UserDict::try_lookup_h48_fast(ulines_p, lmask_v, r.h48, pid), 0)) {
+            pid = dict.get_or_insert_h48_slow(r.h48, arenas, tid, tl_cur, tl_end, g_cur, g_end);
+        }
+        ev_out.push(r.eb, RawEvent16{r.w0, (uint64_t(r.ts_rel_ms) << 32) | (uint64_t(pid) << 8)});
+    }
+    st.nfast = 0;
+    ctx.tl_cur = tl_cur; ctx.tl_end = tl_end;
+    ctx.g_cur  = g_cur;  ctx.g_end  = g_end;
+}
+
+static SS_NOINLINE void flush_ev_hex(EvTaskCtx& __restrict ctx) {
+    EvBatchState& __restrict st = ctx.ebatch;
+    const uint32_t nh = st.nhex;
+    if (__builtin_expect(nh == 0, 0)) return;
+    UserDict& __restrict dict = ctx.dict;
+    StringArenaPool& __restrict arenas = ctx.arenas;
+    const int tid = ctx.tid;
+    auto& __restrict ev_out = ctx.ev_out;
+    uint32_t tl_cur = ctx.tl_cur, tl_end = ctx.tl_end;
+
+    const UserDict::HexLine* const __restrict hlines_p = dict.hlines;
+    const size_t hmask_v = dict.hmask;
+    const HexEvItem* const __restrict items = st.hex;
+
+    for (uint32_t i = 0; i < nh; ++i) {
+        if (__builtin_expect(i + 8 < nh, 1)) {
+            __builtin_prefetch(&hlines_p[size_t(items[i + 8].h) & hmask_v], 0, 3);
+            __builtin_prefetch(ev_out.blk_cur[items[i + 8].eb], 1, 1);
+        }
+        const HexEvItem& r = items[i];
+        uint32_t pid;
+        if (__builtin_expect(!UserDict::try_lookup_hex_fast(hlines_p, hmask_v, r.lo, r.hi, r.h, pid), 0)) {
+            pid = dict.get_or_insert_hex(r.lo, r.hi, r.h, arenas, tid, tl_cur, tl_end);
+        }
+        ev_out.push(r.eb, RawEvent16{r.w0, (uint64_t(r.ts_rel_ms) << 32) | (uint64_t(pid) << 8)});
+    }
+    st.nhex = 0;
+    ctx.tl_cur = tl_cur; ctx.tl_end = tl_end;
+}
+
+static SS_NOINLINE void flush_ev_long_u48(EvTaskCtx& __restrict ctx) {
+    EvBatchState& __restrict st = ctx.ebatch;
+    const uint32_t nl = st.nlong_u48;
+    if (__builtin_expect(nl == 0, 0)) return;
+    UserDict& __restrict dict = ctx.dict;
+    StringArenaPool& __restrict arenas = ctx.arenas;
+    const int tid = ctx.tid;
+    auto& __restrict long_ev_out = ctx.long_ev_out;
+    uint32_t tl_cur = ctx.tl_cur, tl_end = ctx.tl_end;
+    uint32_t g_cur = ctx.g_cur, g_end = ctx.g_end;
+
+    const UserDict::Uline* const __restrict ulines_p = dict.ulines;
+    const size_t lmask_v = dict.lmask;
+    const LongU48EvItem* const __restrict items = st.long_u48;
+
+    for (uint32_t i = 0; i < nl; ++i) {
+        if (__builtin_expect(i + 8 < nl, 1)) {
+            __builtin_prefetch(&ulines_p[size_t(items[i + 8].h48) & lmask_v], 0, 3);
+            __builtin_prefetch(long_ev_out.blk_cur[items[i + 8].eb], 1, 1);
+        }
+        const LongU48EvItem& r = items[i];
+        uint32_t pid;
+        if (__builtin_expect(!UserDict::try_lookup_h48_fast(ulines_p, lmask_v, r.h48, pid), 0)) {
+            pid = dict.get_or_insert_h48_slow(r.h48, arenas, tid, tl_cur, tl_end, g_cur, g_end);
+        }
+        long_ev_out.push(r.eb, LongEv32::make_valid(r.elo, r.ehi, r.ing_abs_sec, pid, r.ts_rel_ms, 0U, 0U));
+    }
+    st.nlong_u48 = 0;
+    ctx.tl_cur = tl_cur; ctx.tl_end = tl_end;
+    ctx.g_cur  = g_cur;  ctx.g_end  = g_end;
+}
+
+static SS_NOINLINE void flush_ev_extra(EvTaskCtx& __restrict ctx) {
+    EvBatchState& __restrict st = ctx.ebatch;
+    const uint32_t ne = st.nextra;
+    if (__builtin_expect(ne == 0, 0)) return;
     UserDict& __restrict dict = ctx.dict;
     StringArenaPool& __restrict arenas = ctx.arenas;
     const int tid = ctx.tid;
@@ -3374,40 +3736,11 @@ static SS_NOINLINE void flush_ev_batches(EvTaskCtx& __restrict ctx) {
     uint32_t tl_cur = ctx.tl_cur, tl_end = ctx.tl_end;
     uint32_t g_cur = ctx.g_cur, g_end = ctx.g_end;
 
-    const uint64_t* const __restrict uslots_p = dict.uslots;
-    const size_t umask_v = dict.umask;
+    const UserDict::Uline* const __restrict ulines_p = dict.ulines;
+    const size_t lmask_v = dict.lmask;
     const UserDict::HexLine* const __restrict hlines_p = dict.hlines;
     const size_t hmask_v = dict.hmask;
 
-    const uint32_t nf = st.nfast;
-    for (uint32_t i = 0; i < nf; ++i) {
-        if (__builtin_expect(i + 8 < nf, 1)) {
-            __builtin_prefetch(ev_out.blk_cur[st.fast[i + 8].eb], 1, 1);
-        }
-        const FastEvItem& r = st.fast[i];
-        uint32_t pid;
-        if (__builtin_expect(!UserDict::try_lookup_h48_fast(uslots_p, umask_v, r.h48, pid), 0)) {
-            pid = dict.get_or_insert_h48_slow(r.h48, arenas, tid, tl_cur, tl_end, g_cur, g_end);
-        }
-        ev_out.push(r.eb, RawEvent16{r.w0, (uint64_t(r.ts_rel_ms) << 32) | (uint64_t(pid) << 8)});
-    }
-    st.nfast = 0;
-
-    const uint32_t nh = st.nhex;
-    for (uint32_t i = 0; i < nh; ++i) {
-        if (__builtin_expect(i + 8 < nh, 1)) {
-            __builtin_prefetch(ev_out.blk_cur[st.hex[i + 8].eb], 1, 1);
-        }
-        const HexEvItem& r = st.hex[i];
-        uint32_t pid;
-        if (__builtin_expect(!UserDict::try_lookup_hex_fast(hlines_p, hmask_v, r.lo, r.hi, r.h, pid), 0)) {
-            pid = dict.get_or_insert_hex(r.lo, r.hi, r.h, arenas, tid, tl_cur, tl_end);
-        }
-        ev_out.push(r.eb, RawEvent16{r.w0, (uint64_t(r.ts_rel_ms) << 32) | (uint64_t(pid) << 8)});
-    }
-    st.nhex = 0;
-
-    const uint32_t ne = st.nextra;
     for (uint32_t i = 0; i < ne; ++i) {
         const ExtraEvItem& r = st.extra[i];
         uint32_t pid;
@@ -3416,11 +3749,11 @@ static SS_NOINLINE void flush_ev_batches(EvTaskCtx& __restrict ctx) {
                 pid = dict.get_or_insert_hex(r.u_a, r.u_b, r.u_h, arenas, tid, tl_cur, tl_end);
             }
         } else {
-            if (__builtin_expect(!UserDict::try_lookup_h48_fast(uslots_p, umask_v, r.u_a, pid), 0)) {
+            if (__builtin_expect(!UserDict::try_lookup_h48_fast(ulines_p, lmask_v, r.u_a, pid), 0)) {
                 pid = dict.get_or_insert_h48_slow(r.u_a, arenas, tid, tl_cur, tl_end, g_cur, g_end);
             }
         }
-        if (__builtin_expect((r.flags & 2U) != 0, 1)) {
+        if (r.flags & 2U) {
             long_ev_out.push(r.eb, LongEv32::make_valid(r.e_a, r.e_b, r.ing_val, pid, r.ts_rel_ms, r.price, r.cat_id));
         } else {
             uint32_t sidx = side_slab.push({r.e_a, r.ts_rel_ms, pid, r.ing_val, r.price, r.cat_id});
@@ -3428,14 +3761,21 @@ static SS_NOINLINE void flush_ev_batches(EvTaskCtx& __restrict ctx) {
         }
     }
     st.nextra = 0;
-
     ctx.tl_cur = tl_cur; ctx.tl_end = tl_end;
     ctx.g_cur  = g_cur;  ctx.g_end  = g_end;
 }
 
-// Micro-Loop B (Clicks): 1-register-arg flush_clk_batches(ctx) -> hoisted uslots/hlines + 8-PID cache-line blocking!
-static SS_NOINLINE void flush_clk_batches(ClkTaskCtx& __restrict ctx) {
+static SS_ALWAYS_INLINE void flush_ev_all(EvTaskCtx& ctx) {
+    if (ctx.ebatch.nfast)     flush_ev_fast(ctx);
+    if (ctx.ebatch.nhex)      flush_ev_hex(ctx);
+    if (ctx.ebatch.nlong_u48) flush_ev_long_u48(ctx);
+    if (ctx.ebatch.nextra)    flush_ev_extra(ctx);
+}
+
+static SS_NOINLINE void flush_clk_fast(ClkTaskCtx& __restrict ctx) {
     ClkBatchState& __restrict st = ctx.cbatch;
+    const uint32_t nf = st.nfast;
+    if (__builtin_expect(nf == 0, 0)) return;
     UserDict& __restrict dict = ctx.dict;
     StringArenaPool& __restrict arenas = ctx.arenas;
     const int tid = ctx.tid;
@@ -3443,25 +3783,45 @@ static SS_NOINLINE void flush_clk_batches(ClkTaskCtx& __restrict ctx) {
     uint32_t tl_cur = ctx.tl_cur, tl_end = ctx.tl_end;
     uint32_t g_cur = ctx.g_cur, g_end = ctx.g_end;
 
-    const uint64_t* const __restrict uslots_p = dict.uslots;
-    const size_t umask_v = dict.umask;
-    const UserDict::HexLine* const __restrict hlines_p = dict.hlines;
-    const size_t hmask_v = dict.hmask;
+    const UserDict::Uline* const __restrict ulines_p = dict.ulines;
+    const size_t lmask_v = dict.lmask;
+    const FastClkItem* const __restrict items = st.fast;
 
-    const uint32_t nf = st.nfast;
     for (uint32_t i = 0; i < nf; ++i) {
-        const FastClkItem& r = st.fast[i];
+        if (__builtin_expect(i + 8 < nf, 1)) {
+            __builtin_prefetch(&ulines_p[size_t(items[i + 8].h48) & lmask_v], 0, 3);
+        }
+        const FastClkItem& r = items[i];
         uint32_t pid;
-        if (__builtin_expect(!UserDict::try_lookup_h48_fast(uslots_p, umask_v, r.h48, pid), 0)) {
+        if (__builtin_expect(!UserDict::try_lookup_h48_fast(ulines_p, lmask_v, r.h48, pid), 0)) {
             pid = dict.get_or_insert_h48_slow(r.h48, arenas, tid, tl_cur, tl_end, g_cur, g_end);
         }
         clk_out.push(pid_to_bucket(pid), CompactClick{r.cid, (uint64_t(pid_to_local(pid)) << 44) | r.ts_camp44});
     }
     st.nfast = 0;
+    ctx.tl_cur = tl_cur; ctx.tl_end = tl_end;
+    ctx.g_cur  = g_cur;  ctx.g_end  = g_end;
+}
 
+static SS_NOINLINE void flush_clk_hex(ClkTaskCtx& __restrict ctx) {
+    ClkBatchState& __restrict st = ctx.cbatch;
     const uint32_t nh = st.nhex;
+    if (__builtin_expect(nh == 0, 0)) return;
+    UserDict& __restrict dict = ctx.dict;
+    StringArenaPool& __restrict arenas = ctx.arenas;
+    const int tid = ctx.tid;
+    auto& __restrict clk_out = ctx.clk_out;
+    uint32_t tl_cur = ctx.tl_cur, tl_end = ctx.tl_end;
+
+    const UserDict::HexLine* const __restrict hlines_p = dict.hlines;
+    const size_t hmask_v = dict.hmask;
+    const HexClkItem* const __restrict items = st.hex;
+
     for (uint32_t i = 0; i < nh; ++i) {
-        const HexClkItem& r = st.hex[i];
+        if (__builtin_expect(i + 8 < nh, 1)) {
+            __builtin_prefetch(&hlines_p[size_t(items[i + 8].h) & hmask_v], 0, 3);
+        }
+        const HexClkItem& r = items[i];
         uint32_t pid;
         if (__builtin_expect(!UserDict::try_lookup_hex_fast(hlines_p, hmask_v, r.lo, r.hi, r.h, pid), 0)) {
             pid = dict.get_or_insert_hex(r.lo, r.hi, r.h, arenas, tid, tl_cur, tl_end);
@@ -3469,9 +3829,12 @@ static SS_NOINLINE void flush_clk_batches(ClkTaskCtx& __restrict ctx) {
         clk_out.push(pid_to_bucket(pid), CompactClick{r.cid, (uint64_t(pid_to_local(pid)) << 44) | r.ts_camp44});
     }
     st.nhex = 0;
-
     ctx.tl_cur = tl_cur; ctx.tl_end = tl_end;
-    ctx.g_cur  = g_cur;  ctx.g_end  = g_end;
+}
+
+static SS_ALWAYS_INLINE void flush_clk_all(ClkTaskCtx& ctx) {
+    if (ctx.cbatch.nfast) flush_clk_fast(ctx);
+    if (ctx.cbatch.nhex)  flush_clk_hex(ctx);
 }
 
 static SS_COLD_NOINLINE void emit_ev_direct_gen_cold(
@@ -3615,6 +3978,283 @@ static SS_COLD_NOINLINE void push_invalid_ev_cold(
     ev_out.push(eb, RawEvent16::make_side(false, irel21, eid_in_side, rem39, tid, sidx));
 }
 
+template <typename RowT>
+static SS_ALWAYS_INLINE void process_click_row_full_impl(RowT row, ClkTaskCtx& ctx) {
+    Slice f2 = row.template get<2>();
+    if (__builtin_expect(f2.len == 0, 0)) return;
+    uint32_t camp_idx = ctx.campaigns.lookup_padded(f2.ptr, f2.len);
+    if (__builtin_expect(camp_idx == FastStringIdMap::NOT_FOUND, 0)) return;
+
+    Slice f3 = row.template get<3>();
+    int64_t ts = 0;
+    bool ts_ok = false;
+    if (__builtin_expect(f3.len == 13, 0)) {
+        int64_t s = 0; uint32_t msr = 0;
+        ts_ok = parse_13d_sec_ms(f3.ptr, s, msr);
+        ts = s * 1000LL + int64_t(msr);
+    } else if (__builtin_expect(f3.len == 20 || f3.len == 25, 1)) {
+        int64_t rel_s = 0;
+        ts_ok = ctx.lut.parse_iso_f12_rel_sec(f3.ptr, f3.len, rel_s);
+        ts = (ctx.lut.win_start_sec + rel_s) * 1000LL;
+    }
+    if (__builtin_expect(!ts_ok, 0)) ts_ok = parse_ts_slow(f3.ptr, f3.len, ts, ctx.lut);
+    if (__builtin_expect(!ts_ok || ts < ctx.click_start_ms || ts >= ctx.win_end_ms, 0)) return;
+
+    Slice f0 = row.template get<0>();
+    Slice f1 = row.template get<1>();
+    if (__builtin_expect((f0.len == 0) | (f1.len == 0), 0)) return;
+
+    uint64_t cid = encode_keyref_padded(f0.ptr, f0.len, ctx.seg_id, ctx.seg_base, ctx.arenas, ctx.tid);
+    uint64_t ts_camp44 = (uint64_t(uint32_t(ts - ctx.click_start_ms)) << 12) | uint64_t(camp_idx);
+    uint64_t u48 = 0;
+    if (__builtin_expect(encode_uid48_padded(f1.ptr, f1.len, u48), 1)) {
+        uint64_t h48 = mix48(u48);
+        ctx.dict.prefetch_uslot_l2(h48);
+        if (__builtin_expect(ctx.cbatch.nfast >= CLK_FAST_CAP, 0)) flush_clk_fast(ctx);
+        ctx.cbatch.fast[ctx.cbatch.nfast++] = {h48, cid, ts_camp44};
+    } else {
+        uint64_t lo = 0, hi = 0;
+        if (__builtin_expect(encode_uhex128(f1.ptr, f1.len, lo, hi), 1)) {
+            uint64_t hh = hash_uhex128(lo, hi);
+            ctx.dict.prefetch_hline_l2(hh);
+            if (__builtin_expect(ctx.cbatch.nhex >= CLK_HEX_CAP, 0)) flush_clk_hex(ctx);
+            ctx.cbatch.hex[ctx.cbatch.nhex++] = {lo, hi, hh, cid, ts_camp44};
+        } else {
+            emit_clk_direct_gen_cold(f1.ptr, f1.len, ctx.seg_id, ctx.seg_base, cid, ts_camp44,
+                                     ctx.dict, ctx.arenas, ctx.tid, ctx.clk_out,
+                                     ctx.tl_cur, ctx.tl_end, ctx.g_cur, ctx.g_end);
+        }
+    }
+}
+
+static SS_NOINLINE void process_click_row_extra(
+    const char* bptr, const uint16_t* row_seps, uint32_t qm, ClkTaskCtx& ctx
+) {
+    process_click_row_full_impl(SepsCsvRow<4>{bptr, row_seps, qm}, ctx);
+}
+
+static SS_COLD_NOINLINE void process_click_row_slice(const Slice* fs, ClkTaskCtx& ctx) {
+    process_click_row_full_impl(SliceCsvRow{fs}, ctx);
+}
+
+template <bool IS_F3, bool IS_HEX_UID, bool IS_LONG_CID>
+static SS_ALWAYS_INLINE void run_clk_bucket(
+    const uint16_t* __restrict codes,
+    uint32_t n,
+    const char* __restrict bptr,
+    const uint16_t* __restrict base_seps,
+    const Campaigns* __restrict campp,
+    const DateLut* __restrict lutp,
+    int64_t cs_sec,
+    int64_t ws_minus_cs_sec,
+    uint64_t clk_dur_sec,
+    const UserDict::Uline* __restrict ulines_p,
+    size_t lmask_v,
+    const UserDict::HexLine* __restrict hlines_p,
+    size_t hmask_v,
+    uint32_t seg_id,
+    const char* seg_base,
+    StringArenaPool& arenas,
+    int tid,
+    ClkBatchState* __restrict cbp,
+    uint16_t* __restrict ex_buf,
+    uint32_t& n_ex
+) {
+    if constexpr (!IS_F3)       { (void)cs_sec; }
+    else                        { (void)ws_minus_cs_sec; }
+    if constexpr (IS_HEX_UID)   { (void)ulines_p; (void)lmask_v; }
+    else                        { (void)hlines_p; (void)hmask_v; }
+    if constexpr (!IS_LONG_CID) { (void)seg_id; (void)seg_base; (void)arenas; (void)tid; }
+
+    if (n == 0) return;
+
+    auto* __restrict dst_fast = cbp->fast + cbp->nfast;
+    auto* __restrict dst_hex  = cbp->hex  + cbp->nhex;
+
+    for (uint32_t k = 0; k < n; ++k) {
+        uint32_t code = codes[k];
+        const uint16_t* sp = base_seps + (code & 0x1FFU);
+        uint32_t qm = code >> 9;
+        SepsCsvRow<4> row{bptr, sp, qm};
+
+        Slice f2 = row.template get<2>();
+        uint32_t camp_idx = 0;
+        int cr = campp->try_lookup_fast_c(f2.ptr, f2.len, camp_idx);
+        if (__builtin_expect(cr <= 0, 0)) {
+            if (cr < 0) ex_buf[n_ex++] = uint16_t(code);
+            continue;
+        }
+
+        Slice f3 = row.template get<3>();
+        int64_t clk_rel_sec = 0;
+        uint32_t ts_off_ms = 0;
+        bool ts_ok;
+        if constexpr (IS_F3) {
+            int64_t f3_sec = 0;
+            uint32_t ts_ms_rem = 0;
+            ts_ok = parse_13d_sec_ms(f3.ptr, f3_sec, ts_ms_rem);
+            clk_rel_sec = f3_sec - cs_sec;
+            ts_off_ms = uint32_t(clk_rel_sec) * 1000U + ts_ms_rem;
+        } else {
+            int64_t rel_s = 0;
+            ts_ok = lutp->parse_iso_f12_rel_sec(f3.ptr, f3.len, rel_s);
+            clk_rel_sec = rel_s + ws_minus_cs_sec;
+            ts_off_ms = uint32_t(clk_rel_sec) * 1000U;
+        }
+        if (__builtin_expect(!ts_ok, 0)) {
+            ex_buf[n_ex++] = uint16_t(code);
+            continue;
+        }
+        if (__builtin_expect(uint64_t(clk_rel_sec) >= clk_dur_sec, 0)) {
+            continue;
+        }
+
+        Slice f0 = row.template get<0>();
+        Slice f1 = row.template get<1>();
+        uint64_t ts_camp44 = (uint64_t(ts_off_ms) << 12) | uint64_t(camp_idx);
+
+        if constexpr (!IS_LONG_CID) {
+            uint64_t cid = 0;
+            if (__builtin_expect(!try_encode_key64_2_9(f0.ptr, f0.len, cid), 0)) {
+                ex_buf[n_ex++] = uint16_t(code);
+                continue;
+            }
+            if constexpr (!IS_HEX_UID) {
+                uint64_t u48 = 0;
+                if (__builtin_expect(!encode_uid48_padded(f1.ptr, f1.len, u48), 0)) {
+                    ex_buf[n_ex++] = uint16_t(code);
+                    continue;
+                }
+                uint64_t uh48 = mix48(u48);
+                __builtin_prefetch(&ulines_p[size_t(uh48) & lmask_v], 0, 2);
+                *dst_fast++ = {uh48, cid, ts_camp44};
+            } else {
+                uint64_t lo = 0, hi = 0;
+                if (__builtin_expect(!encode_uhex128(f1.ptr, f1.len, lo, hi), 0)) {
+                    ex_buf[n_ex++] = uint16_t(code);
+                    continue;
+                }
+                uint64_t hh = hash_uhex128(lo, hi);
+                __builtin_prefetch(&hlines_p[size_t(hh) & hmask_v], 0, 2);
+                *dst_hex++ = {lo, hi, hh, cid, ts_camp44};
+            }
+        } else {
+            // Encode/prefetch UID BEFORE copying long click_id into arena (zero wasted arena bytes on fallback!)
+            uint64_t u48 = 0;
+            if (__builtin_expect(!encode_uid48_padded(f1.ptr, f1.len, u48), 0)) {
+                ex_buf[n_ex++] = uint16_t(code);
+                continue;
+            }
+            uint64_t uh48 = mix48(u48);
+            __builtin_prefetch(&ulines_p[size_t(uh48) & lmask_v], 0, 2);
+            uint64_t cid = encode_keyref_long(f0.ptr, f0.len, seg_id, seg_base, arenas, tid);
+            *dst_fast++ = {uh48, cid, ts_camp44};
+        }
+    }
+
+    if constexpr (IS_HEX_UID) cbp->nhex  = uint32_t(dst_hex  - cbp->hex);
+    else                      cbp->nfast = uint32_t(dst_fast - cbp->fast);
+}
+
+static SS_NOINLINE void process_click_window(
+    const char* __restrict bptr,
+    const uint16_t* __restrict seps,
+    const uint8_t* __restrict q_bytes,
+    uint32_t n_rows,
+    ClkTaskCtx& ctx
+) {
+    const Campaigns* const __restrict campp = &ctx.campaigns;
+    const DateLut* const __restrict lutp = &ctx.lut;
+    const int64_t cs_sec = ctx.cs_sec;
+    const int64_t ws_minus_cs_sec = ctx.ws_minus_cs_sec;
+    const uint64_t clk_dur_sec = ctx.clk_dur_sec;
+    const UserDict::Uline* const __restrict ulines_p = ctx.dict.ulines;
+    const size_t lmask_v = ctx.dict.lmask;
+    const UserDict::HexLine* const __restrict hlines_p = ctx.dict.hlines;
+    const size_t hmask_v = ctx.dict.hmask;
+    const uint32_t seg_id = ctx.seg_id;
+    const char* const seg_base = ctx.seg_base;
+    StringArenaPool& arenas = ctx.arenas;
+    const int tid = ctx.tid;
+    ClkBatchState* const __restrict cbp = &ctx.cbatch;
+
+    alignas(64) uint16_t part[7][WIN_CHUNK_CLK];
+
+    for (uint32_t rbase = 0; rbase < n_rows; rbase += WIN_CHUNK_CLK) {
+        const uint32_t m = std::min<uint32_t>(WIN_CHUNK_CLK, n_rows - rbase);
+        const uint32_t rbase_si = rbase * 4U;
+        const uint16_t* const __restrict base_seps = seps + rbase_si;
+
+        // Pass 1: 100% branchless, zero-CSV-load, 1-store/row classifier (7 x 8-bit packed counters in `cnts`)!
+        uint32_t s0 = uint32_t(uint16_t(base_seps[-1] + 1U));
+        uint32_t si_rel = 0;
+        uint32_t si_abs = rbase_si;
+        uint64_t cnts = 0;
+        for (uint32_t r = 0; r < m; ++r, si_rel += 4U, si_abs += 4U) {
+            uint32_t qm = (uint32_t(q_bytes[si_abs >> 3]) >> (si_abs & 4U)) & 0x0FU;
+            const uint16_t* sp = base_seps + si_rel;
+            uint32_t p0 = sp[0], p1 = sp[1], p2 = sp[2], p3 = sp[3];
+            uint32_t l0 = (p0 - s0)     - ((qm & 1U) << 1);
+            uint32_t l1 = (p1 - p0 - 1) - (qm & 2U);
+            uint32_t l2 = (p2 - p1 - 1) - ((qm >> 1) & 2U);
+            uint32_t l3 = (p3 - p2 - 1) - ((qm >> 2) & 2U);
+            s0 = p3 + 1U;
+
+            uint32_t is_c64   = ((l0 - 2U) <= 7U);
+            uint32_t is_clong = (l0 >= 10U);
+            uint32_t is_u48   = ((l1 - 2U) <= 7U);
+            uint32_t is_uhex  = (l1 == 33U);
+            uint32_t is_c2_ok = ((l2 - 3U) <= 3U);
+            uint32_t is_iso   = (l3 == 20U) | (l3 == 25U);
+            uint32_t is_f3    = (l3 == 13U);
+
+            uint32_t base_ok  = is_c2_ok & (is_iso | is_f3);
+            uint32_t c64_ok   = base_ok & is_c64   & (is_u48 | is_uhex);
+            uint32_t clong_ok = base_ok & is_clong & is_u48;
+
+            uint32_t cls = 6U;
+            cls = clong_ok ? (4U | is_f3)             : cls;
+            cls = c64_ok   ? (is_f3 | (is_uhex << 1)) : cls;
+
+            uint32_t sh = cls << 3;
+            uint32_t c  = uint32_t((cnts >> sh) & 0xFFU);
+            part[cls][c] = uint16_t(si_rel | (qm << 9));
+            cnts += (1ULL << sh);
+        }
+
+        const uint32_t n0 = uint32_t( cnts        & 0xFFU);
+        const uint32_t n1 = uint32_t((cnts >> 8)  & 0xFFU);
+        const uint32_t n2 = uint32_t((cnts >> 16) & 0xFFU);
+        const uint32_t n3 = uint32_t((cnts >> 24) & 0xFFU);
+        const uint32_t n4 = uint32_t((cnts >> 32) & 0xFFU);
+        const uint32_t n5 = uint32_t((cnts >> 40) & 0xFFU);
+        uint32_t n_ex     = uint32_t((cnts >> 48) & 0xFFU);
+
+        // Pre-flush ONLY if this chunk would exceed batch capacity (hides prior window DRAM latency behind build_seps + Pass 1!)
+        if (__builtin_expect(cbp->nfast + (n0 + n1 + n4 + n5) > CLK_FAST_CAP, 0)) flush_clk_fast(ctx);
+        if (__builtin_expect(cbp->nhex  + (n2 + n3)           > CLK_HEX_CAP,  0)) flush_clk_hex(ctx);
+
+        // Pass 2: 6 homogeneous leaf loops (ZERO F3/ISO, ZERO short/hex UID, ZERO short/long CID branches!)
+        run_clk_bucket<false, false, false>(part[0], n0, bptr, base_seps, campp, lutp, cs_sec, ws_minus_cs_sec, clk_dur_sec,
+                                            ulines_p, lmask_v, hlines_p, hmask_v, seg_id, seg_base, arenas, tid, cbp, part[6], n_ex);
+        run_clk_bucket<true,  false, false>(part[1], n1, bptr, base_seps, campp, lutp, cs_sec, ws_minus_cs_sec, clk_dur_sec,
+                                            ulines_p, lmask_v, hlines_p, hmask_v, seg_id, seg_base, arenas, tid, cbp, part[6], n_ex);
+        run_clk_bucket<false, true,  false>(part[2], n2, bptr, base_seps, campp, lutp, cs_sec, ws_minus_cs_sec, clk_dur_sec,
+                                            ulines_p, lmask_v, hlines_p, hmask_v, seg_id, seg_base, arenas, tid, cbp, part[6], n_ex);
+        run_clk_bucket<true,  true,  false>(part[3], n3, bptr, base_seps, campp, lutp, cs_sec, ws_minus_cs_sec, clk_dur_sec,
+                                            ulines_p, lmask_v, hlines_p, hmask_v, seg_id, seg_base, arenas, tid, cbp, part[6], n_ex);
+        run_clk_bucket<false, false, true >(part[4], n4, bptr, base_seps, campp, lutp, cs_sec, ws_minus_cs_sec, clk_dur_sec,
+                                            ulines_p, lmask_v, hlines_p, hmask_v, seg_id, seg_base, arenas, tid, cbp, part[6], n_ex);
+        run_clk_bucket<true,  false, true >(part[5], n5, bptr, base_seps, campp, lutp, cs_sec, ws_minus_cs_sec, clk_dur_sec,
+                                            ulines_p, lmask_v, hlines_p, hmask_v, seg_id, seg_base, arenas, tid, cbp, part[6], n_ex);
+
+        for (uint32_t k = 0; k < n_ex; ++k) {
+            uint32_t code = part[6][k];
+            process_click_row_extra(bptr, base_seps + (code & 0x1FFU), code >> 9, ctx);
+        }
+    }
+}
+
 static SS_NOINLINE void process_click_task_fast(
     const CsvTask& task,
     ReadBuf& rbuf,
@@ -3630,68 +4270,35 @@ static SS_NOINLINE void process_click_task_fast(
     uint32_t& tl_cur, uint32_t& tl_end,
     uint32_t& g_cur,  uint32_t& g_end
 ) {
-    const uint32_t seg_id = task.file->seg_id;
-    const char* seg_base = task.file->map_base;
-    ClkTaskCtx cctx{tid, seg_id, seg_base, dict, arenas, clk_out, cbatch, tl_cur, tl_end, g_cur, g_end};
+    const int64_t cs_sec = click_start_ms / 1000LL;
+    const int64_t ws_minus_cs_sec = lut.win_start_sec - cs_sec;
+    const uint64_t clk_dur_sec = uint64_t((win_end_ms - click_start_ms) / 1000LL);
 
-    auto flush_now = [&]() SS_LAMBDA_INLINE {
-        if (__builtin_expect((cbatch.nfast | cbatch.nhex) != 0, 1)) {
-            flush_clk_batches(cctx);
-        }
+    ClkTaskCtx cctx{
+        tid, task.file->seg_id, task.file->map_base,
+        campaigns, lut, dict, arenas,
+        click_start_ms, win_end_ms, cs_sec, ws_minus_cs_sec, clk_dur_sec,
+        clk_out, cbatch, tl_cur, tl_end, g_cur, g_end
     };
+    ClkTaskCtx* const ctxp = &cctx;
+    auto noop_end = []() SS_LAMBDA_INLINE {};
 
-    const int64_t cs_ms = click_start_ms;
-    const int64_t we_ms = win_end_ms;
-    const int64_t ws_sec = lut.win_start_sec;
-    const uint64_t* const __restrict uslots_p = dict.uslots;
-    const size_t umask_v = dict.umask;
-    const UserDict::HexLine* const __restrict hlines_p = dict.hlines;
-    const size_t hmask_v = dict.hmask;
-
-    scan_csv_rows<4>(task, rbuf, [&](auto row) SS_LAMBDA_INLINE {
-        Slice f2 = row.template get<2>();
-        if (__builtin_expect(f2.len == 0, 0)) return;
-        uint32_t camp_idx = campaigns.lookup_padded(f2.ptr, f2.len);
-        if (__builtin_expect(camp_idx == FastStringIdMap::NOT_FOUND, 0)) return;
-        Slice f3 = row.template get<3>();
-        int64_t ts = 0;
-        bool ts_ok = false;
-        if (__builtin_expect(f3.len == 13, 0)) {
-            int64_t s = 0; uint32_t msr = 0;
-            ts_ok = parse_13d_sec_ms(f3.ptr, s, msr);
-            ts = s * 1000LL + int64_t(msr);
-        } else if (__builtin_expect(f3.len == 20 || f3.len == 25, 1)) {
-            int64_t rel_s = 0;
-            ts_ok = lut.parse_iso_f12_rel_sec(f3.ptr, f3.len, rel_s);
-            ts = (ws_sec + rel_s) * 1000LL;
-        }
-        if (__builtin_expect(!ts_ok, 0)) ts_ok = parse_ts_slow(f3.ptr, f3.len, ts, lut);
-        if (__builtin_expect(!ts_ok || ts < cs_ms || ts >= we_ms, 0)) return;
-        Slice f0 = row.template get<0>();
-        Slice f1 = row.template get<1>();
-        if (__builtin_expect((f0.len == 0) | (f1.len == 0), 0)) return;
-
-        uint64_t cid = encode_keyref_padded(f0.ptr, f0.len, seg_id, seg_base, arenas, tid);
-        uint64_t ts_camp44 = (uint64_t(uint32_t(ts - cs_ms)) << 12) | uint64_t(camp_idx);
-        uint64_t u48 = 0;
-        if (__builtin_expect(encode_uid48_padded(f1.ptr, f1.len, u48), 1)) {
-            uint64_t h48 = mix48(u48);
-            __builtin_prefetch(&uslots_p[size_t(h48) & umask_v], 0, 3);
-            cbatch.fast[cbatch.nfast++] = {h48, cid, ts_camp44};
-            if (__builtin_expect(cbatch.nfast == CLK_BATCH_CAP, 0)) flush_now();
-        } else {
-            uint64_t lo = 0, hi = 0;
-            if (__builtin_expect(encode_uhex128(f1.ptr, f1.len, lo, hi), 1)) {
-                uint64_t hh = hash_uhex128(lo, hi);
-                __builtin_prefetch(&hlines_p[size_t(hh) & hmask_v], 0, 3);
-                cbatch.hex[cbatch.nhex++] = {lo, hi, hh, cid, ts_camp44};
-                if (__builtin_expect(cbatch.nhex == CLK_BATCH_CAP, 0)) flush_now();
+    scan_csv_windows<4>(
+        task, rbuf,
+        [ctxp](const char* bptr, const uint16_t* seps, const uint8_t* q_bytes, uint32_t n_rows) SS_LAMBDA_INLINE {
+            process_click_window(bptr, seps, q_bytes, n_rows, *ctxp);
+        },
+        [ctxp](auto row) SS_LAMBDA_INLINE {
+            using RowT = std::decay_t<decltype(row)>;
+            if constexpr (std::is_same_v<RowT, SepsCsvRow<4>>) {
+                process_click_row_extra(row.bptr, row.sp, row.qm, *ctxp);
             } else {
-                emit_clk_direct_gen_cold(f1.ptr, f1.len, seg_id, seg_base, cid, ts_camp44,
-                                         dict, arenas, tid, clk_out, tl_cur, tl_end, g_cur, g_end);
+                process_click_row_slice(row.f, *ctxp);
             }
-        }
-    }, flush_now);
+        },
+        noop_end
+    );
+    flush_clk_all(cctx);
 }
 
 template <typename RowT>
@@ -3808,41 +4415,41 @@ static SS_ALWAYS_INLINE void process_event_row_full_impl(RowT row, EvTaskCtx& ct
     uint64_t u48 = 0;
     if (__builtin_expect(encode_uid48_padded(f1.ptr, f1.len, u48), 1)) {
         uint64_t h48 = mix48(u48);
-        ctx.dict.prefetch_uslot(h48);
+        ctx.dict.prefetch_uslot_l2(h48);
         if (__builtin_expect(!(is_long32 | need_side), 0)) {
             uint64_t w0 = (1ULL << 62) | (uint64_t(irel21) << 41) | rem39;
+            if (__builtin_expect(ctx.ebatch.nfast >= EV_FAST_CAP, 0)) flush_ev_fast(ctx);
             ctx.ebatch.fast[ctx.ebatch.nfast++] = {h48, w0, ts_rel_ms, eb};
-            if (__builtin_expect(ctx.ebatch.nfast == EV_BATCH_CAP, 0)) flush_ev_batches(ctx);
         } else {
             int64_t iv = is_long32 ? (ctx.win_start_sec + ing_rel_sec)
                                    : ((ing_whole_sec && irel21 == 0) ? (ctx.win_start_sec + ing_rel_sec) * 1000LL : ing_ms);
+            if (__builtin_expect(ctx.ebatch.nextra >= EV_EXTRA_CAP, 0)) flush_ev_extra(ctx);
             ctx.ebatch.extra[ctx.ebatch.nextra++] = {
                 h48, 0ULL, 0ULL,
                 is_long32 ? elo : eid_k64, is_long32 ? ehi : rem39,
                 iv, ts_rel_ms, eb, price, cat_id, irel21,
                 (uint32_t(is_long32) << 1) | (uint32_t(eid_in_side) << 2)
             };
-            if (__builtin_expect(ctx.ebatch.nextra == EV_BATCH_CAP, 0)) flush_ev_batches(ctx);
         }
     } else {
         uint64_t lo = 0, hi = 0;
         if (__builtin_expect(encode_uhex128(f1.ptr, f1.len, lo, hi), 1)) {
             uint64_t hh = hash_uhex128(lo, hi);
-            ctx.dict.prefetch_hline(hh);
+            ctx.dict.prefetch_hline_l2(hh);
             if (__builtin_expect(!(is_long32 | need_side), 0)) {
                 uint64_t w0 = (1ULL << 62) | (uint64_t(irel21) << 41) | rem39;
+                if (__builtin_expect(ctx.ebatch.nhex >= EV_HEX_CAP, 0)) flush_ev_hex(ctx);
                 ctx.ebatch.hex[ctx.ebatch.nhex++] = {lo, hi, hh, w0, ts_rel_ms, eb};
-                if (__builtin_expect(ctx.ebatch.nhex == EV_BATCH_CAP, 0)) flush_ev_batches(ctx);
             } else {
                 int64_t iv = is_long32 ? (ctx.win_start_sec + ing_rel_sec)
                                        : ((ing_whole_sec && irel21 == 0) ? (ctx.win_start_sec + ing_rel_sec) * 1000LL : ing_ms);
+                if (__builtin_expect(ctx.ebatch.nextra >= EV_EXTRA_CAP, 0)) flush_ev_extra(ctx);
                 ctx.ebatch.extra[ctx.ebatch.nextra++] = {
                     lo, hi, hh,
                     is_long32 ? elo : eid_k64, is_long32 ? ehi : rem39,
                     iv, ts_rel_ms, eb, price, cat_id, irel21,
                     1U | (uint32_t(is_long32) << 1) | (uint32_t(eid_in_side) << 2)
                 };
-                if (__builtin_expect(ctx.ebatch.nextra == EV_BATCH_CAP, 0)) flush_ev_batches(ctx);
             }
         } else {
             if (need_side && ing_whole_sec && irel21 == 0) ing_ms = (ctx.win_start_sec + ing_rel_sec) * 1000LL;
@@ -3856,7 +4463,6 @@ static SS_ALWAYS_INLINE void process_event_row_full_impl(RowT row, EvTaskCtx& ct
     }
 }
 
-// 4-register-arg non-cold handler for the 15.6% long-EID / purchase / slow-ts / invalid / general-UID rows!
 static SS_NOINLINE void process_event_row_extra(
     const char* bptr, const uint16_t* row_seps, uint32_t qm, EvTaskCtx& ctx
 ) {
@@ -3865,6 +4471,337 @@ static SS_NOINLINE void process_event_row_extra(
 
 static SS_COLD_NOINLINE void process_event_row_slice(const Slice* fs, EvTaskCtx& ctx) {
     process_event_row_full_impl(SliceCsvRow{fs}, ctx);
+}
+
+template <bool IS_F3, bool IS_HEX_UID, bool IS_LONG_EID>
+static SS_ALWAYS_INLINE void run_ev_bucket(
+    const uint16_t* __restrict codes,
+    uint32_t n,
+    const char* __restrict bptr,
+    const uint16_t* __restrict base_seps,
+    const DateLut* __restrict lutp,
+    int64_t ws_sec,
+    int64_t wd_sec,
+    const UserDict::Uline* __restrict ulines_p,
+    size_t lmask_v,
+    const UserDict::HexLine* __restrict hlines_p,
+    size_t hmask_v,
+    EvBatchState* __restrict ebp,
+    uint16_t* __restrict ex_buf,
+    uint32_t& n_ex
+) {
+    static constexpr uint32_t VIEW_U32 = 0x77656976U; // "view" LE
+    static constexpr uint32_t CART_U32 = 0x74726163U; // "cart" LE
+
+    if constexpr (!IS_F3 && !IS_LONG_EID) { (void)ws_sec; }
+    if constexpr (IS_HEX_UID)             { (void)ulines_p; (void)lmask_v; }
+    else                                  { (void)hlines_p; (void)hmask_v; }
+
+    if (n == 0) return;
+
+    auto* __restrict dst_fast = ebp->fast     + ebp->nfast;
+    auto* __restrict dst_hex  = ebp->hex      + ebp->nhex;
+    auto* __restrict dst_l48  = ebp->long_u48 + ebp->nlong_u48;
+
+    for (uint32_t k = 0; k < n; ++k) {
+        uint32_t code = codes[k];
+        const uint16_t* sp = base_seps + (code & 0x1FFU);
+        uint32_t qm = code >> 9;
+        SepsCsvRow<7> row{bptr, sp, qm};
+
+        // 1. Validate f4 ("view" or "cart"; len==4 & f5 nonempty already proven by Pass 1!)
+        Slice f4 = row.template get<4>();
+        uint32_t v4;
+        std::memcpy(&v4, f4.ptr, 4);
+        if (__builtin_expect((v4 != VIEW_U32) & (v4 != CART_U32), 0)) {
+            ex_buf[n_ex++] = uint16_t(code);
+            continue;
+        }
+
+        // 2. Parse F1 20B ingest_ts (len==20 already proven by Pass 1!)
+        Slice f3 = row.template get<3>();
+        int64_t ing_rel_sec = 0;
+        if (__builtin_expect(f3.ptr[19] != 'Z' || !lutp->parse_ingest_f1_rel_sec(f3.ptr, ing_rel_sec), 0)) {
+            ex_buf[n_ex++] = uint16_t(code);
+            continue;
+        }
+        int64_t ir = 0;
+        if constexpr (!IS_LONG_EID) {
+            ir = ing_rel_sec + RawEvent16::ING_BIAS;
+            if (__builtin_expect(uint64_t(ir - 1) >= uint64_t(RawEvent16::ING_MAX), 0)) {
+                ex_buf[n_ex++] = uint16_t(code);
+                continue;
+            }
+        }
+
+        // 3. Parse event_ts: ZERO F3 vs ISO branch!
+        Slice f2 = row.template get<2>();
+        int64_t ts_rel_sec = 0;
+        uint32_t ts_rel_ms = 0;
+        bool ts_ok;
+        if constexpr (IS_F3) {
+            int64_t f3_sec = 0;
+            uint32_t ts_ms_rem = 0;
+            ts_ok = parse_13d_sec_ms(f2.ptr, f3_sec, ts_ms_rem);
+            ts_rel_sec = f3_sec - ws_sec;
+            ts_rel_ms = uint32_t(ts_rel_sec * 1000LL + int64_t(ts_ms_rem));
+        } else {
+            ts_ok = lutp->parse_iso_f12_rel_sec(f2.ptr, f2.len, ts_rel_sec);
+            ts_rel_ms = uint32_t(ts_rel_sec) * 1000U;
+        }
+        if (__builtin_expect(!ts_ok || uint64_t(ts_rel_sec) >= uint64_t(wd_sec) ||
+                             ing_rel_sec - ts_rel_sec > 86400LL, 0)) {
+            ex_buf[n_ex++] = uint16_t(code);
+            continue;
+        }
+
+        // 4. Encode EID + UID + L2 prefetch (ZERO short/hex UID or short/long EID branch!)
+        Slice f0 = row.template get<0>();
+        Slice f1 = row.template get<1>();
+        if constexpr (IS_LONG_EID) {
+            uint64_t elo = 0, ehi = 0;
+            if (__builtin_expect(!encode_ehex128(f0.ptr, f0.len, elo, ehi), 0)) {
+                ex_buf[n_ex++] = uint16_t(code);
+                continue;
+            }
+            uint64_t u48 = 0;
+            if (__builtin_expect(!encode_uid48_padded(f1.ptr, f1.len, u48), 0)) {
+                ex_buf[n_ex++] = uint16_t(code);
+                continue;
+            }
+            uint64_t uh48 = mix48(u48);
+            __builtin_prefetch(&ulines_p[size_t(uh48) & lmask_v], 0, 2);
+            uint64_t eh = hash_uhex128(elo, ehi);
+            uint32_t eb = uint32_t(eh >> (64 - LONG_EV_SHIFT));
+            *dst_l48++ = {uh48, elo, ehi, ws_sec + ing_rel_sec, ts_rel_ms, eb};
+        } else {
+            uint64_t eid48 = 0;
+            if (__builtin_expect(!encode_eid48_padded(f0.ptr, f0.len, eid48), 0)) {
+                ex_buf[n_ex++] = uint16_t(code);
+                continue;
+            }
+            if constexpr (!IS_HEX_UID) {
+                uint64_t u48 = 0;
+                if (__builtin_expect(!encode_uid48_padded(f1.ptr, f1.len, u48), 0)) {
+                    ex_buf[n_ex++] = uint16_t(code);
+                    continue;
+                }
+                uint64_t uh48 = mix48(u48);
+                __builtin_prefetch(&ulines_p[size_t(uh48) & lmask_v], 0, 2);
+                uint64_t eh48 = mix48(eid48);
+                uint32_t eb = uint32_t(eh48 >> (48 - EV_SHIFT));
+                uint64_t w0 = (1ULL << 62) | (uint64_t(uint32_t(ir)) << 41) | (eh48 & RawEvent16::REM38_MASK);
+                *dst_fast++ = {uh48, w0, ts_rel_ms, eb};
+            } else {
+                uint64_t lo = 0, hi = 0;
+                if (__builtin_expect(!encode_uhex128(f1.ptr, f1.len, lo, hi), 0)) {
+                    ex_buf[n_ex++] = uint16_t(code);
+                    continue;
+                }
+                uint64_t hh = hash_uhex128(lo, hi);
+                __builtin_prefetch(&hlines_p[size_t(hh) & hmask_v], 0, 2);
+                uint64_t eh48 = mix48(eid48);
+                uint32_t eb = uint32_t(eh48 >> (48 - EV_SHIFT));
+                uint64_t w0 = (1ULL << 62) | (uint64_t(uint32_t(ir)) << 41) | (eh48 & RawEvent16::REM38_MASK);
+                *dst_hex++ = {lo, hi, hh, w0, ts_rel_ms, eb};
+            }
+        }
+    }
+
+    if constexpr (IS_LONG_EID)     ebp->nlong_u48 = uint32_t(dst_l48  - ebp->long_u48);
+    else if constexpr (IS_HEX_UID) ebp->nhex      = uint32_t(dst_hex  - ebp->hex);
+    else                           ebp->nfast     = uint32_t(dst_fast - ebp->fast);
+}
+
+static SS_NOINLINE void process_event_window(
+    const char* __restrict bptr,
+    const uint16_t* __restrict seps,
+    const uint8_t* __restrict q_bytes,
+    uint32_t n_rows,
+    EvTaskCtx& ctx
+) {
+    const int64_t ws_sec = ctx.win_start_sec;
+    const int64_t wd_sec = ctx.win_dur_sec;
+    const uint32_t use_l32_mask = uint32_t(ctx.use_long_ev32);
+    const DateLut* const __restrict lutp = &ctx.lut;
+    const UserDict::Uline* const __restrict ulines_p = ctx.dict.ulines;
+    const size_t lmask_v = ctx.dict.lmask;
+    const UserDict::HexLine* const __restrict hlines_p = ctx.dict.hlines;
+    const size_t hmask_v = ctx.dict.hmask;
+    EvBatchState* const __restrict ebp = &ctx.ebatch;
+
+    alignas(64) uint16_t part[7][WIN_CHUNK_EV];
+
+    for (uint32_t rbase = 0; rbase < n_rows; rbase += WIN_CHUNK_EV) {
+        const uint32_t m = std::min<uint32_t>(WIN_CHUNK_EV, n_rows - rbase);
+        const uint32_t rbase_si = rbase * 7U;
+        const uint16_t* const __restrict base_seps = seps + rbase_si;
+
+        // Pass 1: 100% branchless, zero-CSV-load, 1-store/row classifier (ZERO %zmm!)
+        uint32_t si_rel = 0;
+        uint32_t si_abs = rbase_si;
+        uint64_t cnts = 0;
+#if defined(__AVX512BW__) && defined(__AVX512VL__)
+        const __m128i v_one   = _mm_set1_epi16(1);
+        const __m128i v_two   = _mm_set1_epi16(2);
+        const __m128i v_seven = _mm_set1_epi16(7);
+        const __m128i v_pat_a = _mm_setr_epi16(33, 33, 20, 20, 4, 0, 0, 0);
+        const __m128i v_pat_b = _mm_setr_epi16( 0,  0, 25,  0, 0, 0, 0, 0);
+        const __m128i v_pat_c = _mm_setr_epi16( 0,  0, 13,  0, 0, 0, 0, 0);
+        for (uint32_t r = 0; r < m; ++r, si_rel += 7U, si_abs += 7U) {
+            uint16_t qb16;
+            std::memcpy(&qb16, q_bytes + (si_abs >> 3), 2);
+            uint32_t qm = (uint32_t(qb16) >> (si_abs & 7U)) & 0x7FU;
+
+            const uint16_t* sp = base_seps + si_rel;
+            __m128i vs   = _mm_loadu_si128(reinterpret_cast<const __m128i*>(sp - 1));
+            __m128i ve   = _mm_loadu_si128(reinterpret_cast<const __m128i*>(sp));
+            __m128i vraw = _mm_sub_epi16(ve, _mm_add_epi16(vs, v_one));
+            __m128i vlen = _mm_mask_sub_epi16(vraw, __mmask8(qm), vraw, v_two);
+
+            uint32_t m_s = uint32_t(_mm_cmple_epu16_mask(_mm_sub_epi16(vlen, v_two), v_seven));
+            uint32_t m_a = uint32_t(_mm_cmpeq_epi16_mask(vlen, v_pat_a));
+            uint32_t m_b = uint32_t(_mm_cmpeq_epi16_mask(vlen, v_pat_b));
+            uint32_t m_c = uint32_t(_mm_cmpeq_epi16_mask(vlen, v_pat_c));
+
+            uint32_t hdr_ok  = ((m_a & 0x38U) == 0x18U);
+            uint32_t is_iso  = ((m_a | m_b) >> 2) & 1U;
+            uint32_t is_f3   = (m_c >> 2) & 1U;
+            uint32_t is_e48  = m_s & 1U;
+            uint32_t is_ehex = m_a & 1U;
+            uint32_t is_u48  = (m_s >> 1) & 1U;
+            uint32_t is_uhex = (m_a >> 1) & 1U;
+
+            uint32_t base_ok  = hdr_ok & (is_iso | is_f3);
+            uint32_t short_ok = base_ok & is_e48 & (is_u48 | is_uhex);
+            uint32_t long_ok  = base_ok & use_l32_mask & is_ehex & is_u48;
+
+            uint32_t cls = 6U;
+            cls = long_ok  ? (4U | is_f3)             : cls;
+            cls = short_ok ? (is_f3 | (is_uhex << 1)) : cls;
+
+            uint32_t sh = cls << 3;
+            uint32_t c  = uint32_t((cnts >> sh) & 0xFFU);
+            part[cls][c] = uint16_t(si_rel | (qm << 9));
+            cnts += (1ULL << sh);
+        }
+#elif defined(__SSE2__)
+        const __m128i v_one   = _mm_set1_epi16(1);
+        const __m128i v_ten   = _mm_set1_epi16(10);
+        const __m128i v_qbits = _mm_setr_epi16(1, 2, 4, 8, 16, 32, 64, 128);
+        const __m128i v_pat_a = _mm_setr_epi16(33, 33, 20, 20, 4, 0, 0, 0);
+        const __m128i v_pat_b = _mm_setr_epi16( 0,  0, 25,  0, 0, 0, 0, 0);
+        const __m128i v_pat_c = _mm_setr_epi16( 0,  0, 13,  0, 0, 0, 0, 0);
+        for (uint32_t r = 0; r < m; ++r, si_rel += 7U, si_abs += 7U) {
+            uint16_t qb16;
+            std::memcpy(&qb16, q_bytes + (si_abs >> 3), 2);
+            uint32_t qm = (uint32_t(qb16) >> (si_abs & 7U)) & 0x7FU;
+
+            const uint16_t* sp = base_seps + si_rel;
+            __m128i vs   = _mm_loadu_si128(reinterpret_cast<const __m128i*>(sp - 1));
+            __m128i ve   = _mm_loadu_si128(reinterpret_cast<const __m128i*>(sp));
+            __m128i vraw = _mm_sub_epi16(ve, _mm_add_epi16(vs, v_one));
+            __m128i vqm  = _mm_cmpeq_epi16(_mm_and_si128(_mm_set1_epi16(short(qm)), v_qbits), v_qbits);
+            __m128i vlen = _mm_add_epi16(vraw, _mm_add_epi16(vqm, vqm));
+
+            __m128i vs_cmp = _mm_and_si128(_mm_cmpgt_epi16(vlen, v_one), _mm_cmpgt_epi16(v_ten, vlen));
+            uint32_t m_s = uint32_t(_mm_movemask_epi8(vs_cmp));
+            uint32_t m_a = uint32_t(_mm_movemask_epi8(_mm_cmpeq_epi16(vlen, v_pat_a)));
+            uint32_t m_b = uint32_t(_mm_movemask_epi8(_mm_cmpeq_epi16(vlen, v_pat_b)));
+            uint32_t m_c = uint32_t(_mm_movemask_epi8(_mm_cmpeq_epi16(vlen, v_pat_c)));
+
+            uint32_t hdr_ok  = ((m_a & 0x0540U) == 0x0140U);
+            uint32_t is_iso  = ((m_a | m_b) >> 4) & 1U;
+            uint32_t is_f3   = (m_c >> 4) & 1U;
+            uint32_t is_e48  = m_s & 1U;
+            uint32_t is_ehex = m_a & 1U;
+            uint32_t is_u48  = (m_s >> 2) & 1U;
+            uint32_t is_uhex = (m_a >> 2) & 1U;
+
+            uint32_t base_ok  = hdr_ok & (is_iso | is_f3);
+            uint32_t short_ok = base_ok & is_e48 & (is_u48 | is_uhex);
+            uint32_t long_ok  = base_ok & use_l32_mask & is_ehex & is_u48;
+
+            uint32_t cls = 6U;
+            cls = long_ok  ? (4U | is_f3)             : cls;
+            cls = short_ok ? (is_f3 | (is_uhex << 1)) : cls;
+
+            uint32_t sh = cls << 3;
+            uint32_t c  = uint32_t((cnts >> sh) & 0xFFU);
+            part[cls][c] = uint16_t(si_rel | (qm << 9));
+            cnts += (1ULL << sh);
+        }
+#else
+        for (uint32_t r = 0; r < m; ++r, si_rel += 7U, si_abs += 7U) {
+            uint16_t qb16;
+            std::memcpy(&qb16, q_bytes + (si_abs >> 3), 2);
+            uint32_t qm = (uint32_t(qb16) >> (si_abs & 7U)) & 0x7FU;
+
+            const uint16_t* sp = base_seps + si_rel;
+            uint32_t s0 = uint32_t(uint16_t(sp[-1] + 1U));
+            uint32_t p0 = sp[0], p1 = sp[1], p2 = sp[2], p3 = sp[3], p4 = sp[4], p5 = sp[5];
+            uint32_t l0 = (p0 - s0)     - ((qm & 1U) << 1);
+            uint32_t l1 = (p1 - p0 - 1) - (qm & 2U);
+            uint32_t l2 = (p2 - p1 - 1) - ((qm >> 1) & 2U);
+            uint32_t l3 = (p3 - p2 - 1) - ((qm >> 2) & 2U);
+            uint32_t l4 = (p4 - p3 - 1) - ((qm >> 3) & 2U);
+            uint32_t l5 = (p5 - p4 - 1) - ((qm >> 4) & 2U);
+
+            uint32_t hdr_ok  = (l3 == 20U) & (l4 == 4U) & (l5 != 0U);
+            uint32_t is_iso  = (l2 == 20U) | (l2 == 25U);
+            uint32_t is_f3   = (l2 == 13U);
+            uint32_t is_e48  = ((l0 - 2U) <= 7U);
+            uint32_t is_ehex = (l0 == 33U);
+            uint32_t is_u48  = ((l1 - 2U) <= 7U);
+            uint32_t is_uhex = (l1 == 33U);
+
+            uint32_t base_ok  = hdr_ok & (is_iso | is_f3);
+            uint32_t short_ok = base_ok & is_e48 & (is_u48 | is_uhex);
+            uint32_t long_ok  = base_ok & use_l32_mask & is_ehex & is_u48;
+
+            uint32_t cls = 6U;
+            cls = long_ok  ? (4U | is_f3)             : cls;
+            cls = short_ok ? (is_f3 | (is_uhex << 1)) : cls;
+
+            uint32_t sh = cls << 3;
+            uint32_t c  = uint32_t((cnts >> sh) & 0xFFU);
+            part[cls][c] = uint16_t(si_rel | (qm << 9));
+            cnts += (1ULL << sh);
+        }
+#endif
+
+        const uint32_t n0 = uint32_t( cnts        & 0xFFU);
+        const uint32_t n1 = uint32_t((cnts >> 8)  & 0xFFU);
+        const uint32_t n2 = uint32_t((cnts >> 16) & 0xFFU);
+        const uint32_t n3 = uint32_t((cnts >> 24) & 0xFFU);
+        const uint32_t n4 = uint32_t((cnts >> 32) & 0xFFU);
+        const uint32_t n5 = uint32_t((cnts >> 40) & 0xFFU);
+        uint32_t n_ex     = uint32_t((cnts >> 48) & 0xFFU);
+
+        // Pre-flush ONLY when a batch would exceed capacity (hides prior window DRAM latency behind build_seps + Pass 1!)
+        if (__builtin_expect(ebp->nfast     + (n0 + n1) > EV_FAST_CAP,     0)) flush_ev_fast(ctx);
+        if (__builtin_expect(ebp->nhex      + (n2 + n3) > EV_HEX_CAP,      0)) flush_ev_hex(ctx);
+        if (__builtin_expect(ebp->nlong_u48 + (n4 + n5) > EV_LONG_U48_CAP, 0)) flush_ev_long_u48(ctx);
+
+        // Pass 2: 6 homogeneous leaf loops (ZERO F3/ISO, ZERO short/hex UID, ZERO short/long EID branches!)
+        run_ev_bucket<false, false, false>(part[0], n0, bptr, base_seps, lutp, ws_sec, wd_sec,
+                                           ulines_p, lmask_v, hlines_p, hmask_v, ebp, part[6], n_ex);
+        run_ev_bucket<true,  false, false>(part[1], n1, bptr, base_seps, lutp, ws_sec, wd_sec,
+                                           ulines_p, lmask_v, hlines_p, hmask_v, ebp, part[6], n_ex);
+        run_ev_bucket<false, true,  false>(part[2], n2, bptr, base_seps, lutp, ws_sec, wd_sec,
+                                           ulines_p, lmask_v, hlines_p, hmask_v, ebp, part[6], n_ex);
+        run_ev_bucket<true,  true,  false>(part[3], n3, bptr, base_seps, lutp, ws_sec, wd_sec,
+                                           ulines_p, lmask_v, hlines_p, hmask_v, ebp, part[6], n_ex);
+        run_ev_bucket<false, false, true >(part[4], n4, bptr, base_seps, lutp, ws_sec, wd_sec,
+                                           ulines_p, lmask_v, hlines_p, hmask_v, ebp, part[6], n_ex);
+        run_ev_bucket<true,  false, true >(part[5], n5, bptr, base_seps, lutp, ws_sec, wd_sec,
+                                           ulines_p, lmask_v, hlines_p, hmask_v, ebp, part[6], n_ex);
+
+        for (uint32_t k = 0; k < n_ex; ++k) {
+            uint32_t code = part[6][k];
+            process_event_row_extra(bptr, base_seps + (code & 0x1FFU), code >> 9, ctx);
+        }
+    }
 }
 
 static SS_NOINLINE void process_event_task_fast(
@@ -3887,9 +4824,6 @@ static SS_NOINLINE void process_event_task_fast(
     uint32_t& tl_cur, uint32_t& tl_end,
     uint32_t& g_cur,  uint32_t& g_end
 ) {
-    static constexpr uint32_t VIEW_U32 = 0x77656976U; // "view" LE
-    static constexpr uint32_t CART_U32 = 0x74726163U; // "cart" LE
-
     EvTaskCtx ctx{
         tid, task.file->seg_id, task.file->map_base,
         products, lut, dict, arenas,
@@ -3897,107 +4831,25 @@ static SS_NOINLINE void process_event_task_fast(
         ev_out, long_ev_out, side_slab, ebatch,
         tl_cur, tl_end, g_cur, g_end
     };
-
-    // By-value local constants so calls to process_event_row_extra / flush_ev_batches cannot alias them!
-    const int64_t ws_sec = win_start_sec;
-    const int64_t wd_sec = win_dur_sec;
-    const DateLut* const __restrict lutp = &lut;
-    const uint64_t* const __restrict uslots_p = dict.uslots;
-    const size_t umask_v = dict.umask;
-    const UserDict::HexLine* const __restrict hlines_p = dict.hlines;
-    const size_t hmask_v = dict.hmask;
-    EvBatchState* const __restrict ebp = &ebatch;
     EvTaskCtx* const ctxp = &ctx;
+    auto noop_end = []() SS_LAMBDA_INLINE {};
 
-    auto flush_now = [ebp, ctxp]() SS_LAMBDA_INLINE {
-        if (__builtin_expect((ebp->nfast | ebp->nhex | ebp->nextra) != 0, 1)) {
-            flush_ev_batches(*ctxp);
-        }
-    };
-
-    // Ultra-slim ZERO-SPILL 84.4% hot loop:
-    //   - Single goto do_extra; bailout (1 call site instead of 6!)
-    //   - Check f0 length + f4/f5 BEFORE timestamps (0 live values!)
-    //   - Only ing_rel_sec + irel21 live across f2 (encode_eid48 + mix48 run AFTER f2!)
-    scan_csv_rows<7>(task, rbuf, [ws_sec, wd_sec, lutp, uslots_p, umask_v, hlines_p, hmask_v, ebp, ctxp, flush_now](auto row) SS_LAMBDA_INLINE {
-        using RowT = std::decay_t<decltype(row)>;
-        if constexpr (!std::is_same_v<RowT, SepsCsvRow<7>>) {
-            process_event_row_slice(row.f, *ctxp);
-            return;
-        } else {
-            // 1. Cheap length/prefix gate on f0 + 4B view/cart + nonempty f5 (0 live row values!)
-            Slice f0 = row.template get<0>();
-            Slice f4 = row.template get<4>();
-            uint32_t v4;
-            std::memcpy(&v4, f4.ptr, 4);
-            if (__builtin_expect((f0.len - 2) > 7 || f0.ptr[0] != 'e' ||
-                                 (f4.len != 4) | ((v4 != VIEW_U32) & (v4 != CART_U32)) | !row.template nonempty<5>(), 0)) {
-                goto do_extra;
+    scan_csv_windows<7>(
+        task, rbuf,
+        [ctxp](const char* bptr, const uint16_t* seps, const uint8_t* q_bytes, uint32_t n_rows) SS_LAMBDA_INLINE {
+            process_event_window(bptr, seps, q_bytes, n_rows, *ctxp);
+        },
+        [ctxp](auto row) SS_LAMBDA_INLINE {
+            using RowT = std::decay_t<decltype(row)>;
+            if constexpr (std::is_same_v<RowT, SepsCsvRow<7>>) {
+                process_event_row_extra(row.bptr, row.sp, row.qm, *ctxp);
+            } else {
+                process_event_row_slice(row.f, *ctxp);
             }
-            // 2. Parse F1 20B ingest_ts (only ing_rel_sec live across f2!)
-            {
-                Slice f3 = row.template get<3>();
-                int64_t ing_rel_sec = 0;
-                if (__builtin_expect(f3.len != 20 || f3.ptr[19] != 'Z' || !lutp->parse_ingest_f1_rel_sec(f3.ptr, ing_rel_sec), 0)) {
-                    goto do_extra;
-                }
-                int64_t ir = ing_rel_sec + RawEvent16::ING_BIAS;
-                if (__builtin_expect(uint64_t(ir - 1) >= uint64_t(RawEvent16::ING_MAX), 0)) {
-                    goto do_extra;
-                }
-
-                // 3. Parse event_ts (F3 13B vs F1/F2 ISO) + window/late check
-                Slice f2 = row.template get<2>();
-                int64_t ts_rel_sec = 0;
-                uint32_t ts_ms_rem = 0;
-                bool ts_ok;
-                if (__builtin_expect(f2.len == 13, 0)) {
-                    int64_t f3_sec = 0;
-                    ts_ok = parse_13d_sec_ms(f2.ptr, f3_sec, ts_ms_rem);
-                    ts_rel_sec = f3_sec - ws_sec;
-                } else if (__builtin_expect(f2.len == 20 || f2.len == 25, 1)) {
-                    ts_ok = lutp->parse_iso_f12_rel_sec(f2.ptr, f2.len, ts_rel_sec);
-                } else {
-                    ts_ok = false;
-                }
-                if (__builtin_expect(!ts_ok || uint64_t(ts_rel_sec) >= uint64_t(wd_sec) ||
-                                     ing_rel_sec - ts_rel_sec > 86400LL, 0)) {
-                    goto do_extra;
-                }
-                uint32_t ts_rel_ms = uint32_t(ts_rel_sec * 1000LL + int64_t(ts_ms_rem));
-
-                // 4. Encode short EID AFTER f2 (zero w0/eb register pressure across f2!)
-                uint64_t eid48 = 0;
-                if (__builtin_expect(!encode_eid48_padded(f0.ptr, f0.len, eid48), 0)) {
-                    goto do_extra;
-                }
-                uint64_t eh48 = mix48(eid48);
-                uint32_t eb = uint32_t(eh48 >> (48 - EV_SHIFT));
-                uint64_t w0 = (1ULL << 62) | (uint64_t(uint32_t(ir)) << 41) | (eh48 & RawEvent16::REM38_MASK);
-
-                // 5. Unpack user_id -> short uid48 (86%) OR 33B hex uhex128 (13.5%) -> micro-batch + prefetcht0!
-                Slice f1 = row.template get<1>();
-                uint64_t u48 = 0;
-                if (__builtin_expect(encode_uid48_padded(f1.ptr, f1.len, u48), 1)) {
-                    uint64_t uh48 = mix48(u48);
-                    __builtin_prefetch(&uslots_p[size_t(uh48) & umask_v], 0, 3);
-                    ebp->fast[ebp->nfast++] = {uh48, w0, ts_rel_ms, eb};
-                    if (__builtin_expect(ebp->nfast == EV_BATCH_CAP, 0)) flush_now();
-                    return;
-                }
-                uint64_t lo = 0, hi = 0;
-                if (__builtin_expect(encode_uhex128(f1.ptr, f1.len, lo, hi), 1)) {
-                    uint64_t hh = hash_uhex128(lo, hi);
-                    __builtin_prefetch(&hlines_p[size_t(hh) & hmask_v], 0, 3);
-                    ebp->hex[ebp->nhex++] = {lo, hi, hh, w0, ts_rel_ms, eb};
-                    if (__builtin_expect(ebp->nhex == EV_BATCH_CAP, 0)) flush_now();
-                    return;
-                }
-            }
-        do_extra:
-            process_event_row_extra(row.bptr, row.sp, row.qm, *ctxp);
-        }
-    }, flush_now);
+        },
+        noop_end
+    );
+    flush_ev_all(ctx);
 }
 
 // Wide / Classic fallback scanners (arbitrary UTF-8 links, >49.7d windows, >4096 campaigns, >16.7M users!)

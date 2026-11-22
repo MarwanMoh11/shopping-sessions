@@ -415,6 +415,44 @@ static SS_ALWAYS_INLINE uint64_t encode_keyref_padded(
     return arenas.store_fallback(tid, s, len);
 }
 
+// Leaf inline 2..9 byte ASCII Key64 encoder (caller guarantees (len - 2) <= 7 and >= 8 readable pad bytes after s+1).
+static SS_ALWAYS_INLINE bool try_encode_key64_2_9(const char* s, size_t len, uint64_t& out_k64) {
+    uint8_t b0 = uint8_t(s[0]);
+    uint64_t raw8;
+    std::memcpy(&raw8, s + 1, 8);
+    uint64_t mask = (~0ULL) >> ((9 - len) << 3);
+    raw8 &= mask;
+    uint64_t check = raw8 | (~mask & 0x0101010101010101ULL);
+    uint64_t bad = (check & 0x8080808080808080ULL) |
+                   ((check - 0x0101010101010101ULL) & ~check & 0x8080808080808080ULL);
+    if (__builtin_expect((bad == 0) & (uint8_t(b0 - 1) < 127), 1)) {
+        out_k64 = (uint64_t(b0) << 56) | pext56(__builtin_bswap64(raw8));
+        return true;
+    }
+    return false;
+}
+
+// Direct KeyRef encoder for known-long strings (len >= 10): skips 2..9B check & inlines 33B pread arena copy!
+static SS_ALWAYS_INLINE uint64_t encode_keyref_long(
+    const char* s, size_t len, uint32_t seg_id, const char* seg_base_ptr, StringArenaPool& arenas, int tid
+) {
+    if (__builtin_expect(seg_id < StringArenaPool::ARENA_SEG_BASE, 0)) {
+        return arenas.make_mmap_ref(seg_id, size_t(s - seg_base_ptr), s, len, tid);
+    }
+    if (__builtin_expect(len == 33, 1)) {
+        size_t off = arenas.pos[tid];
+        if (__builtin_expect(off + 33 <= StringArenaPool::RESERVATION && off <= StringArenaPool::MAX_SEG_OFF, 1)) {
+            char* dst = arenas.base[tid] + off;
+            std::memcpy(dst, s, 32);
+            dst[32] = s[32];
+            arenas.pos[tid] = off + 33;
+            return FALLBACK_BIT | (uint64_t(StringArenaPool::ARENA_SEG_BASE + uint32_t(tid)) << 50)
+                                | (uint64_t(off) << 16) | 33ULL;
+        }
+    }
+    return arenas.store_fallback(tid, s, len);
+}
+
 // Branchless 2..9 byte order-preserving Key64 encoder (requires >= 8 readable pad bytes after s+1!).
 static SS_ALWAYS_INLINE uint64_t encode_key64_padded(const char* s, size_t len, StringArenaPool& arenas, int tid) {
     if (__builtin_expect((len - 2) <= 7, 1)) {
